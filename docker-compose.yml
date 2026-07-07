@@ -1,0 +1,40 @@
+services:
+  fastomop:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastomop
+    restart: unless-stopped
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      # OpenRouter
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
+
+      # Database
+      - DB_TYPE=duckdb
+      - DB_PATH=/app/data/synthetic_snuh.duckdb
+
+      # Langfuse disabled
+      - LANGFUSE_PUBLIC_KEY=disabled
+      - LANGFUSE_SECRET_KEY=disabled
+      - LANGFUSE_HOST=http://localhost:3000
+
+      # Tracing disabled
+      - OTEL_SDK_DISABLED=true
+
+    volumes:
+      # DuckDB data file
+      - ${DB_HOST_PATH:-../data}:/app/data:ro
+
+      # Local config override (OpenRouter model config)
+      - ./agno_fastomop/config.local.toml:/app/agno_fastomop/config.local.toml:ro
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

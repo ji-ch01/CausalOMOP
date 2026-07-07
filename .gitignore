@@ -1,0 +1,37 @@
+# ── Virtual environments ──────────────────────────────────────────────────────
+fhir/
+.venv/
+venv/
+env/
+
+# ── Data — large binary / CSV files (not versioned) ──────────────────────────
+# To reproduce: run scripts/load_vocabulary.py after downloading from Athena
+data/vocabulary/
+data/*.duckdb
+*.duckdb
+
+# DuckDB bundled inside cloned repos
+omcp/synthetic_data/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.html
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+# sample.env and omcp/sample.env are kept (they contain no secrets)
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/settings.json
