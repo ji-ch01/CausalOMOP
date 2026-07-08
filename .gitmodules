@@ -7,3 +7,6 @@
 [submodule "foem"]
 	path = foem
 	url = https://github.com/ji-ch01/foem.git
+[submodule "external/ohdsi_mimic"]
+	path = external/ohdsi_mimic
+	url = https://github.com/OHDSI/MIMIC.git
