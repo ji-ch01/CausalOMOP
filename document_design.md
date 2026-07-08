@@ -16,16 +16,26 @@ The DAG is only one component of this workflow.
 
 ## Current Project Alignment
 
-The primary validation use case for this extension is now:
+The project direction is no longer centered on one fixed validation question.
+The proposed architecture remains relevant, but the Causal Agent Team should not
+be designed as a completely separate module from the existing NL2SQL system.
+Instead, it should be connected to the NL2SQL / SQL execution layer because
+causal analyses still require structured OMOP extraction through SQL queries.
 
-> Does dapagliflozin, compared with sitagliptin, increase the 90-day risk of
-> urinary or genital infection in Type 2 Diabetes Mellitus patients?
+The NL2SQL layer can serve as the data-access layer for the causal workflow. It
+can help construct cohorts, extract variables, check OMOP concepts, run
+feasibility checks, and generate the datasets required for causal inference.
 
-This side-effect endpoint is better aligned with the supervisors' original
-question than the earlier 365-day mortality endpoint. The mortality cohort
-remains useful as a feasibility/demo candidate, but it is not the preferred
-primary causal endpoint because mortality events are sparse for the selected
-T2DM active-comparator study.
+The earlier dapagliflozin-versus-sitagliptin infection question remains a useful
+design example, but the next validation step is to identify a more suitable
+public dataset, ideally one already used in a published causal study. The goal
+is to reuse or approximate an existing causal question and later compare this
+pipeline's output with published assumptions, variables, and results.
+
+The primary methodological objective is now CATE inference with CDM data, with
+TMLE plus SuperLearner-style nuisance modeling and g-computation as planned
+estimation approaches. Population-average ATE/ATT summaries can still be
+reported as secondary validation outputs when a source paper reports them.
 
 Current implemented code status:
 
@@ -40,7 +50,7 @@ Current implemented code status:
   scans, including active-comparator logic and condition outcomes.
 - The full causal agent team is not yet implemented. Only the cohort-builder
   portion of the future Execution Agent exists today.
-- FastOMOP still follows the existing descriptive NL→SQL workflow by default;
+- FastOMOP still follows the existing descriptive NL-to-SQL workflow by default;
   causal/descriptive routing remains a planned integration step.
 
 ---
@@ -98,18 +108,24 @@ rather than SQL alone.
 
 The proposed contribution is **not another standalone DAG generator.**
 
-Instead, the proposal extends FastOMOP with a new **Causal Reasoning Agent-Team**
-that inherits FastOMOP's existing
+Instead, the proposal extends FastOMOP with a **Causal Reasoning Agent-Team**
+connected to the existing NL2SQL / SQL execution layer. The causal layer should
+inherit FastOMOP's existing
 
 - orchestration
 - governance
 - observability
+- OMOP concept lookup and controlled SQL access
 
 layers.
 
 The new team transforms
 
 Natural-language causal question
+
+Descriptive vs causal routing
+
+NL2SQL / controlled OMOP extraction
 
 ↓
 
@@ -125,7 +141,7 @@ OMOP covariate extraction
 
 ↓
 
-Treatment effect estimation
+CATE-oriented treatment effect estimation
 
 ↓
 
@@ -134,6 +150,34 @@ Auditable causal report
 ---
 
 # Overall Architecture
+
+Operational architecture to implement:
+
+```text
+User question
+  -> FastOMOP Orchestrator
+  -> descriptive vs causal routing
+
+Descriptive path:
+  -> NL2SQL Agent-Team
+  -> SQL answer
+
+Causal path:
+  -> NL2SQL / controlled SQL data-access layer
+  -> Causal Reasoning Agent-Team
+  -> Target Trial specification
+  -> literature-grounded DAG
+  -> cohort and covariate extraction
+  -> CATE-oriented causal estimation
+  -> auditable causal report
+```
+
+The causal path depends on the NL2SQL / SQL execution layer for OMOP data
+access. The Causal Reasoning Agent-Team is therefore not a standalone data
+module; it is the planning, evidence, estimation, and reporting layer above
+controlled OMOP extraction.
+
+Legacy inherited-infrastructure sketch:
 
                     User Question
                            │
@@ -161,8 +205,9 @@ All agents automatically inherit:
 
 # Orchestrator Routing: Current Gap and Implementation Plan
 
-The diagram above assumes the FastOMOP Orchestrator already routes a
-user question to either agent-team. **It does not, today.**
+The diagram above assumes the FastOMOP Orchestrator already routes a user
+question to either the descriptive path or the causal workflow. **It does not,
+today.**
 
 Current state (as implemented in `agno_fastomop`):
 
@@ -194,11 +239,12 @@ Reuse the agent-with-tools pattern already sketched in
    instead of `run_omop_query()` directly.
 2. The supervisor is given two tools instead of two sub-agents:
    - `nl2sql_tool` — wraps the existing `run_omop_query()` pipeline
-   - `causal_tool` — wraps a new `run_causal_query()` entrypoint
-     driving the Causal Planner → DAG & Evidence Agent → Causal
-     Execution Agent pipeline (not yet built; today only the cohort
-     builder piece of Agent 3 exists, as a standalone script in
-     `causal/data_builder/cohort.py`, not agent-orchestrated)
+   - `causal_tool` - wraps a new `run_causal_query()` entrypoint that
+     reuses NL2SQL / controlled SQL tools for OMOP extraction, then drives
+     the Causal Planner, DAG & Evidence Agent, and Causal Execution Agent
+     pipeline (not yet built; today only the cohort builder piece of Agent 3
+     exists, as a standalone script in `causal/data_builder/cohort.py`, not
+     agent-orchestrated)
 3. `supervisor.txt` is rewritten to classify intent (descriptive vs.
    causal) before deciding which tool to call, following the same
    example-driven style already used for comparative queries — with
@@ -331,9 +377,9 @@ new-user design
 
 Estimand
 
-ATE
-Risk Difference
-Risk Ratio
+Primary: CATE
+Secondary: ATE / ATT summaries when useful for comparison
+Scales: risk difference, risk ratio, or other study-appropriate contrasts
 
 Design Selection Rule
 
@@ -354,10 +400,13 @@ When untreated controls are unavoidable, the Planner must:
 - flag the design as higher bias-risk in the target trial specification
 - require this flag to be carried into the final governance report
 
-Each estimand must be bound to a compatible estimator (see
-Agent 3 — Estimand/Estimator Contract). ATE requires IPW or
-standardization; ATT requires matching. The Planner's chosen
-estimand constrains which estimators Agent 3 is allowed to use.
+Each estimand must be bound to compatible estimators (see
+Agent 3 - Estimand/Estimator Contract). The primary target is CATE
+inference, with TMLE plus SuperLearner-style nuisance modeling and
+g-computation as planned estimator families. ATE/ATT summaries can be
+computed as secondary outputs when needed for validation against published
+studies. The Planner's chosen estimand constrains which estimators Agent 3 is
+allowed to use.
 
 Responsibilities
 
@@ -508,15 +557,15 @@ Cohort construction
 
 ↓
 
-Propensity score
+Nuisance outcome and treatment models
 
 ↓
 
-IPW
+TMLE / SuperLearner-style estimation
 
 ↓
 
-ATE estimation
+CATE and secondary ATE/ATT summaries
 
 ↓
 
@@ -597,11 +646,15 @@ must:
 Estimand / Estimator Contract
 
 The estimator used must match the estimand specified by the Causal
-Planner. IPW and standardization target the ATE; matching targets
-the ATT. The Execution Agent must validate that the requested
-estimand and the chosen estimation method are compatible, and must
-reject (or explicitly relabel) an analysis that mixes them, e.g.
-reporting a matched estimate as an ATE.
+Planner. The primary estimand is CATE, so the Execution Agent should support
+heterogeneous effect estimation through TMLE with SuperLearner-style nuisance
+models and g-computation. ATE and ATT can be reported as secondary summaries
+when they are compatible with the selected method and useful for comparison
+with a published validation study.
+
+The Execution Agent must validate that the requested estimand and chosen
+estimation method are compatible, and must reject or explicitly relabel an
+analysis that mixes them.
 
 Competing Risks
 
@@ -611,7 +664,7 @@ Execution Agent must not treat "no event, but the patient died
 before it could occur" the same as "no event, patient remained
 event-free and alive." At minimum, the method used (cause-specific
 hazard vs. subdistribution/Fine-Gray) must be stated, and the choice
-must be reported alongside the ATE.
+must be reported alongside the primary causal estimate.
 
 Outputs
 
@@ -631,7 +684,7 @@ follow_up_days
 
 Then
 
-Propensity Score
+CATE nuisance models
 
 ↓
 
@@ -639,7 +692,7 @@ Balance diagnostics
 
 ↓
 
-ATE
+CATE and secondary ATE/ATT summaries
 
 ↓
 
@@ -779,7 +832,7 @@ OMOP covariates
 
 ↓
 
-PS/IPW
+TMLE / g-computation
 
 ↓
 
@@ -893,8 +946,8 @@ effect), a point estimate can look precise while remaining
 systematically biased, which undermines the "auditable" claim of the
 whole workflow. At minimum, the Execution Agent's Sensitivity
 Analysis step should run a small negative-control outcome set
-alongside the primary ATE estimate. A full standalone Negative
-Control Agent-Team can still come later.
+alongside the primary CATE analysis and any secondary ATE/ATT summaries. A full
+standalone Negative Control Agent-Team can still come later.
 
 Potential future agents
 
@@ -928,7 +981,9 @@ Covariate Matrix
 
 Balance Diagnostics
 
-ATE Estimate
+CATE Estimate
+
+Secondary ATE/ATT Summaries
 
 Sensitivity Analysis
 

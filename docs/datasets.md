@@ -2,9 +2,10 @@
 
 This project separates dataset preparation from causal inference claims.
 
-## SNUH Synthetic Dataset
+## SYN-SNUH Synthetic Dataset
 
-The SNUH synthetic dataset was used to test:
+The SYN-SNUH synthetic dataset was used to test the FastOMOP and OMOP
+infrastructure pipeline:
 
 - OMOP CDM table access through DuckDB;
 - Athena vocabulary loading;
@@ -12,7 +13,13 @@ The SNUH synthetic dataset was used to test:
 - early causal cohort-builder mechanics.
 
 It is kept in the project as a test and demonstration dataset. It should not be
-presented as the primary causal inference dataset.
+presented as the primary causal inference dataset or as evidence that the full
+causal workflow is clinically valid. The main issue is not that SYN-SNUH is
+useless, but that it does not contain enough clinically realistic detail for
+causal adjustment in many target trial settings. For example, BMI or related
+anthropometric information is absent or not sufficiently usable, even though it
+can be an important baseline confounder and effect modifier in cardiometabolic
+questions.
 
 ## Local File Layout
 
@@ -35,7 +42,7 @@ data/
 
 These files are ignored by Git because they are large and/or derived.
 
-## SNUH Dataset Status
+## SYN-SNUH Dataset Status
 
 Current validated use:
 
@@ -47,15 +54,16 @@ Current validated use:
 Known limitations for causal inference:
 
 - synthetic temporal artifacts;
-- missing BMI;
+- missing or insufficiently detailed BMI/body-size information;
 - limited adverse-event signal;
 - some prevalent-user patterns;
 - sparse vital-sign coverage;
 - incomplete observation remapping;
 - limited drug hierarchy coverage for non-self ancestors.
 
-Because of these limitations, the SNUH synthetic dataset should be described as
-a development dataset, not as the final causal evidence source.
+Because of these limitations, the SYN-SNUH synthetic dataset should be described
+as a development dataset for infrastructure and workflow prototyping, not as the
+final causal evidence source.
 
 ## Vocabulary Loading
 
@@ -116,3 +124,25 @@ A more suitable causal dataset should ideally have:
 The causal workflow should remain OMOP-based so it can run against a better
 database without being tied to SNUH-specific artifacts.
 
+## Public Dataset Review
+
+The next work package should identify a public dataset that can support a
+published or reproducible causal question. Preference should go to datasets
+that have already been used in peer-reviewed causal studies, because they allow
+the pipeline output to be compared against published design choices, variables,
+assumptions, and expected results.
+
+The review should capture:
+
+- existing literature on reproducible causal studies;
+- available public datasets suitable for causal reasoning;
+- causal questions that can be tested with each dataset;
+- required exposure, outcome, baseline covariate, and effect-modifier
+  variables;
+- OMOP compatibility or feasibility of OMOP conversion;
+- sample size, follow-up, positivity, and missingness constraints;
+- expected results from the literature for future validation.
+
+The ideal validation dataset should support CATE estimation, not only an average
+treatment effect. That means it should contain enough baseline heterogeneity and
+sample size to evaluate clinically meaningful effect modifiers.

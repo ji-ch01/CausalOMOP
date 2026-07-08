@@ -58,6 +58,8 @@ Use these locations:
 scripts/snuh_etl/   SNUH-specific preparation and vocabulary cleanup
 causal/             causal cohort construction and future estimators
 docs/               project documentation
+docs/reproducible_causal_review.md
+                    literature and public dataset review work package
 notebooks/          exploratory analysis
 ```
 
@@ -104,4 +106,3 @@ Use folder names to mark ownership:
 - `causal` means reusable causal workflow code;
 - `docs` means human-facing project explanation;
 - submodule folders keep their upstream names.
-

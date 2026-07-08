@@ -32,7 +32,8 @@ censored
 - concept matching is still string-based;
 - explicit outcome concept sets are not implemented yet;
 - covariate extraction is not implemented yet;
-- no propensity score model or effect estimator is implemented yet;
+- no TMLE, SuperLearner-style nuisance modeling, g-computation, or CATE
+  estimator is implemented yet;
 - SNUH synthetic data is not the final causal inference dataset.
 
 ## Planned Direction
@@ -40,14 +41,22 @@ censored
 The causal workflow should become:
 
 ```text
-CausalStudySpec
+User question
+  -> descriptive vs causal routing
+  -> NL-to-SQL / controlled OMOP SQL extraction
+  -> CausalStudySpec
+  -> literature-grounded DAG
   -> OMOP concept sets
   -> cohort SQL
   -> baseline covariates
-  -> estimator
+  -> CATE-oriented estimators
   -> diagnostics
   -> report
 ```
 
-See `docs/causal_architecture.md` and `document_design.md`.
+The primary methodological target is CATE inference with OMOP CDM data.
+Planned estimators include TMLE with SuperLearner-style nuisance models and
+g-computation. Average treatment-effect summaries may still be reported as
+secondary outputs for comparison with published studies.
 
+See `docs/causal_architecture.md` and `document_design.md`.

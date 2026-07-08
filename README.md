@@ -1,7 +1,7 @@
 # K-OMOP-CDM
 
-Research repository for adapting FastOMOP to Korean OMOP CDM data and
-prototyping a causal reasoning extension for OMOP-based real-world evidence.
+Research repository for adapting FastOMOP to OMOP CDM data and prototyping a
+causal reasoning extension for OMOP-based real-world evidence.
 
 The repository has two complementary roles:
 
@@ -9,21 +9,41 @@ The repository has two complementary roles:
 - develop a causal workflow that can turn clinical causal questions into
   auditable cohort definitions, covariates, estimands, and reports.
 
-The SNUH synthetic dataset is kept in the project because it was useful for
-testing the ETL and FastOMOP NL-to-SQL stack. It is no longer treated as the
-primary dataset for causal inference.
+The SNUH synthetic dataset is kept because it is useful for testing ETL,
+FastOMOP, OMOP concept access, and early workflow mechanics. It is not treated
+as the primary validation dataset for causal inference.
 
 ## Current Scope
 
-The project is centered on this causal research question:
+The project direction is now broader than one fixed clinical question. The
+causal extension should remain connected to the existing NL-to-SQL system,
+because causal analyses still require structured OMOP extraction through SQL:
+concept checks, cohort construction, variable extraction, feasibility checks,
+and analytic dataset generation.
 
-> Does dapagliflozin, compared with sitagliptin, increase the 90-day risk of
-> urinary or genital infection among patients with Type 2 Diabetes Mellitus?
+Target workflow:
 
-The intended design is an active-comparator, new-user target trial emulation.
-The current implemented causal code is still an early prototype: it can build
-basic treatment/comparator cohorts and feasibility summaries, but it does not
-yet run the full causal agent workflow or final effect estimation.
+```text
+User question
+  -> descriptive vs causal routing
+  -> SQL / OMOP extraction through NL-to-SQL or controlled SQL tools
+  -> Causal Agent Team
+  -> Target Trial specification
+  -> literature-grounded DAG
+  -> cohort and covariate extraction
+  -> causal estimation
+  -> auditable report
+```
+
+The primary methodological objective is heterogeneous treatment-effect
+estimation, especially CATE estimation with OMOP CDM data. Planned estimators
+include TMLE with SuperLearner-style nuisance modeling and g-computation, with
+average treatment-effect summaries treated as secondary outputs when useful.
+
+The next validation step is to identify a public dataset and a causal question
+that has already been studied in the scientific literature, so the pipeline can
+later be compared against published assumptions, variables, and expected
+results.
 
 ## Repository Map
 
@@ -37,6 +57,7 @@ K-OMOP-CDM/
     datasets.md                   # local data policy and SNUH status
     fastomop_integration.md       # FastOMOP submodules and runtime notes
     causal_architecture.md        # proposed causal/NL2SQL architecture
+    reproducible_causal_review.md # next literature and dataset review package
 
   scripts/
     snuh_etl/                     # SNUH synthetic ETL and data-quality scripts
@@ -67,8 +88,10 @@ This repo currently keeps three FastOMOP-related dependencies as submodules:
 | `foem/` | evaluation and monitoring queries for FastOMOP |
 
 For this project, FastOMOP is used first as the descriptive OMOP query layer.
-The causal extension should sit close to the NL-to-SQL team because causal
-questions still need OMOP concept mapping and SQL cohort extraction.
+The causal extension should reuse this NL-to-SQL / SQL execution layer as its
+data-access layer. Causal planning and estimation are separate responsibilities,
+but they should not bypass OMOP concept mapping, controlled SQL generation, or
+schema-aware extraction.
 
 See [docs/fastomop_integration.md](docs/fastomop_integration.md).
 
@@ -178,15 +201,20 @@ It currently supports:
 The planned architecture adds:
 
 - causal intent routing inside the NL-to-SQL team;
+- controlled SQL / OMOP extraction as the data-access layer;
 - target trial specification;
-- DAG/evidence support;
+- literature-grounded DAG/evidence support using PubMed or reliable biomedical
+  sources;
 - OMOP concept-set mapping;
 - covariate extraction;
-- propensity score and IPW estimation;
+- CATE-oriented causal estimation with TMLE/SuperLearner and g-computation;
+- diagnostics for positivity, covariate balance, and overlap;
 - an auditable causal report.
 
 See [docs/causal_architecture.md](docs/causal_architecture.md) and
-[document_design.md](document_design.md).
+[document_design.md](document_design.md). See
+[docs/reproducible_causal_review.md](docs/reproducible_causal_review.md) for the
+next literature and dataset review work package.
 
 ## Notebooks
 
@@ -213,8 +241,14 @@ See [notebooks/README.md](notebooks/README.md).
 
 ## Current Next Steps
 
-- Implement explicit urinary/genital infection concept sets.
-- Update cohort building to use concept sets and seed-plus-descendant logic.
-- Add baseline covariate extraction around the index date.
-- Add propensity score/IPW estimation and balance diagnostics.
-- Wire causal intent routing into the FastOMOP NL-to-SQL workflow.
+- Review reproducible causal studies and public datasets suitable for causal
+  reasoning validation.
+- Select a public dataset and a published causal question that can be reproduced
+  or approximated with OMOP CDM variables.
+- Define the CATE target, candidate effect modifiers, baseline covariates, and
+  expected literature results for validation.
+- Wire descriptive-vs-causal routing into the FastOMOP NL-to-SQL workflow.
+- Replace string-based cohort logic with concept sets and seed-plus-descendant
+  OMOP extraction.
+- Add baseline covariate extraction, TMLE/SuperLearner, g-computation, and
+  auditable reporting.

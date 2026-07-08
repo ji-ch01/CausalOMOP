@@ -26,7 +26,12 @@ Git should ignore:
 - `*.duckdb`;
 - `backups/`;
 - `vocabulary/`;
-- any exported data files that contain patient-level rows.
+- exported patient-level rows;
+- intermediate analytic datasets that contain individual-level data.
 
-Use `docs/datasets.md` for dataset notes and rebuild instructions.
+The SNUH synthetic DuckDB files are development assets for OMOP/FastOMOP
+infrastructure testing. They should not be treated as the main causal inference
+validation dataset.
 
+Use `docs/datasets.md` for dataset notes, rebuild instructions, and the public
+dataset review plan.
