@@ -1,9 +1,9 @@
 [submodule "agno_fastomop"]
 	path = agno_fastomop
-	url = https://github.com/fastomop/agno_fastomop.git
+	url = https://github.com/ji-ch01/agno_fastomop.git
 [submodule "omcp"]
 	path = omcp
-	url = https://github.com/fastomop/omcp.git
+	url = https://github.com/ji-ch01/omcp.git
 [submodule "foem"]
 	path = foem
-	url = https://github.com/fastomop/foem.git
+	url = https://github.com/ji-ch01/foem.git
