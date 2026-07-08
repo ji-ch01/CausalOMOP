@@ -1,0 +1,9 @@
+[submodule "agno_fastomop"]
+	path = agno_fastomop
+	url = https://github.com/fastomop/agno_fastomop.git
+[submodule "omcp"]
+	path = omcp
+	url = https://github.com/fastomop/omcp.git
+[submodule "foem"]
+	path = foem
+	url = https://github.com/fastomop/foem.git
