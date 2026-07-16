@@ -1,0 +1,40 @@
+{
+  "study_id": "albumin_sepsis_28d_mimic_omop",
+  "status": "draft_blocked_on_drug_concept_mapping",
+  "source_question": "Among adult ICU patients with sepsis, what is the effect of crystalloids plus albumin versus crystalloids alone, initiated within 24 hours of ICU admission, on 28-day all-cause mortality?",
+  "reference": {
+    "doi": "10.1371/journal.pdig.0000721",
+    "code": "https://github.com/soda-inria/causal_ehr_mimic"
+  },
+  "data_source": "runtime-configured restricted OMOP dataset",
+  "target_trial": {
+    "population": "Adults with sepsis admitted to ICU",
+    "treatment": "Crystalloids plus albumin within 24 hours of ICU admission",
+    "comparator": "Crystalloids without albumin within 24 hours of ICU admission",
+    "time_zero": "ICU admission",
+    "grace_period_hours": 24,
+    "outcome": "All-cause mortality within 28 days",
+    "follow_up_days": 28,
+    "primary_estimand": "ATE",
+    "secondary_estimands": ["CATE by age", "CATE by sex", "CATE by septic shock"]
+  },
+  "design_constraints": [
+    "Align eligibility, treatment assignment, and start of follow-up to prevent immortal-time bias",
+    "Use only covariates measured before or during the predefined baseline window",
+    "Do not promote text-matched concepts to executable concept sets without human validation"
+  ],
+  "concept_sets": {
+    "sepsis": {"status": "candidate_pending_human_approval", "concept_ids": [132797]},
+    "septic_shock": {"status": "candidate_pending_human_approval", "concept_ids": [196236]},
+    "albumin": {"status": "present_but_unmapped_to_standard_concept", "concept_ids": []},
+    "crystalloids": {"status": "partially_mapped_requires_product_rules", "concept_ids": []}
+  },
+  "first_pass_covariates": [
+    "age", "sex", "race", "emergency admission", "SOFA", "lactate",
+    "mechanical ventilation", "vasopressors", "antibiotic classes"
+  ],
+  "published_benchmarks": {
+    "approximately_eligible": 18421,
+    "albumin_treated": 3559
+  }
+}

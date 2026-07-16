@@ -1,0 +1,21 @@
+{
+  "status": "provisional_pending_clinical_review",
+  "time_zero": "first recorded adult ICU visit_detail start per person",
+  "source_table": "visit_detail joined to care_site",
+  "datetime_column": "visit_detail_start_datetime",
+  "care_site_names": [
+    "Medical Intensive Care Unit (MICU)",
+    "Cardiac Vascular Intensive Care Unit (CVICU)",
+    "Medical/Surgical Intensive Care Unit (MICU/SICU)",
+    "Surgical Intensive Care Unit (SICU)",
+    "Trauma SICU (TSICU)",
+    "Coronary Care Unit (CCU)",
+    "Neuro Surgical Intensive Care Unit (Neuro SICU)"
+  ],
+  "known_limitations": [
+    "Only MICU/SICU currently maps to OMOP visit_detail concept 32037 Intensive Care",
+    "Other ICU locations are identified from care_site_name",
+    "The first ICU stay per person is used for initial feasibility",
+    "This definition has not yet been compared row-by-row with MIMIC icustays"
+  ]
+}

@@ -1,7 +1,7 @@
 # FastOMOP Integration
 
-This project uses FastOMOP as the descriptive OMOP query layer and as the base
-architecture for the planned causal reasoning extension.
+This project uses OMCP as the shared governed OMOP access layer for both
+FastOMOP descriptive queries and CausalOMOP causal workflows.
 
 ## Included FastOMOP Repositories
 
@@ -64,6 +64,56 @@ NL-to-SQL team
 
 The orchestrator should route intent. The causal planner should create a target
 trial specification before SQL is generated.
+
+## Shared MCP Contract
+
+FastOMOP remains backward compatible with the existing `Select_Query` tool.
+CausalOMOP uses `Causal_Select_Query`, which additionally requires:
+
+- an operation (`aggregate_feasibility`, `cohort_build`, `diagnostics`, or
+  `causal_estimation`);
+- the workflow `run_id` and `study_id`;
+- the workflow mode and gate decisions;
+- the boolean permissions produced by the Execution Agent.
+
+Each readiness evaluation writes `mcp_context.json` next to the run artifacts.
+OMCP validates this context and fails closed before submitting unauthorized
+causal SQL. This is a technical authorization check and does not replace human
+clinical validation.
+
+For the MIMIC-IV OMOP conversion, configure the shared server with:
+
+```text
+DB_TYPE=bigquery
+DB_PROJECT=<your-gcp-project>
+DB_DATASET=<your-omop-dataset>
+DB_READ_ONLY=true
+CDM_SCHEMA=<your-omop-dataset>
+VOCAB_SCHEMA=<your-omop-dataset>
+```
+
+Google Application Default Credentials are used for authentication.
+
+Install the CausalOMOP MCP client and run governed feasibility with:
+
+```powershell
+pip install -r requirements-mcp.txt
+python -m causal.cli workflow feasibility <run_id> --transport mcp
+```
+
+The Data Science Agent can also retrieve standardized vocabulary candidates:
+
+```powershell
+python -m causal.cli workflow plan <run_id> --with-mcp
+```
+
+These candidates are written under each phenotype in `analysis_plan.json`. They
+never change `concept_ids`, approve a mapping, or enable execution; a reviewer
+must copy approved identifiers into the protocol through the existing clinical
+mapping gate.
+
+The resulting `feasibility.json` records `execution_transport = "omcp"`, the
+OMCP query hash, run identifier, study identifier, and causal permission flag.
 
 ## Local Configuration
 
@@ -139,4 +189,3 @@ git -C foem status -sb
 
 If a submodule is edited, commit inside that submodule first, then commit the
 updated pointer in the root repo.
-

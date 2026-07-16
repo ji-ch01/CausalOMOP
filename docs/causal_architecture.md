@@ -1,5 +1,10 @@
 # Causal Architecture
 
+> This file describes the earlier prototype. The clarified normative architecture is
+> [CausalOMOP Causal Roadmap](causal_roadmap.md). In particular, causal design and
+> identification must precede OMOP extraction; the database must not determine
+> the scientific DAG or adjustment set.
+
 The causal extension should transform a natural-language causal question into an
 auditable OMOP-based study workflow. SQL is necessary, but it is not sufficient:
 the system also needs target trial specification, literature-grounded causal
@@ -23,11 +28,10 @@ The NL-to-SQL layer can serve as the data-access layer for causal work:
 ```text
 User question
   -> descriptive vs causal routing
-  -> SQL / OMOP extraction through NL-to-SQL or controlled SQL tools
-  -> Causal Agent Team
-  -> Target Trial specification
-  -> literature-grounded DAG
-  -> cohort and covariate extraction
+  -> Causal question and Target Trial specification
+  -> causal estimand and literature-grounded DAG
+  -> deterministic identification and human review
+  -> controlled OMOP mapping and feasibility extraction
   -> causal estimation
   -> auditable report
 ```

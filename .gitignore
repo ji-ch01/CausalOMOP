@@ -6,6 +6,7 @@ env/
 
 # ── Data — large binary / CSV files (not versioned) ──────────────────────────
 # To reproduce: run scripts/load_vocabulary.py after downloading from Athena
+data
 data/vocabulary/
 data/*.duckdb
 *.duckdb
@@ -29,6 +30,7 @@ build/
 
 # ── Environment / secrets ─────────────────────────────────────────────────────
 .env
+artifacts/runs/
 # sample.env and omcp/sample.env are kept (they contain no secrets)
 
 # ── OS / editor ───────────────────────────────────────────────────────────────

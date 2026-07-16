@@ -1,0 +1,3 @@
+-r requirements-bigquery.txt
+openai>=1.68.0,<3
+python-dotenv>=1.0.1,<2
