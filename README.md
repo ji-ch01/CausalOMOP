@@ -1,4 +1,4 @@
-                                                     # CausalOMOP
+# CausalOMOP
 
 Research repository for building an auditable causal-inference workflow over
 observational health data represented in OMOP CDM.
