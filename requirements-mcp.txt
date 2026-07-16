@@ -1,0 +1,2 @@
+-r requirements-bigquery.txt
+mcp>=1.27.0,<2
