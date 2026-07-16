@@ -2,6 +2,27 @@
 
 This project separates dataset preparation from causal inference claims.
 
+## Primary Analysis Dataset (MIMIC-IV 2.2)
+
+MIMIC-IV has been converted to OMOP CDM 5.3.1 in BigQuery. The dataset roles
+are deliberately separated:
+
+| Role | Runtime environment variable |
+|---|---|
+| GCP project | `CAUSALOMOP_BQ_PROJECT` |
+| analysis-ready OMOP CDM | `CAUSALOMOP_BQ_OMOP_DATASET` |
+| vocabulary preparation/audit | `CAUSALOMOP_BQ_VOCAB_DATASET` |
+| staging, lookups, intermediate ETL | `CAUSALOMOP_BQ_ETL_DATASET` |
+| tests, run logs, and metrics | `CAUSALOMOP_BQ_METRICS_DATASET` |
+
+Analyses must read clinical data from the configured OMOP role. They must not
+silently use staging tables. Generated quality metrics and provenance belong in
+the configured metrics role; the clean OMOP dataset is treated as read-only.
+
+Real project identifiers, dataset names, bucket paths, credentials, converted
+tables, and patient-level artifacts are local configuration and must not be
+committed or published.
+
 ## SYN-SNUH Synthetic Dataset
 
 The SYN-SNUH synthetic dataset was used to test the FastOMOP and OMOP
