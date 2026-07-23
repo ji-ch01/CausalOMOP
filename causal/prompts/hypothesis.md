@@ -39,7 +39,10 @@ Rules:
 - Use explicit time zero, exposure grace period, and follow-up.
 - If the question is underspecified, choose conservative draft values and list
   every assumption in assumptions_requiring_review.
-- Covariates are candidates for human/evidence review, not an approved adjustment set.
+- Covariates are an unclassified brainstorm list, not an approved adjustment set: none of
+  them has a causal role yet. A later DAG stage assigns each one an explicit role
+  (confounder, treatment-only cause, outcome-only cause, mediator, or collider) before
+  any of them can be used for adjustment.
 - Literature search terms must be concise clinical noun phrases, not sentences,
   Boolean expressions, PubMed field tags, eligibility criteria, or assumptions.
 - Include common clinical synonyms when useful, with at most 3 terms per role.

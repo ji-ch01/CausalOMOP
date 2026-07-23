@@ -21,7 +21,9 @@ class LocalLLMConfig:
     model: str = "local-model"
     base_url: str = "http://localhost:11434/v1"
     timeout_seconds: float = 120.0
-    max_completion_tokens: int = 2500
+    # Kept in sync with OpenRouterGPTConfig.max_completion_tokens — see that
+    # field's comment for why 2500 was raised.
+    max_completion_tokens: int = 6000
 
     @classmethod
     def from_env(cls) -> "LocalLLMConfig":

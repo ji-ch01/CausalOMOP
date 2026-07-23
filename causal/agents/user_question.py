@@ -8,18 +8,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from causal.agents.hypothesis import DAG_RELATIONS, HypothesisAgent, HypothesisArtifact
-from causal.literature.pubmed import PubMedArticle, PubMedClient
+from causal.agents.hypothesis import (
+    DAG_VARIABLE_ROLES,
+    ROLE_ALLOWED_TEMPORAL_CLASSES,
+    HypothesisAgent,
+    HypothesisArtifact,
+)
+from causal.literature.orchestrator import LiteratureArticle, LiteratureOrchestrator
 from causal.llm.base import LLMCallable
+from causal.roadmap import EDGE_CERTAINTY
+
+
+def _parsed_certainty(item: dict) -> str:
+    certainty = item.get("certainty", "established")
+    return certainty if certainty in EDGE_CERTAINTY else "established"
 
 
 _STUDY_ID = re.compile(r"^[a-z][a-z0-9_]{2,79}$")
+_STUDY_ID_INVALID_CHARS = re.compile(r"[^a-z0-9_]+")
 _LITERATURE_TERM_FIELDS = (
     "population_terms", "treatment_terms", "comparator_terms", "outcome_terms"
 )
 _ABSTRACT_PREVIEW_CHARS = 600
 _MAX_TERMS_PER_ROLE = 3
 _MAX_TERM_CHARS = 80
+_MAX_DAG_ARTICLES = 10
 
 
 @dataclass(frozen=True)
@@ -67,7 +80,7 @@ class UserQuestionHypothesisService:
         question: str,
         llm: LLMCallable,
         data_source: str | None = None,
-        pubmed: PubMedClient | None = None,
+        literature: LiteratureOrchestrator | None = None,
         on_llm_output: LLMOutputCallback | None = None,
     ) -> GeneratedHypothesis:
         raw = llm(self.build_prompt(question))
@@ -78,9 +91,9 @@ class UserQuestionHypothesisService:
         protocol = self.parse_response(question, raw)
         if data_source:
             protocol["data_source"] = data_source
-        if pubmed is not None:
+        if literature is not None and literature.is_configured():
             protocol = self._attach_literature_dag(
-                protocol, llm, pubmed, llm_outputs, on_llm_output
+                protocol, llm, literature, llm_outputs, on_llm_output
             )
         return GeneratedHypothesis(
             protocol,
@@ -92,7 +105,7 @@ class UserQuestionHypothesisService:
         self,
         protocol: dict,
         llm: LLMCallable,
-        pubmed: PubMedClient,
+        literature: LiteratureOrchestrator,
         llm_outputs: list[LLMRawOutput],
         on_llm_output: LLMOutputCallback | None,
     ) -> dict:
@@ -100,23 +113,25 @@ class UserQuestionHypothesisService:
 
         A missing/empty search result or a malformed second-stage LLM response
         degrades to an empty candidate_dag with an auditable note, instead of
-        failing the whole hypothesis draft. Genuine PubMed/LLM transport errors
-        (network, auth, ...) are not caught here and propagate normally.
+        failing the whole hypothesis draft. Genuine transport errors from a
+        literature source or the LLM (network, auth, ...) are not caught here
+        and propagate normally; only per-source retrieval failures are
+        absorbed, inside `LiteratureOrchestrator` itself.
         """
         target = protocol.get("target_trial", {})
-        articles: tuple[PubMedArticle, ...] = ()
+        articles: tuple[LiteratureArticle, ...] = ()
         term = ""
         try:
             term = self._literature_search_term(protocol)
-            pmids = pubmed.search(term, retmax=8)
-            articles = pubmed.fetch_abstracts(pmids) if pmids else ()
+            articles = literature.search_and_fetch(term, limit=_MAX_DAG_ARTICLES)
         except ValueError:
             articles = ()
 
-        edges: list[dict] = []
+        variables: list[dict] = []
+        relations: list[dict] = []
         rejected = 0
         if not articles:
-            note = "No PubMed literature could be retrieved for this question; candidate_dag is empty."
+            note = "No literature could be retrieved for this question; candidate_dag is empty."
         else:
             try:
                 raw = llm(self._build_dag_prompt(target, articles))
@@ -124,20 +139,24 @@ class UserQuestionHypothesisService:
                 llm_outputs.append(dag_output)
                 if on_llm_output is not None:
                     on_llm_output(dag_output)
-                edges, rejected = self._parse_dag_response(raw, {article.pmid for article in articles})
+                known_citation_ids = {article.citation_id for article in articles}
+                variables, relations, rejected = self._parse_dag_response(raw, known_citation_ids)
             except ValueError:
-                edges, rejected = [], 0
+                variables, relations, rejected = [], [], 0
             note = (
-                f"{len(edges)} literature-grounded candidate DAG edge(s) proposed "
-                f"from {len(articles)} retrieved article(s)"
+                f"{len(variables)} literature-grounded candidate DAG variable(s) and "
+                f"{len(relations)} covariate relation(s) proposed from {len(articles)} retrieved article(s)"
             )
             if rejected:
-                note += f"; {rejected} edge(s) rejected for ungrounded or invalid content"
+                note += f"; {rejected} entr(y/ies) rejected for ungrounded or invalid content"
 
-        protocol["candidate_dag"] = edges
+        protocol["candidate_dag"] = variables
+        protocol["covariate_relations"] = relations
         protocol["literature_evidence"] = {
             "search_query": term,
-            "retrieved_pmids": [article.pmid for article in articles],
+            "retrieved_citations": [
+                {"source": article.source, "id": article.citation_id} for article in articles
+            ],
         }
         protocol.setdefault("design_constraints", [])
         protocol["design_constraints"] = list(protocol["design_constraints"]) + [note]
@@ -193,10 +212,11 @@ class UserQuestionHypothesisService:
                 raise ValueError(f"literature_search.{required} requires at least one term")
         return normalized
 
-    def _build_dag_prompt(self, target: dict, articles: tuple[PubMedArticle, ...]) -> str:
+    def _build_dag_prompt(self, target: dict, articles: tuple[LiteratureArticle, ...]) -> str:
         template = self.dag_prompt_path.read_text(encoding="utf-8")
         listed = "\n".join(
-            f"- PMID {article.pmid}: {article.title} — {article.abstract[:_ABSTRACT_PREVIEW_CHARS]}"
+            f"- [{article.source}, evidence={article.evidence_level}] {article.citation_id}: "
+            f"{article.title} — {article.abstract[:_ABSTRACT_PREVIEW_CHARS]}"
             for article in articles
         )
         replacements = {
@@ -213,7 +233,9 @@ class UserQuestionHypothesisService:
         return template
 
     @staticmethod
-    def _parse_dag_response(raw: str, known_pmids: set[str]) -> tuple[list[dict], int]:
+    def _parse_dag_response(
+        raw: str, known_citation_ids: set[str]
+    ) -> tuple[list[dict], list[dict], int]:
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("LLM returned an empty DAG response")
         try:
@@ -223,25 +245,56 @@ class UserQuestionHypothesisService:
         if not isinstance(payload, dict) or not isinstance(payload.get("candidate_dag"), list):
             raise ValueError("DAG response must contain a candidate_dag list")
 
-        accepted: list[dict] = []
         rejected = 0
+        accepted_variables: list[dict] = []
+        known_labels: set[str] = set()
         for item in payload["candidate_dag"]:
+            role = item.get("role") if isinstance(item, dict) else None
+            temporal = item.get("temporal_classification") if isinstance(item, dict) else None
             if (
                 isinstance(item, dict)
-                and isinstance(item.get("confounder"), str) and item["confounder"].strip()
-                and item.get("relation") in DAG_RELATIONS
-                and isinstance(item.get("pmid"), str) and item["pmid"] in known_pmids
+                and isinstance(item.get("label"), str) and item["label"].strip()
+                and role in DAG_VARIABLE_ROLES
+                and temporal in ROLE_ALLOWED_TEMPORAL_CLASSES.get(role, ())
+                and isinstance(item.get("pmid"), str) and item["pmid"] in known_citation_ids
                 and isinstance(item.get("rationale"), str) and item["rationale"].strip()
             ):
-                accepted.append({
-                    "confounder": item["confounder"].strip(),
-                    "relation": item["relation"],
+                label = item["label"].strip()
+                accepted_variables.append({
+                    "label": label,
+                    "role": role,
+                    "temporal_classification": temporal,
                     "pmid": item["pmid"],
                     "rationale": item["rationale"].strip(),
+                    "observed": item.get("observed", True) if isinstance(item.get("observed", True), bool) else True,
+                    "certainty": _parsed_certainty(item),
                 })
+                known_labels.add(label)
             else:
                 rejected += 1
-        return accepted, rejected
+
+        accepted_relations: list[dict] = []
+        raw_relations = payload.get("covariate_relations", [])
+        if isinstance(raw_relations, list):
+            for item in raw_relations:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("source"), str) and item["source"].strip() in known_labels
+                    and isinstance(item.get("target"), str) and item["target"].strip() in known_labels
+                    and item["source"].strip() != item["target"].strip()
+                    and isinstance(item.get("pmid"), str) and item["pmid"] in known_citation_ids
+                    and isinstance(item.get("rationale"), str) and item["rationale"].strip()
+                ):
+                    accepted_relations.append({
+                        "source": item["source"].strip(),
+                        "target": item["target"].strip(),
+                        "pmid": item["pmid"],
+                        "rationale": item["rationale"].strip(),
+                        "certainty": _parsed_certainty(item),
+                    })
+                else:
+                    rejected += 1
+        return accepted_variables, accepted_relations, rejected
 
     def parse_response(self, original_question: str, raw: str) -> dict:
         if not isinstance(raw, str) or not raw.strip():
@@ -255,8 +308,12 @@ class UserQuestionHypothesisService:
         if protocol.get("source_question") != original_question.strip():
             raise ValueError("LLM must preserve the original source_question exactly")
         study_id = protocol.get("study_id")
-        if not isinstance(study_id, str) or not _STUDY_ID.fullmatch(study_id):
+        if not isinstance(study_id, str) or not study_id.strip():
             raise ValueError("LLM produced an invalid study_id")
+        normalized_study_id = _STUDY_ID_INVALID_CHARS.sub("_", study_id.strip().lower())
+        if not _STUDY_ID.fullmatch(normalized_study_id):
+            raise ValueError("LLM produced an invalid study_id")
+        protocol["study_id"] = normalized_study_id
         assumptions = protocol.get("assumptions_requiring_review", [])
         if not isinstance(assumptions, list) or not all(isinstance(item, str) for item in assumptions):
             raise ValueError("assumptions_requiring_review must be a list of strings")

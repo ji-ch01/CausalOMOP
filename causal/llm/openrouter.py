@@ -20,7 +20,12 @@ class OpenRouterGPTConfig:
     model: str = "openai/gpt-oss-120b"
     base_url: str = "https://openrouter.ai/api/v1"
     timeout_seconds: float = 90.0
-    max_completion_tokens: int = 2500
+    # Reasoning models (e.g. gpt-oss) can spend most of this budget on a
+    # free-form "analysis" preamble before emitting the requested JSON,
+    # especially for the DAG stage where ~15+ retrieved abstracts are in
+    # context; 2500 was observed truncating mid-reasoning and silently
+    # falling back to an empty candidate_dag.
+    max_completion_tokens: int = 6000
 
     @classmethod
     def from_env(cls, model: str | None = None) -> "OpenRouterGPTConfig":

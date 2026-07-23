@@ -138,6 +138,24 @@ class CausalRoadmapTests(unittest.TestCase):
                 outcome_id="mortality",
             )
 
+    def test_comparator_defaults_to_empty_and_can_be_set_explicitly(self):
+        bare = CausalDAG(
+            nodes=(node("albumin", "exposure", "treatment"), node("mortality", "outcome", "outcome")),
+            edges=(edge("albumin", "mortality"),),
+            exposure_id="albumin",
+            outcome_id="mortality",
+        )
+        self.assertEqual(bare.comparator, "")
+
+        with_comparator = CausalDAG(
+            nodes=(node("albumin", "exposure", "treatment"), node("mortality", "outcome", "outcome")),
+            edges=(edge("albumin", "mortality"),),
+            exposure_id="albumin",
+            outcome_id="mortality",
+            comparator="Crystalloids alone",
+        )
+        self.assertEqual(with_comparator.comparator, "Crystalloids alone")
+
     def test_rejects_temporally_reversed_edge(self):
         with self.assertRaisesRegex(ValueError, "temporal order"):
             CausalDAG(

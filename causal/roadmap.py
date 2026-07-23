@@ -21,10 +21,23 @@ NODE_ROLES = {
     "prognostic",
     "effect_modifier",
     "selection",
+    "instrument",
     "other",
 }
 NODE_TIMINGS = ("baseline", "treatment", "post_treatment", "outcome")
 _TIMING_ORDER = {name: index for index, name in enumerate(NODE_TIMINGS)}
+
+# Evidence-provenance status (CausalEdge.status) answers "how was this edge
+# authorized?". EDGE_CERTAINTY answers a different question: "how settled is
+# the causal claim itself?". An edge can be evidence_supported (a citation
+# was given) while the direction it asserts is still contested in that same
+# literature -- these two axes are kept independent on purpose.
+EDGE_CERTAINTY = {
+    "established",       # consistent, direct evidence for this direction
+    "plausible",          # reasonable clinical hypothesis, not strongly evidenced
+    "contested",           # the literature disagrees on this relationship or its direction
+    "unknown_direction",  # an association is documented but causal direction is unclear
+}
 
 
 def _require_text(value: str, field: str) -> str:
@@ -139,6 +152,7 @@ class CausalEdge:
     rationale: str
     evidence_ids: tuple[str, ...] = ()
     status: str = "proposed"
+    certainty: str = "established"
 
     def __post_init__(self) -> None:
         if self.source == self.target:
@@ -147,6 +161,8 @@ class CausalEdge:
             raise ValueError("A causal edge requires a rationale")
         if self.status not in {"proposed", "expert_approved", "evidence_supported"}:
             raise ValueError(f"Unknown causal edge status: {self.status}")
+        if self.certainty not in EDGE_CERTAINTY:
+            raise ValueError(f"Unknown causal edge certainty: {self.certainty}")
 
 
 @dataclass(frozen=True)
@@ -173,6 +189,15 @@ class CausalDAG:
     edges: tuple[CausalEdge, ...]
     exposure_id: str
     outcome_id: str
+    # The active comparator (e.g. "piperacillin-tazobactam" when exposure is
+    # "ceftriaxone"): identification and adjustment are computed over the
+    # single binary exposure node, but the comparator must still be visible
+    # on the DAG itself rather than living only in prose, so a reviewer can
+    # see which contrast the graph actually represents. Optional at this
+    # generic graph layer (default "") since not every CausalDAG consumer is
+    # a target-trial emulation; the clinical bridge that builds a DAG from a
+    # HypothesisArtifact always supplies it.
+    comparator: str = ""
 
     def __post_init__(self) -> None:
         node_map = self.node_map
@@ -232,7 +257,10 @@ class CausalDAG:
                 blockers.append(f"unobserved_node:{node_id}")
             if node.timing != "baseline":
                 blockers.append(f"not_baseline:{node_id}")
-            if node.role in {"mediator", "collider", "selection"}:
+            if node.role in {"mediator", "collider", "selection", "instrument"}:
+                # Instruments are excluded alongside mediators/colliders: conditioning on a
+                # pure instrument does not block a backdoor path and can amplify bias from
+                # any remaining unmeasured confounding (Bhattacharya & Vogt, 2007).
                 blockers.append(f"forbidden_role:{node_id}:{node.role}")
         for node_id in set(selected) & self.descendants(self.exposure_id):
             blockers.append(f"descendant_of_exposure:{node_id}")
@@ -378,3 +406,60 @@ class CausalStudySpecification:
             "counterfactual_contrast": self.estimand.counterfactual_contrast,
         }
         return result
+
+
+def to_dagitty(dag: CausalDAG, adjustment_set: tuple[str, ...] = ()) -> str:
+    """Serialize a CausalDAG to dagitty text syntax.
+
+    Paste the output into https://dagitty.net (Model > Import model from
+    text). No plotting library or system binary is required for this: it is
+    plain text generation, and dagitty.net renders and lays it out in the
+    browser. `adjustment_set` (node_ids) is optional and only changes how the
+    diagram is annotated; it never mutates `dag`.
+    """
+    labels = [node.label for node in dag.nodes]
+    if len(labels) != len(set(labels)):
+        raise ValueError("Cannot export to dagitty: duplicate node labels would collide")
+    adjusted = set(adjustment_set)
+
+    by_timing: dict[str, list[CausalNode]] = {timing: [] for timing in NODE_TIMINGS}
+    for node in dag.nodes:
+        by_timing[node.timing].append(node)
+
+    lines = ["dag {"]
+    if dag.comparator:
+        exposure_label = dag.node_map[dag.exposure_id].label
+        lines.append(f'// active comparator: "{exposure_label}" vs "{dag.comparator}"')
+    for timing_index, timing in enumerate(NODE_TIMINGS):
+        nodes_at_timing = by_timing[timing]
+        count = len(nodes_at_timing)
+        for slot, node in enumerate(nodes_at_timing):
+            x = timing_index * 2
+            y = (slot - (count - 1) / 2) * 1.5
+            attrs = []
+            if node.node_id == dag.exposure_id:
+                attrs.append("exposure")
+            if node.node_id == dag.outcome_id:
+                attrs.append("outcome")
+            if node.node_id in adjusted:
+                attrs.append("adjusted")
+            if not node.observed:
+                attrs.append("latent")
+            attrs.append(f'pos="{x},{y:.2f}"')
+            lines.append(f"{_dagitty_id(node.label)} [{','.join(attrs)}]")
+    for edge in dag.edges:
+        source_label = dag.node_map[edge.source].label
+        target_label = dag.node_map[edge.target].label
+        tag = "evidence" if edge.status == "evidence_supported" else edge.status
+        if edge.certainty != "established":
+            tag += f"|{edge.certainty}"
+        comment = f"  // [{tag}] {edge.rationale}"
+        if edge.evidence_ids:
+            comment += f" (PMID: {', '.join(edge.evidence_ids)})"
+        lines.append(f"{_dagitty_id(source_label)} -> {_dagitty_id(target_label)}{comment}")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _dagitty_id(label: str) -> str:
+    return '"' + label.replace('"', '\\"') + '"'
