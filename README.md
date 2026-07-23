@@ -314,7 +314,9 @@ a final run requires full approval.
 
 See [docs/responsible_demo_guide.md](docs/responsible_demo_guide.md) for a
 step-by-step demonstration script and the boundary between technical findings
-and causal results.
+and causal results. An English version, updated for the `start-question` /
+PubMed-grounded DAG flow and grounded in real stored runs, is at
+[docs/responsible_demo_guide_en.md](docs/responsible_demo_guide_en.md).
 
 The current natural-language prototype is documented in
 [docs/llm_hypothesis_integration.md](docs/llm_hypothesis_integration.md). LLM

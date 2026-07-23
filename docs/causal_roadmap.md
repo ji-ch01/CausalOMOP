@@ -88,11 +88,12 @@ OMOP availability must not determine the DAG. An important unobserved confounder
 stays in the causal model and becomes an identification limitation; it must not
 silently disappear because no convenient column exists.
 
-## Role of LLM, PubMed and MCP
+## Role of LLM, literature retrieval and MCP
 
 - The LLM is a co-pilot that proposes structured artifacts and critiques known
   bias patterns. It never declares its own output identified or approved.
-- PubMed grounds clinical relationships and edge rationales. A PMID supports an
+- PubMed and OpenAlex, queried together through `LiteratureOrchestrator`,
+  ground clinical relationships and edge rationales. A citation supports an
   assertion; it does not prove the whole DAG is correct.
 - MCP/OMCP provides governed metadata, vocabulary lookup and aggregate data
   audits after the scientific specification is established.
@@ -121,8 +122,8 @@ Migration should proceed incrementally:
 6. Add the observed-data estimand and estimator plan only after identification
    and data-support audits pass.
 
-PubMed and MCP code remain reusable, but they move under the appropriate Roadmap
-stage instead of defining the pipeline order.
+Literature-retrieval and MCP code remain reusable, but they move under the
+appropriate Roadmap stage instead of defining the pipeline order.
 
 ## Current implementation boundary
 
