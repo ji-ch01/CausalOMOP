@@ -8,12 +8,15 @@ import sys
 
 from causal.bigquery import BigQueryOMOPGateway, make_google_client
 from causal.config import BigQueryDatasets
-from causal.agents import UserQuestionHypothesisService
+from causal.agents import HypothesisAgent, UserQuestionHypothesisService
+from causal.agents.dag_identification import assess_identification
+from causal.agents.hypothesis import DAG_VARIABLE_ROLES
 from causal.agents.user_question import LLMRawOutput
-from causal.literature import PubMedClient
+from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
 from causal.mcp_client import OMCPClient
 from causal.orchestrator import WorkflowManager
+from causal.roadmap import to_dagitty
 
 
 def _print_raw_llm_output(output: LLMRawOutput) -> None:
@@ -55,7 +58,7 @@ def main() -> int:
     workflow_question.add_argument("--mode", choices=("exploratory", "final"), default="exploratory")
     workflow_question.add_argument(
         "--skip-literature", action="store_true",
-        help="skip PubMed retrieval and the literature-grounded DAG draft",
+        help="skip PubMed/OpenAlex retrieval and the literature-grounded DAG draft",
     )
     workflow_status = workflow_sub.add_parser("status")
     workflow_status.add_argument("run_id")
@@ -65,6 +68,29 @@ def main() -> int:
     workflow_gate.add_argument("status", choices=("approved", "rejected", "provisional"))
     workflow_gate.add_argument("--reviewer", required=True)
     workflow_gate.add_argument("--comment")
+    workflow_covariate_review = workflow_sub.add_parser(
+        "covariate-review",
+        help="accept (with a causal role) or reject a pending first-pass covariate",
+    )
+    workflow_covariate_review.add_argument("run_id")
+    workflow_covariate_review.add_argument("label")
+    workflow_covariate_review.add_argument("decision", choices=("accept", "reject"))
+    workflow_covariate_review.add_argument("--reviewer", required=True)
+    workflow_covariate_review.add_argument(
+        "--role", choices=DAG_VARIABLE_ROLES,
+        help="required when decision=accept",
+    )
+    workflow_covariate_review.add_argument(
+        "--comment", help="rationale; required when decision=accept"
+    )
+    workflow_covariate_review.add_argument("--pmid", default="")
+    workflow_covariate_review.add_argument(
+        "--unobserved", action="store_true", help="mark the accepted variable as latent/unmeasured"
+    )
+    workflow_covariate_review.add_argument(
+        "--certainty", choices=("established", "plausible", "contested", "unknown_direction"),
+        default="established",
+    )
     workflow_advance = workflow_sub.add_parser("advance")
     workflow_advance.add_argument("run_id")
     workflow_hypothesis = workflow_sub.add_parser("hypothesis")
@@ -98,6 +124,15 @@ def main() -> int:
         "followup-audit", help="audit aggregate 28-day follow-up observability through OMCP"
     )
     workflow_followup_audit.add_argument("run_id")
+    workflow_dag_export = workflow_sub.add_parser(
+        "dag-export",
+        help="export the literature-grounded DAG as dagitty text (paste into dagitty.net)",
+    )
+    workflow_dag_export.add_argument("run_id")
+    workflow_dag_export.add_argument(
+        "--highlight-adjustment-set", action="store_true",
+        help="mark the computed minimum backdoor adjustment set as [adjusted] in the export",
+    )
     args = parser.parse_args()
     datasets = BigQueryDatasets.from_env()
 
@@ -107,12 +142,15 @@ def main() -> int:
             state = manager.start(args.protocol, args.mode)
         elif args.workflow_command == "start-question":
             resolved_llm = build_hypothesis_llm(model=args.model)
-            pubmed = None if args.skip_literature else PubMedClient()
+            literature = (
+                None if args.skip_literature
+                else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
+            )
             generated = UserQuestionHypothesisService().generate(
                 args.question,
                 resolved_llm.call,
                 data_source=datasets.fq_dataset("omop"),
-                pubmed=pubmed,
+                literature=literature,
                 on_llm_output=_print_raw_llm_output,
             )
             state = manager.start_generated(
@@ -124,6 +162,18 @@ def main() -> int:
             state = manager.decide_gate(args.run_id, args.gate, args.status, args.reviewer, args.comment)
         elif args.workflow_command == "hypothesis":
             state = manager.run_hypothesis_agent(args.run_id)
+        elif args.workflow_command == "covariate-review":
+            state = manager.review_covariate(
+                args.run_id,
+                args.label,
+                args.decision,
+                args.reviewer,
+                args.comment,
+                role=args.role,
+                pmid=args.pmid,
+                observed=not args.unobserved,
+                certainty=args.certainty,
+            )
         elif args.workflow_command == "plan":
             lookup = (
                 OMCPClient(project=datasets.project, dataset=datasets.omop)
@@ -162,6 +212,25 @@ def main() -> int:
                 OMCPClient(project=datasets.project, dataset=datasets.omop),
                 datasets,
             )
+        elif args.workflow_command == "dag-export":
+            protocol_path = manager.runs_dir / args.run_id / "protocol.json"
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            hypothesis = HypothesisAgent().run(protocol)
+            result = assess_identification(hypothesis)
+            adjustment_set = (
+                result.minimum_adjustment_sets[0]
+                if args.highlight_adjustment_set and result.minimum_adjustment_sets
+                else ()
+            )
+            print(to_dagitty(result.dag, adjustment_set))
+            print(
+                f"// identified_by_backdoor_adjustment={result.identified_by_backdoor_adjustment} "
+                f"confounder_count={result.confounder_count}",
+                file=sys.stderr,
+            )
+            for warning in result.warnings:
+                print(f"// warning: {warning}", file=sys.stderr)
+            return 0
         else:
             state = manager.advance(args.run_id)
         print(json.dumps(state.to_dict(), indent=2))

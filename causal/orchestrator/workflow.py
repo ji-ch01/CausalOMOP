@@ -7,10 +7,12 @@ import csv
 import io
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from causal.orchestrator.state import ApprovalGate, NEXT_PHASE, RunState
 from causal.agents import DataScienceAgent, ExecutionAgent, HypothesisAgent
+from causal.agents.hypothesis import DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
 from causal.agents.user_question import GeneratedHypothesis
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
@@ -27,6 +29,16 @@ REQUIRED_GATES = {
 }
 
 
+def _make_run_id(study_id: str) -> str:
+    """Build a chronologically sortable, question-identifiable run id.
+
+    Format: {UTC timestamp}_{study_id}-{short random hash}, e.g.
+    20260723-143012_albumin_sepsis_28d_mimic_omop-f00fefd1
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{timestamp}_{study_id}-{uuid.uuid4().hex[:8]}"
+
+
 class WorkflowManager:
     def __init__(self, runs_dir: str | Path = "artifacts/runs") -> None:
         self.runs_dir = Path(runs_dir)
@@ -40,7 +52,7 @@ class WorkflowManager:
         if not isinstance(study_id, str) or not study_id.strip():
             raise ValueError("Protocol requires a non-empty study_id")
 
-        run_id = f"{study_id}-{uuid.uuid4().hex[:8]}"
+        run_id = _make_run_id(study_id)
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         snapshot = run_dir / "protocol.json"
@@ -74,7 +86,7 @@ class WorkflowManager:
         study_id = generated.protocol.get("study_id")
         if not isinstance(study_id, str) or not study_id.strip():
             raise ValueError("Generated protocol requires a non-empty study_id")
-        run_id = f"{study_id}-{uuid.uuid4().hex[:8]}"
+        run_id = _make_run_id(study_id)
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         (run_dir / "protocol.json").write_text(
@@ -136,6 +148,8 @@ class WorkflowManager:
             raise ValueError(f"Unknown gate: {gate}")
         if status not in {"approved", "rejected", "provisional"}:
             raise ValueError("status must be approved, rejected, or provisional")
+        if gate == "protocol" and status == "approved":
+            self._block_if_major_confounders_unresolved(run_id)
         state.gates[gate].decide(status, reviewer, comment)  # type: ignore[arg-type]
         state.record("gate_decided", f"{gate}={status} by {reviewer}")
         self.save(state)
@@ -166,16 +180,118 @@ class WorkflowManager:
             raise RuntimeError("Hypothesis Agent can only run during protocol_review or concept_mapping")
         protocol_path = self.runs_dir / run_id / "protocol.json"
         protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
-        artifact = HypothesisAgent().run(protocol).to_dict()
-        artifact_path = self.runs_dir / run_id / "hypothesis.json"
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
+        self._write_hypothesis(run_id, protocol)
         if "hypothesis.json" not in state.artifacts:
             state.artifacts.append("hypothesis.json")
         state.record("agent_completed", "hypothesis_agent->hypothesis.json")
         self.save(state)
         return state
+
+    def review_covariate(
+        self,
+        run_id: str,
+        label: str,
+        decision: str,
+        reviewer: str,
+        comment: str | None = None,
+        *,
+        role: str | None = None,
+        temporal_classification: str | None = None,
+        pmid: str = "",
+        observed: bool = True,
+        certainty: str = "established",
+    ) -> RunState:
+        """Record a human accept/reject decision for a pending first-pass covariate.
+
+        "Accept" adds a role-classified `candidate_dag` entry (same shape the
+        LLM/literature stage produces, minus a pmid); "reject" records an
+        audited exclusion instead of leaving the covariate silently absent.
+        Either way, `hypothesis.json` is regenerated so the decision is
+        immediately reflected in `assess_identification`.
+        """
+        if decision not in {"accept", "reject"}:
+            raise ValueError("decision must be accept or reject")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        label = label.strip()
+        if not label:
+            raise ValueError("label is required")
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before reviewing covariates")
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+
+        candidate_dag = [item for item in protocol.get("candidate_dag", ()) if item.get("label") != label]
+        rejected_covariates = [
+            item for item in protocol.get("rejected_covariates", ()) if item.get("label") != label
+        ]
+
+        if decision == "accept":
+            if role not in DAG_VARIABLE_ROLES:
+                raise ValueError(f"role must be one of {DAG_VARIABLE_ROLES}")
+            if temporal_classification not in DAG_VARIABLE_TEMPORAL_CLASSES:
+                raise ValueError(
+                    f"temporal_classification must be one of {DAG_VARIABLE_TEMPORAL_CLASSES}"
+                )
+            if not comment or not comment.strip():
+                raise ValueError("comment is required as the rationale when accepting a covariate")
+            candidate_dag.append({
+                "label": label,
+                "role": role,
+                "temporal_classification": temporal_classification,
+                "rationale": comment.strip(),
+                "pmid": pmid,
+                "observed": observed,
+                "certainty": certainty,
+            })
+        else:
+            rejected_covariates.append({
+                "label": label,
+                "reviewer": reviewer.strip(),
+                "comment": (comment or "").strip(),
+                "decided_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+        protocol["candidate_dag"] = candidate_dag
+        protocol["rejected_covariates"] = rejected_covariates
+        temporary = protocol_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+        temporary.replace(protocol_path)
+
+        self._write_hypothesis(run_id, protocol)
+        state.record("covariate_reviewed", f"{label}={decision} by {reviewer}")
+        self.save(state)
+        return state
+
+    def _block_if_major_confounders_unresolved(self, run_id: str) -> None:
+        """The DAG-approval gate ("protocol") cannot be approved while a major
+        confounder is still unresolved: the run may never have called the
+        Hypothesis Agent yet, so absence of hypothesis.json is not itself a
+        blocker here (protocol.json-only workflows never touch this gate's
+        clinical content). Once hypothesis.json exists, its
+        `unresolved_major_confounders` is authoritative.
+        """
+        hypothesis_path = self.runs_dir / run_id / "hypothesis.json"
+        if not hypothesis_path.is_file():
+            return
+        hypothesis = json.loads(hypothesis_path.read_text(encoding="utf-8"))
+        unresolved_major = hypothesis.get("unresolved_major_confounders") or []
+        if unresolved_major:
+            raise ValueError(
+                "Cannot approve the protocol/DAG gate while major confounders remain "
+                f"unresolved: {', '.join(unresolved_major)}. Classify each one with a role and "
+                "rationale, or explicitly reject it with a reviewer and rationale."
+            )
+
+    def _write_hypothesis(self, run_id: str, protocol: dict) -> None:
+        artifact = HypothesisAgent().run(protocol).to_dict()
+        artifact_path = self.runs_dir / run_id / "hypothesis.json"
+        temporary = artifact_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+        temporary.replace(artifact_path)
 
     def run_data_science_agent(
         self,
@@ -525,12 +641,6 @@ class WorkflowManager:
             ])
             lines.extend(f"- `{blocker}`" for blocker in readiness.get("blockers", ()))
         lines.extend([
-            "", "## Current evidence from the OMOP audit", "",
-            "- BigQuery OMOP preflight succeeded: 10 required tables are accessible.",
-            "- The `person` table contains 259,770 persons.",
-            "- Standard sepsis candidate `132797` occurs for 4,838 persons.",
-            "- Standard septic-shock candidate `196236` occurs for 2,719 persons.",
-            "- Albumin and Lactated Ringer's source administrations exist but are currently unmapped (`concept_id = 0`).",
             "", "## Interpretation", "",
             "The workflow contracts and audit trail are operational. Cohort feasibility refinement and causal estimates remain pending. "
             "Source-value phenotypes are restricted to development; final conclusions require clinical mapping approval.",

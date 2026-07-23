@@ -131,5 +131,143 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("causal effect is", report.lower())
 
 
+class WorkflowCovariateReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE"
+            },
+            "first_pass_covariates": ["age", "SOFA score"],
+            "concept_sets": {"treatment": {"status": "approved"}},
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        self.state = self.manager.run_hypothesis_agent(state.run_id)
+        self.run_dir = root / "runs" / self.state.run_id
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _hypothesis(self) -> dict:
+        return json.loads((self.run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+
+    def test_accept_adds_a_role_classified_candidate_dag_entry(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "accept", "Dr. Chen",
+            "Institutional practice affects who receives treatment.",
+            role="treatment_cause_only", temporal_classification="pre_treatment",
+        )
+        hypothesis = self._hypothesis()
+        entry = next(item for item in hypothesis["candidate_dag"] if item["label"] == "age")
+        self.assertEqual(entry["role"], "treatment_cause_only")
+        self.assertEqual(entry["temporal_classification"], "pre_treatment")
+
+    def test_accept_without_temporal_classification_raises(self):
+        with self.assertRaises(ValueError):
+            self.manager.review_covariate(
+                self.state.run_id, "age", "accept", "Dr. Chen",
+                "Institutional practice affects who receives treatment.",
+                role="treatment_cause_only",
+            )
+
+    def test_reject_records_an_audited_exclusion(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "reject", "Dr. Chen", "Not plausible in this cohort.",
+        )
+        hypothesis = self._hypothesis()
+        self.assertEqual(hypothesis["candidate_dag"], [])
+        entry = next(item for item in hypothesis["rejected_covariates"] if item["label"] == "age")
+        self.assertEqual(entry["reviewer"], "Dr. Chen")
+        self.assertEqual(entry["comment"], "Not plausible in this cohort.")
+
+    def test_reviewing_a_label_again_replaces_rather_than_duplicates(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "reject", "Dr. Chen", "First pass.",
+        )
+        self.manager.review_covariate(
+            self.state.run_id, "age", "accept", "Dr. Lee", "Reconsidered as a treatment cause.",
+            role="treatment_cause_only", temporal_classification="pre_treatment",
+        )
+        hypothesis = self._hypothesis()
+        self.assertEqual(hypothesis["rejected_covariates"], [])
+        self.assertEqual(len([item for item in hypothesis["candidate_dag"] if item["label"] == "age"]), 1)
+
+    def test_accept_without_role_raises(self):
+        with self.assertRaises(ValueError):
+            self.manager.review_covariate(
+                self.state.run_id, "age", "accept", "Dr. Chen", "Some rationale."
+            )
+
+    def test_reject_records_history_event(self):
+        state = self.manager.review_covariate(
+            self.state.run_id, "age", "reject", "Dr. Chen", "Not plausible.",
+        )
+        self.assertTrue(any(event["event"] == "covariate_reviewed" for event in state.history))
+
+    def test_requires_hypothesis_agent_to_have_run_first(self):
+        state = self.manager.start(self.protocol)
+        with self.assertRaises(RuntimeError):
+            self.manager.review_covariate(state.run_id, "age", "reject", "Dr. Chen", "x")
+
+
+class WorkflowMajorConfounderGateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE"
+            },
+            "first_pass_covariates": ["age", "SOFA score"],
+            "major_confounders": ["age"],
+            "concept_sets": {"treatment": {"status": "approved"}},
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        self.state = self.manager.run_hypothesis_agent(state.run_id)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_protocol_gate_cannot_be_approved_while_major_confounder_unresolved(self):
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+
+    def test_protocol_gate_can_still_be_rejected_or_made_provisional(self):
+        self.manager.decide_gate(self.state.run_id, "protocol", "provisional", "tester")
+        self.manager.decide_gate(self.state.run_id, "protocol", "rejected", "tester")
+
+    def test_classifying_the_major_confounder_unblocks_approval(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "accept", "Dr. Chen",
+            "Baseline age affects both treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+        )
+        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+        self.assertEqual(state.gates["protocol"].status, "approved")
+
+    def test_rejecting_the_major_confounder_unblocks_approval(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "reject", "Dr. Chen",
+            "Cohort is age-restricted at enrollment.",
+        )
+        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+        self.assertEqual(state.gates["protocol"].status, "approved")
+
+
 if __name__ == "__main__":
     unittest.main()
