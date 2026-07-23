@@ -32,6 +32,7 @@ class PubMedArticle:
     pmid: str
     title: str
     abstract: str
+    publication_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,11 +111,17 @@ def _parse_efetch_xml(raw: bytes) -> tuple[PubMedArticle, ...]:
             "".join(node.itertext()).strip()
             for node in article.findall(".//Abstract/AbstractText")
         ]
+        publication_types = tuple(
+            (node.text or "").strip()
+            for node in article.findall(".//PublicationTypeList/PublicationType")
+            if (node.text or "").strip()
+        )
         articles.append(
             PubMedArticle(
                 pmid=pmid_el.text.strip(),
                 title="".join(title_el.itertext()).strip() if title_el is not None else "",
                 abstract=" ".join(part for part in abstract_parts if part),
+                publication_types=publication_types,
             )
         )
     return tuple(articles)
