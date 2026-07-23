@@ -37,3 +37,10 @@ artifacts/runs/
 .DS_Store
 Thumbs.db
 .vscode/settings.json
+
+# ── Local agent tooling (Claude Code skills/config, not project code) ────────
+.agents/
+.claude/
+
+# ── Ad-hoc demo/run output ────────────────────────────────────────────────────
+dag_export.txt
