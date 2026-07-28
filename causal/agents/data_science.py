@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Protocol
 
 from causal.provenance import artifact_metadata
+from causal.queries import EXPOSURE_CONTRASTS
 
 
 class ConceptLookup(Protocol):
@@ -23,15 +24,29 @@ class ConceptCandidate:
     domain_id: str
 
 
+# domain -> OMOP tables a phenotype in that domain is built from. Mirrors
+# `causal.queries.feasibility.DOMAIN_TABLES` but at the coarser granularity
+# this review-only plan needs (table names, not columns).
+_PHENOTYPE_DOMAIN_TABLES: dict[str, tuple[str, ...]] = {
+    "condition": ("condition_occurrence", "concept_ancestor"),
+    "drug": ("drug_exposure",),
+    "procedure": ("procedure_occurrence",),
+    "measurement": ("measurement",),
+    "observation": ("observation",),
+}
+
+
 @dataclass(frozen=True)
 class PhenotypePlan:
     name: str
     role: str
     status: str
     mode: str
+    domain: str
     omop_tables: tuple[str, ...]
     concept_ids: tuple[int, ...]
     source_value_rule: str | None = None
+    lookup_term: str | None = None
     approval_required: bool = True
     concept_candidates: tuple[ConceptCandidate, ...] = ()
 
@@ -72,8 +87,20 @@ class AnalysisPlanArtifact:
         return asdict(self)
 
 
+_REQUIRED_PHENOTYPE_ROLES = (
+    "population", "treatment", "comparator", "treatment_and_comparator", "time_zero", "outcome",
+)
+
+
 class DataScienceAgent:
-    """Turn a normalized hypothesis into a reviewable, non-executing plan."""
+    """Turn a normalized hypothesis into a reviewable, non-executing plan.
+
+    Phenotypes are derived generically from `protocol["concept_sets"]`: each
+    entry declares its own `role` and `domain` (see `_phenotype_from_concept_set`)
+    instead of the agent hardcoding clinical names. This is what lets the same
+    agent plan a sepsis/albumin study and an unrelated one without touching
+    Python code -- only `concept_sets` changes.
+    """
 
     def run(
         self,
@@ -88,24 +115,30 @@ class DataScienceAgent:
         if not isinstance(concept_sets, dict):
             raise ValueError("Protocol requires concept_sets")
 
-        phenotypes = (
-            self._condition_phenotype("sepsis", "population", concept_sets),
-            self._condition_phenotype("septic_shock", "effect_modifier", concept_sets),
-            self._drug_phenotype("albumin", "treatment", concept_sets, r"(?i)^Albumin(?:, Human)?\b"),
-            self._drug_phenotype(
-                "crystalloids", "treatment_and_comparator", concept_sets,
-                r"(?i)(Lactated Ringers|Sodium Chloride).*(Bag|Bottle|Injection)$",
-            ),
-            PhenotypePlan(
-                name="all_cause_death", role="outcome", status="standard_table",
-                mode="standard", omop_tables=("death",), concept_ids=(),
-                approval_required=False,
-            ),
-            PhenotypePlan(
-                name="icu_admission", role="time_zero", status="definition_pending",
-                mode="standard", omop_tables=("visit_detail", "visit_occurrence"), concept_ids=(),
-            ),
+        phenotypes = tuple(
+            self._phenotype_from_concept_set(name, definition)
+            for name, definition in concept_sets.items()
         )
+        declared_roles = {phenotype.role for phenotype in phenotypes}
+        # Fallback scaffolding for the two OMOP-standard building blocks that
+        # do not need a concept set of their own (all-cause death lives in
+        # `death`; a study's time-zero location is a visit-level definition).
+        # A protocol that instead defines a non-mortality outcome or a
+        # non-visit time-zero via its own concept_sets entry (role="outcome"
+        # / role="time_zero") overrides these defaults rather than getting
+        # both.
+        if "outcome" not in declared_roles:
+            phenotypes += (PhenotypePlan(
+                name="all_cause_death", role="outcome", status="standard_table",
+                mode="standard", domain="standard", omop_tables=("death",), concept_ids=(),
+                approval_required=False,
+            ),)
+        if "time_zero" not in declared_roles:
+            phenotypes += (PhenotypePlan(
+                name="index_event", role="time_zero", status="definition_pending",
+                mode="standard", domain="standard",
+                omop_tables=("visit_detail", "visit_occurrence"), concept_ids=(),
+            ),)
 
         if concept_lookup is not None:
             phenotypes = self._attach_concept_candidates(phenotypes, concept_lookup)
@@ -123,8 +156,13 @@ class DataScienceAgent:
         core_definitions_ready = all(
             item.status not in {"missing", "definition_pending"}
             for item in phenotypes
-            if item.role in {"population", "treatment", "treatment_and_comparator", "time_zero", "outcome"}
+            if item.role in _REQUIRED_PHENOTYPE_ROLES
         )
+
+        exposure_contrast = self._exposure_contrast(protocol)
+        treatment_name = self._phenotype_name_for_role(phenotypes, "treatment", "treatment_and_comparator")
+        comparator_name = self._phenotype_name_for_role(phenotypes, "comparator", "treatment_and_comparator")
+        follow_up_days = self._required_int(hypothesis, "follow_up_days", 1)
 
         return AnalysisPlanArtifact(
             metadata=artifact_metadata(
@@ -134,20 +172,24 @@ class DataScienceAgent:
             study_id=study_id,
             status="draft_pending_review",
             data_source=self._required_text(protocol, "data_source"),
-            design="active_comparator_target_trial_emulation",
+            design=(
+                "add_on_target_trial_emulation" if exposure_contrast == "add_on"
+                else "active_comparator_target_trial_emulation"
+            ),
             time_zero=self._required_text(hypothesis, "time_zero"),
             grace_period_hours=self._required_int(hypothesis, "grace_period_hours", 0),
-            follow_up_days=self._required_int(hypothesis, "follow_up_days", 1),
+            follow_up_days=follow_up_days,
             estimands=(self._required_text(hypothesis, "primary_estimand"), *tuple(hypothesis.get("secondary_estimands", ()))),
             phenotypes=phenotypes,
             covariates=covariates,
             required_tables=required_tables,
             feasibility_checks=(
-                "eligible ICU stays and unique persons",
-                "albumin exposure within grace period",
-                "crystalloid exposure within grace period",
-                "mutually exclusive treatment assignment",
-                "28-day deaths by treatment arm",
+                "eligible population and unique persons",
+                f"{treatment_name} exposure within grace period",
+                f"{comparator_name} exposure within grace period",
+                "mutually exclusive treatment assignment" if exposure_contrast == "mutually_exclusive"
+                else "add-on treatment assignment relative to the comparator backbone",
+                f"{follow_up_days}-day outcome events by treatment arm",
                 "missingness for every baseline covariate",
                 "published cohort-size comparison",
             ),
@@ -161,32 +203,40 @@ class DataScienceAgent:
             final_execution_allowed=not unresolved,
         )
 
+    @staticmethod
+    def _exposure_contrast(protocol: dict[str, Any]) -> str:
+        settings = protocol.get("query_settings")
+        value = settings.get("exposure_contrast", "add_on") if isinstance(settings, dict) else "add_on"
+        if value not in EXPOSURE_CONTRASTS:
+            raise ValueError(f"query_settings.exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
+        return value
+
+    @staticmethod
+    def _phenotype_name_for_role(phenotypes: tuple[PhenotypePlan, ...], *roles: str) -> str:
+        for phenotype in phenotypes:
+            if phenotype.role in roles:
+                return phenotype.name
+        return "/".join(roles)
+
     @classmethod
     def _attach_concept_candidates(
         cls,
         phenotypes: tuple[PhenotypePlan, ...],
         lookup: ConceptLookup,
     ) -> tuple[PhenotypePlan, ...]:
-        terms = {
-            "sepsis": ("condition", "sepsis"),
-            "septic_shock": ("condition", "septic shock"),
-            "albumin": ("drug", "albumin"),
-            "crystalloids": ("drug", "sodium chloride"),
-        }
         enriched = []
         for phenotype in phenotypes:
-            lookup_spec = terms.get(phenotype.name)
-            if lookup_spec is None or phenotype.status == "approved":
+            if phenotype.domain not in {"condition", "drug"} or phenotype.status == "approved":
                 enriched.append(phenotype)
                 continue
-            domain, term = lookup_spec
+            term = phenotype.lookup_term or phenotype.name.replace("_", " ")
             response = (
-                lookup.lookup_condition(term) if domain == "condition"
+                lookup.lookup_condition(term) if phenotype.domain == "condition"
                 else lookup.lookup_drug(term)
             )
             enriched.append(replace(
                 phenotype,
-                concept_candidates=cls._parse_concept_candidates(response.text, domain),
+                concept_candidates=cls._parse_concept_candidates(response.text, phenotype.domain),
             ))
         return tuple(enriched)
 
@@ -210,25 +260,45 @@ class DataScienceAgent:
         return tuple(candidates)
 
     @staticmethod
-    def _condition_phenotype(name: str, role: str, concept_sets: dict[str, Any]) -> PhenotypePlan:
-        definition = concept_sets.get(name, {})
-        ids = tuple(int(value) for value in definition.get("concept_ids", ()))
-        return PhenotypePlan(
-            name=name, role=role, status=str(definition.get("status", "missing")),
-            mode="standard", omop_tables=("condition_occurrence", "concept_ancestor"),
-            concept_ids=ids,
-        )
+    def _phenotype_from_concept_set(name: str, definition: Any) -> PhenotypePlan:
+        """Build one reviewable phenotype from a protocol-declared concept set.
 
-    @staticmethod
-    def _drug_phenotype(name: str, role: str, concept_sets: dict[str, Any], rule: str) -> PhenotypePlan:
-        definition = concept_sets.get(name, {})
+        `role` and `domain` are asserted by the protocol author (human or
+        LLM draft, same "clinical judgment is explicit and checked" contract
+        as `causal.agents.hypothesis`), never guessed from the set's name.
+        `source_value_rule` is optional: it exists only for domains (like
+        `drug`) where a standard-concept mapping can plausibly be missing and
+        a versioned, human-authored regex fallback is meaningful; supplying
+        one is what turns `mode` into "source_value_provisional" while the
+        set is not yet `approved`. `lookup_term` optionally overrides the
+        term sent to `concept_lookup` (see `_attach_concept_candidates`) when
+        the set's own name is not a good vocabulary search term (e.g. a
+        `crystalloids` class name searched as "sodium chloride" instead).
+        """
+        if not isinstance(definition, dict):
+            raise ValueError(f"concept_sets['{name}'] must be an object")
+        role = definition.get("role")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError(f"concept_sets['{name}'] requires a role")
+        domain = definition.get("domain")
+        if domain not in _PHENOTYPE_DOMAIN_TABLES:
+            raise ValueError(
+                f"concept_sets['{name}'] requires domain to be one of {tuple(_PHENOTYPE_DOMAIN_TABLES)}"
+            )
+        source_value_rule = definition.get("source_value_rule")
+        if source_value_rule is not None and not isinstance(source_value_rule, str):
+            raise ValueError(f"concept_sets['{name}'].source_value_rule must be a string")
+        lookup_term = definition.get("lookup_term")
+        if lookup_term is not None and not isinstance(lookup_term, str):
+            raise ValueError(f"concept_sets['{name}'].lookup_term must be a string")
         ids = tuple(int(value) for value in definition.get("concept_ids", ()))
         status = str(definition.get("status", "missing"))
-        mode = "standard" if status == "approved" and ids else "source_value_provisional"
+        mode = "source_value_provisional" if status != "approved" and source_value_rule else "standard"
         return PhenotypePlan(
-            name=name, role=role, status=status, mode=mode,
-            omop_tables=("drug_exposure",), concept_ids=ids,
-            source_value_rule=None if mode == "standard" else rule,
+            name=name, role=role.strip(), status=status, mode=mode, domain=domain,
+            omop_tables=_PHENOTYPE_DOMAIN_TABLES[domain], concept_ids=ids,
+            source_value_rule=source_value_rule if mode == "source_value_provisional" else None,
+            lookup_term=lookup_term,
         )
 
     @staticmethod

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from causal.config import BigQueryDatasets
-from causal.queries.albumin_sepsis import albumin_sepsis_feasibility_sql
+from causal.queries.feasibility import EXPOSURE_CONTRASTS, ConceptSetSpec, analytic_cohort_sql
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class CohortBuildManifest:
     contains_person_level_data: bool
     delivery_to_llm_allowed: bool
     execution_allowed: bool
+    exposure_contrast: str
     columns: tuple[AnalyticColumn, ...]
     unresolved_issues: tuple[str, ...]
 
@@ -39,9 +40,9 @@ class AnalyticCohortBuilder:
 
     COLUMNS = (
         AnalyticColumn("person_id", "identifier", "INT64", "index_linkage_only"),
-        AnalyticColumn("A", "treatment", "INT64", "within_24h_grace_period"),
-        AnalyticColumn("Y", "outcome", "INT64", "within_28d_follow_up"),
-        AnalyticColumn("index_datetime", "time_zero", "DATETIME", "icu_admission"),
+        AnalyticColumn("A", "treatment", "INT64", "within_grace_period"),
+        AnalyticColumn("Y", "outcome", "INT64", "within_follow_up"),
+        AnalyticColumn("index_datetime", "time_zero", "DATETIME", "population_defining_event"),
         AnalyticColumn("follow_up_days", "follow_up", "INT64", "prespecified"),
         AnalyticColumn("censored", "censoring", "INT64", "not_implemented"),
         AnalyticColumn("age", "baseline_covariate", "INT64", "at_index"),
@@ -54,31 +55,33 @@ class AnalyticCohortBuilder:
         study_id: str,
         datasets: BigQueryDatasets,
         *,
+        population: ConceptSetSpec,
+        treatment: ConceptSetSpec,
+        comparator: ConceptSetSpec,
+        outcome: ConceptSetSpec,
+        grace_period_hours: int = 24,
+        follow_up_days: int = 28,
+        min_age_years: int | None = 18,
+        care_site_names: tuple[str, ...] = (),
+        exposure_contrast: str = "add_on",
         execution_allowed: bool,
     ) -> tuple[str, CohortBuildManifest]:
         if not study_id.strip():
             raise ValueError("study_id is required")
-        feasibility = albumin_sepsis_feasibility_sql(datasets)
-        marker = "\n    SELECT\n      COUNT(*) AS eligible_persons"
-        if marker not in feasibility:
-            raise RuntimeError("Unexpected feasibility SQL structure")
-        common_ctes = feasibility.split(marker, 1)[0]
-        sql = common_ctes + f"""
-    SELECT
-      a.person_id,
-      CASE WHEN a.has_albumin THEN 1 ELSE 0 END AS A,
-      CASE WHEN a.death_28d THEN 1 ELSE 0 END AS Y,
-      e.index_datetime,
-      28 AS follow_up_days,
-      CAST(NULL AS INT64) AS censored,
-      EXTRACT(YEAR FROM DATE(e.index_datetime)) - p.year_of_birth AS age,
-      p.gender_concept_id,
-      p.race_concept_id
-    FROM analytic a
-    JOIN eligible e USING (person_id)
-    JOIN {datasets.table('omop', 'person')} p USING (person_id)
-    WHERE a.has_crystalloid
-    """
+        if exposure_contrast not in EXPOSURE_CONTRASTS:
+            raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
+        sql = analytic_cohort_sql(
+            datasets,
+            population=population,
+            treatment=treatment,
+            comparator=comparator,
+            outcome=outcome,
+            grace_period_hours=grace_period_hours,
+            follow_up_days=follow_up_days,
+            min_age_years=min_age_years,
+            care_site_names=care_site_names,
+            exposure_contrast=exposure_contrast,
+        )
         manifest = CohortBuildManifest(
             schema_version="1.0",
             study_id=study_id.strip(),
@@ -87,20 +90,40 @@ class AnalyticCohortBuilder:
             contains_person_level_data=True,
             delivery_to_llm_allowed=False,
             execution_allowed=execution_allowed,
+            exposure_contrast=exposure_contrast,
             columns=self.COLUMNS,
             unresolved_issues=(
                 "censoring and observation-window completeness are not implemented",
                 "non-demographic baseline covariates are not implemented",
-                "Sepsis-3 phenotype is not implemented",
-                "albumin and crystalloid mappings remain provisional",
-                "septic-shock effect modifier is not implemented",
+                "effect modifiers are not implemented in this cohort query",
             ),
         )
         return sql, manifest
 
-    def profile_sql(self, study_id: str, datasets: BigQueryDatasets) -> str:
+    def profile_sql(
+        self,
+        study_id: str,
+        datasets: BigQueryDatasets,
+        *,
+        population: ConceptSetSpec,
+        treatment: ConceptSetSpec,
+        comparator: ConceptSetSpec,
+        outcome: ConceptSetSpec,
+        grace_period_hours: int = 24,
+        follow_up_days: int = 28,
+        min_age_years: int | None = 18,
+        care_site_names: tuple[str, ...] = (),
+        exposure_contrast: str = "add_on",
+    ) -> str:
         """Return an aggregate-only query safe for MCP feasibility output."""
-        cohort_sql, _ = self.build(study_id, datasets, execution_allowed=False)
+        cohort_sql, _ = self.build(
+            study_id, datasets,
+            population=population, treatment=treatment, comparator=comparator, outcome=outcome,
+            grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
+            min_age_years=min_age_years, care_site_names=care_site_names,
+            exposure_contrast=exposure_contrast,
+            execution_allowed=False,
+        )
         return f"""
         WITH analytic_cohort AS (
           {cohort_sql}
@@ -122,9 +145,30 @@ class AnalyticCohortBuilder:
         FROM analytic_cohort
         """
 
-    def followup_audit_sql(self, study_id: str, datasets: BigQueryDatasets) -> str:
-        """Audit nominal 28-day observability and return aggregate counts only."""
-        cohort_sql, _ = self.build(study_id, datasets, execution_allowed=False)
+    def followup_audit_sql(
+        self,
+        study_id: str,
+        datasets: BigQueryDatasets,
+        *,
+        population: ConceptSetSpec,
+        treatment: ConceptSetSpec,
+        comparator: ConceptSetSpec,
+        outcome: ConceptSetSpec,
+        grace_period_hours: int = 24,
+        follow_up_days: int = 28,
+        min_age_years: int | None = 18,
+        care_site_names: tuple[str, ...] = (),
+        exposure_contrast: str = "add_on",
+    ) -> str:
+        """Audit nominal follow-up observability and return aggregate counts only."""
+        cohort_sql, _ = self.build(
+            study_id, datasets,
+            population=population, treatment=treatment, comparator=comparator, outcome=outcome,
+            grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
+            min_age_years=min_age_years, care_site_names=care_site_names,
+            exposure_contrast=exposure_contrast,
+            execution_allowed=False,
+        )
         return f"""
         WITH analytic_cohort AS (
           {cohort_sql}
@@ -152,20 +196,20 @@ class AnalyticCohortBuilder:
           COUNT(*) AS cohort_persons,
           COUNTIF(observation_end_date IS NULL) AS no_observation_period_at_index,
           COUNTIF(
-            observation_end_date >= DATE_ADD(index_date, INTERVAL 28 DAY)
-          ) AS observation_period_covers_28d,
+            observation_end_date >= DATE_ADD(index_date, INTERVAL {int(follow_up_days)} DAY)
+          ) AS observation_period_covers_follow_up,
           COUNTIF(
-            death_date BETWEEN index_date AND DATE_ADD(index_date, INTERVAL 28 DAY)
-          ) AS known_death_within_28d,
+            death_date BETWEEN index_date AND DATE_ADD(index_date, INTERVAL {int(follow_up_days)} DAY)
+          ) AS known_death_within_follow_up,
           COUNTIF(
-            death_date BETWEEN index_date AND DATE_ADD(index_date, INTERVAL 28 DAY)
-            OR observation_end_date >= DATE_ADD(index_date, INTERVAL 28 DAY)
+            death_date BETWEEN index_date AND DATE_ADD(index_date, INTERVAL {int(follow_up_days)} DAY)
+            OR observation_end_date >= DATE_ADD(index_date, INTERVAL {int(follow_up_days)} DAY)
           ) AS nominal_followup_complete,
           COUNTIF(
-            (death_date IS NULL OR death_date > DATE_ADD(index_date, INTERVAL 28 DAY))
+            (death_date IS NULL OR death_date > DATE_ADD(index_date, INTERVAL {int(follow_up_days)} DAY))
             AND (
               observation_end_date IS NULL
-              OR observation_end_date < DATE_ADD(index_date, INTERVAL 28 DAY)
+              OR observation_end_date < DATE_ADD(index_date, INTERVAL {int(follow_up_days)} DAY)
             )
           ) AS nominal_followup_incomplete
         FROM followup
