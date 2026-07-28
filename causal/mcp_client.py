@@ -16,6 +16,29 @@ class MCPToolResponse:
     metadata: dict[str, Any]
 
 
+# The OMCP subprocess is a third-party server (a separate submodule/service);
+# it gets only what it plausibly needs to run and to authenticate to
+# BigQuery/Google Cloud/Langfuse, not a blanket copy of this process's
+# environment (which could otherwise carry unrelated credentials -- LLM
+# provider keys, other services' tokens -- into a process this codebase does
+# not control). Matches the "narrow gateway" posture already documented in
+# `causal.bigquery.BigQueryOMOPGateway`.
+_INHERITED_ENV_NAMES = (
+    "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "SYSTEMDRIVE",
+    "TEMP", "TMP", "APPDATA", "LOCALAPPDATA", "PATHEXT", "COMSPEC",
+)
+_INHERITED_ENV_PREFIXES = ("GOOGLE_", "GCLOUD_", "CLOUDSDK_", "LANGFUSE_")
+
+
+def _subprocess_environment(overrides: dict[str, str]) -> dict[str, str]:
+    inherited = {
+        key: value for key, value in os.environ.items()
+        if key in _INHERITED_ENV_NAMES or key.startswith(_INHERITED_ENV_PREFIXES)
+    }
+    inherited.update(overrides)
+    return inherited
+
+
 class OMCPClient:
     """Small synchronous facade over the official asynchronous MCP client."""
 
@@ -76,8 +99,7 @@ class OMCPClient:
                 "Install the MCP client with: pip install -r requirements-mcp.txt"
             ) from exc
 
-        environment = dict(os.environ)
-        environment.update({
+        environment = _subprocess_environment({
             "DB_TYPE": "bigquery",
             "DB_PROJECT": self.project,
             "DB_DATASET": self.dataset,
@@ -85,7 +107,7 @@ class OMCPClient:
             "CDM_SCHEMA": self.dataset,
             "VOCAB_SCHEMA": self.dataset,
             "MCP_TRANSPORT": "stdio",
-            "ENABLE_LANGFUSE": environment.get("ENABLE_LANGFUSE", "false"),
+            "ENABLE_LANGFUSE": os.environ.get("ENABLE_LANGFUSE", "false"),
         })
         parameters = StdioServerParameters(
             command="uv",
