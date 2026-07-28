@@ -38,14 +38,14 @@ User question
 ```
 
 This follows the Causal Roadmap and target-trial grounding recommended for
-medical causal co-pilots in [Alaa et al. (2024)](https://arxiv.org/abs/2407.19118).
-The LLM assists with structured proposals and critiques; deterministic code and
-human gates decide whether artifacts are coherent, identified and approved. In
-particular, Alaa et al.'s emphasis on *grounding* an LLM co-pilot in external,
-verifiable evidence rather than its own claims motivated the current
-Hypothesis Agent design: candidate DAG edges are drafted only from PubMed
-abstracts actually retrieved for the question, and any PMID the LLM cites that
-was not retrieved is rejected deterministically. See
+medical causal co-pilots in Alaa et al. (2024) — see [References](#references)
+below. The LLM assists with structured proposals and critiques; deterministic
+code and human gates decide whether artifacts are coherent, identified and
+approved. Grounding an LLM co-pilot in external, verifiable evidence rather
+than its own claims motivated the Hypothesis Agent design: candidate DAG
+edges are drafted only from literature/knowledge-graph evidence actually
+retrieved for the question, and any citation the LLM invents that was not
+retrieved is rejected deterministically. See
 [docs/llm_hypothesis_integration.md](docs/llm_hypothesis_integration.md) for
 the implementation.
 
@@ -53,6 +53,53 @@ The primary methodological objective remains heterogeneous treatment-effect
 estimation with OMOP CDM data. Planned estimators include g-computation and TMLE
 with SuperLearner-style nuisance models, after identification and data-support
 checks pass.
+
+## References
+
+This is a general causal-inference tool: the pipeline, agents and SQL
+builders are protocol-driven and not specific to any one disease, drug or
+outcome (see [Repository Map](#repository-map) and
+[`causal/queries/feasibility.py`](causal/queries/feasibility.py)). Its
+design choices are grounded in existing causal-inference and biomedical-
+informatics literature rather than invented from scratch:
+
+- **Causal DAGs and the backdoor criterion** — Pearl, J. (1995). Causal
+  diagrams for empirical research. *Biometrika*, 82(4), 669–688.
+  [doi:10.1093/biomet/82.4.669](https://doi.org/10.1093/biomet/82.4.669). The
+  identification logic in `causal/roadmap.py` (d-separation,
+  minimum-adjustment-set enumeration) implements this framework.
+- **Target trial emulation** — Hernán, M.A. & Robins, J.M. (2016). Using Big
+  Data to Emulate a Target Trial When a Randomized Trial Is Not Available.
+  *American Journal of Epidemiology*, 183(8), 758–764.
+  [doi:10.1093/aje/kwv254](https://doi.org/10.1093/aje/kwv254). Every study
+  protocol in this repo (`protocol.json`) is a target-trial specification in
+  this sense, not a bespoke, hand-tuned query.
+- **The Causal Roadmap** — Petersen, M.L. & van der Laan, M.J. (2014). Causal
+  Models and Learning from Data: Integrating Causal Modeling and Statistical
+  Estimation. *Epidemiology*, 25(3), 418–426. The 11-step pipeline above
+  follows this roadmap's separation of causal model, causal question,
+  identification, and statistical estimation.
+- **TMLE** — van der Laan, M.J. & Rubin, D. (2006). Targeted Maximum
+  Likelihood Learning. *The International Journal of Biostatistics*, 2(1),
+  Article 11. Planned estimator for the statistical-estimation stage, once
+  identification and data-support checks pass (see Implementation Status
+  below).
+- **Grounding an LLM causal co-pilot in verifiable evidence** — Alaa, A. et
+  al. (2024). [arXiv:2407.19118](https://arxiv.org/abs/2407.19118). Directly
+  shaped the Hypothesis Agent design described above.
+- **OptimusKG** — Vittor et al. OptimusKG: Unifying biomedical knowledge in
+  a modern multimodal graph. [arXiv:2604.27269](https://arxiv.org/pdf/2604.27269)
+  (Zitnik Lab, Harvard Medical School;
+  [github.com/mims-harvard/OptimusKG](https://github.com/mims-harvard/OptimusKG)).
+  Knowledge-graph evidence source used to corroborate DAG edges alongside
+  PubMed/OpenAlex (`causal/knowledge_graph/`).
+- **Worked validation case** — the albumin-plus-crystalloids-vs-crystalloids,
+  ICU sepsis, 28-day-mortality question and its MIMIC-IV OMOP grounding
+  follow *Step-by-step causal analysis of EHRs to ground decision-making*,
+  [doi:10.1371/journal.pdig.0000721](https://doi.org/10.1371/journal.pdig.0000721).
+  This is the first worked example used to validate the pipeline end-to-end,
+  not a constraint on what the pipeline can study — see
+  [MIMIC-IV OMOP Setup](#mimic-iv-omop-setup).
 
 ## Implementation Status
 
@@ -247,7 +294,13 @@ documented using generic names in [docs/datasets.md](docs/datasets.md).
 The first technical validation case is albumin plus crystalloids versus
 crystalloids alone for 28-day mortality in ICU patients with sepsis. Its draft
 target-trial protocol and concept-audit instructions live in
-[`studies/albumin_sepsis_28d/`](studies/albumin_sepsis_28d/).
+[`studies/albumin_sepsis_28d/`](studies/albumin_sepsis_28d/). Nothing about
+the pipeline itself is specific to this question: population, treatment,
+comparator and outcome are all declared as `ConceptSetSpec` entries in
+`protocol.json` and consumed by the same generic SQL builders
+([`causal/queries/feasibility.py`](causal/queries/feasibility.py)), so a new
+study is a new protocol file, not new code. See [References](#references)
+for the study this validation case is grounded in.
 
 ### Current technical workflow
 
