@@ -62,9 +62,12 @@ checks pass.
 | General causal DAG with roles and temporal ordering | Implemented |
 | Cycle detection and backdoor adjustment assessment | Implemented |
 | Minimum adjustment-set enumeration for reviewable DAGs | Implemented |
-| LLM question-to-protocol prototype, PubMed grounding | Implemented as an initial prototype |
+| LLM question-to-protocol prototype, PubMed/OpenAlex/OptimusKG grounding | Implemented as an initial prototype |
 | OMCP vocabulary candidates and aggregate feasibility | Implemented as governed prototype |
-| Causal-roadmap workflow gates and LLM integration | Not yet wired |
+| Hypothesis Agent, DAG identification and workflow gates | Wired: `workflow start-question` drafts a protocol, `workflow hypothesis` builds the DAG, and the `protocol` gate blocks approval both on unresolved major confounders and on failed backdoor identification |
+| DAG critique and bounded-revision agent | Implemented: an independent LLM pass reviews each drafted DAG against structural and clinical checks before it is accepted |
+| SQL governance (`QueryValidationAgent`) | Implemented: every generated query (feasibility, cohort, governed causal tool) is checked for unbound parameters, disallowed tables, and `person_id` leakage before execution |
+| Generalized feasibility/cohort SQL (`ConceptSetSpec`-driven) | Implemented: replaces the earlier hardcoded albumin/sepsis query with builders that work for any protocol-declared population/treatment/comparator/outcome |
 | General DAG-to-OMOP variable mapping | Not yet implemented |
 | Statistical estimand, estimation and sensitivity analysis | Not yet implemented |
 
@@ -98,12 +101,15 @@ CausalOMOP/
 
   causal/
     roadmap.py                    # causal contracts and DAG identification
-    agents/                       # initial prototype agents
-    literature/                   # PubMed retrieval and evidence grounding
+    agents/                       # hypothesis, DAG identification/critique,
+                                   # data science, query validation, execution
+    knowledge_graph/              # OptimusKG client for DAG-evidence grounding
+    literature/                   # PubMed/OpenAlex retrieval and evidence grounding
     llm/                          # dev/cloud and production/local LLM adapters
     orchestrator/                 # persistent governed workflow prototype
     data_builder/                 # analytic-cohort contracts and SQL builders
-    prompts/                      # hypothesis and literature-DAG prompt templates
+    queries/                      # concept-set-driven feasibility/cohort SQL builders
+    prompts/                      # hypothesis, DAG-critique and literature-DAG prompt templates
 
   notebooks/                      # exploratory analyses
 
@@ -187,6 +193,13 @@ LLM, MCP and BigQuery dependencies remain separated:
 pip install -r requirements-llm.txt
 pip install -r requirements-mcp.txt
 pip install -r requirements-bigquery.txt
+```
+
+Optional extras for the Streamlit UI and the knowledge-graph-grounded DAG pipeline:
+
+```powershell
+pip install -r requirements-ui.txt
+pip install -r requirements-knowledge-graph.txt
 ```
 
 ### Local configuration (`.env`)

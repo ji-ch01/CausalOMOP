@@ -55,12 +55,14 @@ deliberate contribution to FastOMOP itself.
 Use these locations:
 
 ```text
-scripts/snuh_etl/   SNUH-specific preparation and vocabulary cleanup
-causal/             causal cohort construction and future estimators
-docs/               project documentation
+scripts/snuh_etl/          SNUH-specific preparation and vocabulary cleanup
+causal/                    causal cohort construction and future estimators
+causal/knowledge_graph/    OptimusKG client for DAG-evidence grounding
+causal/queries/            concept-set-driven feasibility/cohort SQL builders
+docs/                      project documentation
 docs/reproducible_causal_review.md
-                    literature and public dataset review work package
-notebooks/          exploratory analysis
+                           literature and public dataset review work package
+notebooks/                 exploratory analysis
 ```
 
 This keeps the thesis/project work separate from upstream FastOMOP code.

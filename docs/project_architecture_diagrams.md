@@ -1,6 +1,6 @@
 # CausalOMOP Project Diagrams
 
-These diagrams describe the repository as of 21 July 2026. They deliberately
+These diagrams describe the repository as of 28 July 2026. They deliberately
 separate implemented components, prototypes or work in progress, external
 systems, and planned causal-analysis components.
 
@@ -48,18 +48,32 @@ flowchart TB
         LLMDEV["Development LLM<br/>OpenRouter / GPT-OSS"]:::external
         LLMPROD["Production LLM<br/>local OpenAI-compatible endpoint"]:::external
         PUBMED["PubMed E-utilities<br/>PMIDs + abstracts"]:::external
-        VALIDATE["Deterministic validation<br/>strict JSON · unchanged question<br/>required target-trial fields<br/>retrieved-PMID allow-list"]:::implemented
-        PROTOCOL["protocol.json<br/>population · treatment · comparator<br/>time zero · grace period · outcome<br/>follow-up · estimands"]:::artifact
-        HYPOTHESIS["hypothesis.json<br/>normalized target trial<br/>effect modifiers · candidate DAG<br/>unresolved concept sets"]:::artifact
-        RAW["llm_outputs.json<br/>unmodified LLM responses"]:::artifact
+        OPTIMUSKG["OptimusKGClient<br/>biomedical knowledge-graph<br/>relation lookup"]:::implemented
+        KGDATA["OptimusKG dataset<br/>~22M edges · cached in-process<br/>optional dependency"]:::external
+        VALIDATE["Deterministic validation<br/>strict JSON · unchanged question<br/>required target-trial fields<br/>retrieved-citation allow-list<br/>(PMID/OpenAlex ∪ optimuskg: ids)"]:::implemented
+        PRECHECK["Structural + clinical pre-check<br/>reuses assess_identification /<br/>assess_clinical_completeness early"]:::implemented
+        CRITIQUE["Independent critique LLM call<br/>dag_critique.md · challenges the draft<br/>never emits DAG objects itself"]:::implemented
+        REVISION["Bounded revision · ≤1 round<br/>same validation gate as the draft"]:::implemented
+        PROTOCOL["protocol.json<br/>population · treatment · comparator<br/>time zero · grace period · outcome<br/>follow-up · estimands<br/>candidate_dag_unresolved"]:::artifact
+        HYPOTHESIS["hypothesis.json<br/>normalized target trial<br/>effect modifiers · candidate DAG<br/>unresolved concept sets<br/>kg_evidence_id reinforcement"]:::artifact
+        RAW["llm_outputs.json<br/>target_trial_draft · literature_dag_draft<br/>literature_dag_critique · literature_dag_revision"]:::artifact
 
         UQHS --> LLMDEV
         UQHS --> LLMPROD
         UQHS --> PUBMED
+        UQHS -. "--skip-knowledge-graph" .-> OPTIMUSKG
+        OPTIMUSKG --> KGDATA
         LLMDEV --> VALIDATE
         LLMPROD --> VALIDATE
         PUBMED --> VALIDATE
-        VALIDATE --> PROTOCOL
+        OPTIMUSKG --> VALIDATE
+        VALIDATE --> PRECHECK
+        PRECHECK --> CRITIQUE
+        CRITIQUE -. "verdict: revise" .-> REVISION
+        CRITIQUE -. "verdict: approve /<br/>--skip-critique" .-> PROTOCOL
+        REVISION --> PROTOCOL
+        CRITIQUE --> RAW
+        REVISION --> RAW
         VALIDATE --> HYPOTHESIS
         VALIDATE --> RAW
     end
@@ -110,7 +124,7 @@ flowchart TB
     HYPOTHESIS --> WM
     RAW --> WM
     HYPAGENT --> WM
-    IDENTIFY -. integration in progress .-> WM
+    IDENTIFY -- "blocks protocol-gate approval<br/>if not identified by backdoor adjustment" --> WM
     WM --> G1
 
     %% OMOP operationalization
@@ -142,6 +156,7 @@ flowchart TB
         CAUSALSELECT["Causal_Select_Query<br/>read-only · context required<br/>query SHA-256 · fail closed"]:::wip
         POLICY["Allowed operations<br/>aggregate_feasibility<br/>cohort_build · diagnostics<br/>causal_estimation"]:::wip
         DIRECT["Direct BigQuery gateway<br/>preflight · concept/source audits<br/>temporary equivalence path"]:::implemented
+        QVAL["QueryValidationAgent<br/>allowed OMOP tables · no unbound params<br/>no SELECT * · no person_id leakage"]:::implemented
 
         MCPCLIENT --> CAP
         CAP --> CAUSALSELECT
@@ -169,12 +184,12 @@ flowchart TB
     OMCP_DESC --> BQ
     OMCP_DESC --> DUCK
     CAUSALSELECT --> BQ
-    DIRECT --> BQ
+    DIRECT --> QVAL --> BQ
 
     %% Feasibility and cohort planning
     subgraph FEASIBILITY["7. Data-support and feasibility audits"]
         direction TB
-        CASE["Validation case<br/>albumin + crystalloids vs crystalloids<br/>adult ICU sepsis · 28-day mortality"]:::implemented
+        CASE["Protocol-declared concept sets<br/>ConceptSetSpec: population · treatment<br/>comparator · outcome (any study)<br/>worked example: albumin/crystalloids vs<br/>crystalloids, adult ICU sepsis · 28-day mortality"]:::implemented
         COHORT["AnalyticCohortBuilder<br/>non-executable person-level SQL contract"]:::implemented
         FEAS["Aggregate feasibility<br/>eligibility and treatment-arm counts"]:::implemented
         PROFILE["Aggregate cohort profile<br/>rows · persons · treated · outcomes"]:::implemented
@@ -218,7 +233,7 @@ flowchart TB
 
     %% Test and traceability plane
     subgraph QUALITY["Cross-cutting quality and traceability"]
-        TESTS["Deterministic root test suite<br/>62 tests passing"]:::implemented
+        TESTS["Deterministic root test suite<br/>220 tests passing"]:::implemented
         PROV["Artifact metadata<br/>agent/version/input hash"]:::implemented
         DOCS["Architecture, dataset, integration<br/>and responsible-demo documentation"]:::implemented
     end
@@ -283,7 +298,7 @@ right if the presentation software supports animations.
 ```mermaid
 flowchart LR
     Q["Clinical<br/>question"] --> T["Target trial<br/>+ estimand"]
-    T --> L["PubMed-grounded<br/>causal DAG"]
+    T --> L["Literature- and KG-<br/>grounded causal DAG"]
     L --> I["Deterministic<br/>identification"]
     I --> H1{"Human<br/>review"}
     H1 --> M["OMOP concept and<br/>variable mapping"]
