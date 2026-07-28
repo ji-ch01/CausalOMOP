@@ -118,16 +118,179 @@ class ClinicalValidationResult:
 
 
 @dataclass(frozen=True)
+class EvidenceSourceSummary:
+    """How candidate_dag variables and covariate_relations were grounded.
+
+    Every accepted item falls into exactly one bucket: `uncited` (role
+    asserted on rationale alone, `pmid == ""`), `literature_only` (a PubMed/
+    OpenAlex citation, no independent KG confirmation), `kg_only` (an
+    OptimusKG edge id was the *only* evidence -- no retrieved abstract
+    discussed it), or `corroborated` (a literature citation *and* an
+    independent `kg_evidence_id` -- two unrelated sources agree, the
+    strongest evidence tier this pipeline can produce). This is a coverage
+    metric, not a quality one: it says nothing about whether the cited
+    evidence is itself strong (see `causal.literature.orchestrator`'s
+    evidence-tier grading for that), only where each edge's grounding came
+    from.
+    """
+
+    total_items: int
+    literature_only: int
+    kg_only: int
+    corroborated: int
+    uncited: int
+
+    @property
+    def cited_fraction(self) -> float:
+        """Share of items grounded by at least one source (any of the three cited buckets)."""
+        return (self.total_items - self.uncited) / self.total_items if self.total_items else 0.0
+
+    @property
+    def corroborated_fraction(self) -> float:
+        return self.corroborated / self.total_items if self.total_items else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_items": self.total_items,
+            "literature_only": self.literature_only,
+            "kg_only": self.kg_only,
+            "corroborated": self.corroborated,
+            "uncited": self.uncited,
+            "cited_fraction": self.cited_fraction,
+            "corroborated_fraction": self.corroborated_fraction,
+        }
+
+
+def evidence_summary(hypothesis: HypothesisArtifact) -> EvidenceSourceSummary:
+    """Summarize evidence-source coverage across `candidate_dag` and `covariate_relations`.
+
+    Classification relies only on `pmid`/`kg_evidence_id`, following the same
+    convention used everywhere else in this module: a knowledge-graph-only
+    citation lives in `pmid` itself (prefixed `optimuskg:`, see
+    `causal.knowledge_graph.KGEdge.citation_id`), while `kg_evidence_id`
+    marks a *second*, independent KG confirmation of an already
+    literature-cited item (see `DAGVariable`'s docstring). An item can never
+    be `kg_only` and `corroborated` at once because a KG-only variable never
+    populates `kg_evidence_id` (`causal.agents.user_question._kg_reinforcement`
+    short-circuits on an `optimuskg:`-prefixed `pmid`).
+    """
+    pairs: list[tuple[str, str]] = [
+        (variable.pmid, variable.kg_evidence_id) for variable in hypothesis.candidate_dag
+    ] + [
+        (relation.pmid, relation.kg_evidence_id) for relation in hypothesis.covariate_relations
+    ]
+    literature_only = kg_only = corroborated = uncited = 0
+    for pmid, kg_evidence_id in pairs:
+        if not pmid:
+            uncited += 1
+        elif kg_evidence_id:
+            corroborated += 1
+        elif pmid.startswith("optimuskg:"):
+            kg_only += 1
+        else:
+            literature_only += 1
+    return EvidenceSourceSummary(
+        total_items=len(pairs),
+        literature_only=literature_only,
+        kg_only=kg_only,
+        corroborated=corroborated,
+        uncited=uncited,
+    )
+
+
+@dataclass(frozen=True)
+class AdjustmentSetSummary:
+    """Cross-set structure of `DAGIdentificationResult.minimum_adjustment_sets`.
+
+    A single set size/count is easy to read off `DAGIdentificationResult`
+    directly, but a reviewer choosing which variables actually matter needs
+    to know how the *sets* relate to each other, not just how many there
+    are: `core_variable_labels` are in every minimum set (dropping one
+    breaks every option this search found -- there is no way to identify
+    the effect without it), `alternative_variable_labels` appear in some but
+    not all (interchangeable with each other for backdoor-blocking purposes
+    alone -- a reviewer may still prefer one on clinical or measurement
+    grounds), and `unused_confounder_labels` are declared confounders that
+    never appear in *any* minimum set. That last one is not necessarily a
+    bug -- a confounder whose only backdoor path is already blocked by
+    another selected variable is genuinely redundant for identification --
+    but it is exactly the kind of thing `DAGIdentificationResult.
+    technical_notes` cannot flag (it only tracks failures/edge cases in
+    computing the sets, not this kind of within-DAG redundancy), so it is
+    worth a reviewer's attention: it can also mean a role was misassigned.
+    """
+
+    set_count: int
+    set_size: int
+    core_variable_labels: tuple[str, ...]
+    alternative_variable_labels: tuple[str, ...]
+    unused_confounder_labels: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "set_count": self.set_count,
+            "set_size": self.set_size,
+            "core_variable_labels": self.core_variable_labels,
+            "alternative_variable_labels": self.alternative_variable_labels,
+            "unused_confounder_labels": self.unused_confounder_labels,
+        }
+
+
+def adjustment_set_summary(identification: DAGIdentificationResult) -> AdjustmentSetSummary:
+    """Derive core/alternative/unused variable structure from `identification.minimum_adjustment_sets`.
+
+    All label lookups go through `identification.dag.node_map`, so this
+    reads only the already-computed `DAGIdentificationResult` -- it never
+    recomputes adjustment sets itself and is safe to call unconditionally,
+    including when the DAG is not identified (`set_count=0`).
+    """
+    node_map = identification.dag.node_map
+    confounder_ids = {node.node_id for node in identification.dag.nodes if node.role == "confounder"}
+    sets = identification.minimum_adjustment_sets
+    if not sets:
+        return AdjustmentSetSummary(
+            set_count=0,
+            set_size=0,
+            core_variable_labels=(),
+            alternative_variable_labels=(),
+            unused_confounder_labels=tuple(sorted(node_map[node_id].label for node_id in confounder_ids)),
+        )
+    node_id_sets = [set(adjustment_set) for adjustment_set in sets]
+    core = set.intersection(*node_id_sets)
+    union = set.union(*node_id_sets)
+    alternative = union - core
+    unused_confounders = confounder_ids - union
+    return AdjustmentSetSummary(
+        set_count=len(sets),
+        set_size=len(sets[0]),
+        core_variable_labels=tuple(sorted(node_map[node_id].label for node_id in core)),
+        alternative_variable_labels=tuple(sorted(node_map[node_id].label for node_id in alternative)),
+        unused_confounder_labels=tuple(sorted(node_map[node_id].label for node_id in unused_confounders)),
+    )
+
+
+@dataclass(frozen=True)
 class DAGReviewResult:
-    """Bundles the two independent assessments a human reviews before approving a DAG."""
+    """Bundles the assessments a human reviews before approving a DAG.
+
+    `identification`/`clinical` are the two graph-theoretic/clinical
+    verdicts documented on their own classes above; `evidence`/`adjustment`
+    are descriptive metrics computed from those results and never feed back
+    into either verdict -- they exist to make the review surface (CLI/UI)
+    legible at a glance, not to gate approval themselves.
+    """
 
     identification: DAGIdentificationResult
     clinical: ClinicalValidationResult
+    evidence: EvidenceSourceSummary
+    adjustment: AdjustmentSetSummary
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "identification": self.identification.to_dict(),
             "clinical": self.clinical.to_dict(),
+            "evidence": self.evidence.to_dict(),
+            "adjustment": self.adjustment.to_dict(),
         }
 
 
@@ -161,8 +324,10 @@ def build_causal_dag(hypothesis: HypothesisArtifact) -> CausalDAG:
         node_role, timing, directions = _ROLE_MAP[variable.role]
         node_id = _variable_node_id(variable.label, label_to_id)
         nodes.append(CausalNode(node_id, variable.label, node_role, timing, observed=variable.observed))
-        status = "evidence_supported" if variable.pmid else "proposed"
-        evidence_ids = (variable.pmid,) if variable.pmid else ()
+        evidence_ids = tuple(
+            evidence_id for evidence_id in (variable.pmid, variable.kg_evidence_id) if evidence_id
+        )
+        status = "evidence_supported" if evidence_ids else "proposed"
         for direction in directions:
             source, target = _direction_to_edge(direction, node_id)
             edges.append(
@@ -187,8 +352,10 @@ def build_causal_dag(hypothesis: HypothesisArtifact) -> CausalDAG:
                 f"covariate_relations cannot reference a mediator/collider/selection label: "
                 f"{relation.source!r} -> {relation.target!r}"
             )
-        status = "evidence_supported" if relation.pmid else "proposed"
-        evidence_ids = (relation.pmid,) if relation.pmid else ()
+        evidence_ids = tuple(
+            evidence_id for evidence_id in (relation.pmid, relation.kg_evidence_id) if evidence_id
+        )
+        status = "evidence_supported" if evidence_ids else "proposed"
         edges.append(
             CausalEdge(
                 source=label_to_id[relation.source],
@@ -284,6 +451,25 @@ def assess_clinical_completeness(hypothesis: HypothesisArtifact) -> ClinicalVali
         )
 
     dag = build_causal_dag(hypothesis)
+    confounder_count = sum(1 for node in dag.nodes if node.role == "confounder")
+    if confounder_count == 0 and hypothesis.candidate_confounders and hypothesis.unresolved_covariates:
+        # Deliberately advisory, not blocking: `major_confounders` above is the
+        # only sanctioned way to force a block, so a reviewer is never
+        # ambushed by an automatically-inferred one (see
+        # `causal.agents.hypothesis._major_confounders`). But an empty
+        # confounder set trivially satisfies backdoor identification (no path
+        # left to block), which silently reads as "no confounding" unless a
+        # reviewer notices -- this note exists so that reading is never made
+        # by omission, without deciding for the reviewer that it must block.
+        advisory.append(
+            "no candidate_dag variable has been classified as a confounder, and "
+            f"{len(hypothesis.unresolved_covariates)} first-pass covariate(s) remain unresolved "
+            "(" + ", ".join(f"'{label}'" for label in hypothesis.unresolved_covariates) + "); "
+            "backdoor identification is only trivially satisfied here because no confounder was "
+            "ever declared, not because none exists. Review whether any of these should be "
+            "classified as a confounder before approving -- add it to major_confounders if it "
+            "must block approval until resolved."
+        )
     disputed_edges = [edge for edge in dag.edges if edge.certainty in {"contested", "unknown_direction"}]
     if disputed_edges:
         advisory.append(
@@ -301,10 +487,13 @@ def assess_clinical_completeness(hypothesis: HypothesisArtifact) -> ClinicalVali
 
 
 def review_dag(hypothesis: HypothesisArtifact, max_candidates: int = 24) -> DAGReviewResult:
-    """Convenience entry point bundling the graph-theoretic and clinical checks for review/UI use."""
+    """Convenience entry point bundling the graph-theoretic, clinical, and descriptive-metric checks for review/UI use."""
+    identification = assess_identification(hypothesis, max_candidates=max_candidates)
     return DAGReviewResult(
-        identification=assess_identification(hypothesis, max_candidates=max_candidates),
+        identification=identification,
         clinical=assess_clinical_completeness(hypothesis),
+        evidence=evidence_summary(hypothesis),
+        adjustment=adjustment_set_summary(identification),
     )
 
 

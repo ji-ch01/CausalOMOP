@@ -135,6 +135,18 @@ def _evidence_level(publication_types: tuple[str, ...]) -> str:
     return "unclassified"
 
 
+def select_by_evidence_tier(
+    articles: tuple[LiteratureArticle, ...], limit: int
+) -> tuple[LiteratureArticle, ...]:
+    """Public entry point onto the same evidence-tier prioritization
+    `search_and_fetch(..., limit=N)` applies internally, for a caller that
+    merges articles from more than one retrieval pass (e.g.
+    `causal.agents.user_question`'s per-covariate targeted searches) and
+    needs to rank the leftover pool the same way after reserving some slots.
+    """
+    return _select_by_evidence_tier(articles, limit)
+
+
 def _select_by_evidence_tier(
     articles: tuple[LiteratureArticle, ...], limit: int
 ) -> tuple[LiteratureArticle, ...]:

@@ -1,12 +1,16 @@
 import unittest
 
 from causal.agents.dag_identification import (
+    DAGIdentificationResult,
+    adjustment_set_summary,
     assess_clinical_completeness,
     assess_identification,
     build_causal_dag,
+    evidence_summary,
     review_dag,
 )
 from causal.agents.hypothesis import HypothesisAgent
+from causal.roadmap import CausalDAG, CausalEdge, CausalNode
 
 
 def protocol(
@@ -41,13 +45,14 @@ def protocol(
     }
 
 
-def confounder(label, pmid="111", temporal_classification="pre_treatment"):
+def confounder(label, pmid="111", temporal_classification="pre_treatment", kg_evidence_id=""):
     return {
         "label": label,
         "role": "confounder",
         "pmid": pmid,
         "temporal_classification": temporal_classification,
         "rationale": f"{label} influences both treatment choice and the outcome.",
+        "kg_evidence_id": kg_evidence_id,
     }
 
 
@@ -458,12 +463,212 @@ class DAGIdentificationTests(unittest.TestCase):
             )
         )
 
+    def test_zero_confounders_with_unresolved_covariates_is_advisory_not_blocking(self):
+        """An empty confounder set trivially satisfies backdoor identification
+        (no path left to block) -- this must never be silently read as "no
+        confounding". The reviewer gets a loud advisory note, but this alone
+        must not block approval: only a human-declared `major_confounders`
+        entry is allowed to do that (see
+        `causal.agents.hypothesis._major_confounders` and
+        `WorkflowIdentificationGateTests.test_empty_dag_is_trivially_identified_and_not_blocked_here`
+        in test_workflow.py).
+        """
+        hypothesis = HypothesisAgent().run(protocol(
+            first_pass_covariates=["age", "SOFA score"],
+        ))
+        clinical = assess_clinical_completeness(hypothesis)
+        self.assertTrue(
+            any(
+                "no candidate_dag variable has been classified as a confounder" in note
+                and "'age'" in note and "'SOFA score'" in note
+                for note in clinical.advisory_notes
+            )
+        )
+        self.assertFalse(clinical.blocking_issues)
+        self.assertTrue(clinical.approved_for_dag_gate)
+
+    def test_zero_confounders_note_is_skipped_when_at_least_one_is_classified(self):
+        hypothesis = HypothesisAgent().run(protocol(
+            candidate_dag=[confounder("SOFA score")],
+            first_pass_covariates=["SOFA score", "age"],
+        ))
+        clinical = assess_clinical_completeness(hypothesis)
+        self.assertFalse(
+            any("no candidate_dag variable has been classified as a confounder" in note
+                for note in clinical.advisory_notes)
+        )
+
     def test_major_confounders_must_be_declared_first_pass_covariates(self):
         with self.assertRaises(ValueError):
             HypothesisAgent().run(protocol(
                 first_pass_covariates=["SOFA score"],
                 major_confounders=["age"],
             ))
+
+
+class EvidenceSummaryTests(unittest.TestCase):
+    """`evidence_summary` classifies every candidate_dag/covariate_relations
+    item into exactly one of four grounding buckets (see its docstring)."""
+
+    def test_classifies_each_grounding_bucket(self):
+        hypothesis = HypothesisAgent().run(protocol(candidate_dag=[
+            confounder("literature only", pmid="111"),
+            confounder("kg only", pmid="optimuskg:X1|associated_with|X2"),
+            confounder(
+                "corroborated", pmid="111", kg_evidence_id="optimuskg:X3|associated_with|X4"
+            ),
+            {
+                "label": "uncited",
+                "role": "confounder",
+                "pmid": "",
+                "temporal_classification": "pre_treatment",
+                "rationale": "Expert-asserted without a citation.",
+            },
+        ]))
+        summary = evidence_summary(hypothesis)
+        self.assertEqual(summary.total_items, 4)
+        self.assertEqual(summary.literature_only, 1)
+        self.assertEqual(summary.kg_only, 1)
+        self.assertEqual(summary.corroborated, 1)
+        self.assertEqual(summary.uncited, 1)
+        self.assertAlmostEqual(summary.cited_fraction, 0.75)
+        self.assertAlmostEqual(summary.corroborated_fraction, 0.25)
+
+    def test_covariate_relations_count_toward_the_same_summary(self):
+        hypothesis = HypothesisAgent().run(protocol(
+            candidate_dag=[confounder("a"), confounder("b")],
+            covariate_relations=[
+                {"source": "a", "target": "b", "pmid": "111", "rationale": "a precedes b."}
+            ],
+        ))
+        summary = evidence_summary(hypothesis)
+        self.assertEqual(summary.total_items, 3)
+        self.assertEqual(summary.literature_only, 3)
+
+    def test_empty_dag_reports_zero_fractions_not_a_division_error(self):
+        hypothesis = HypothesisAgent().run(protocol())
+        summary = evidence_summary(hypothesis)
+        self.assertEqual(summary.total_items, 0)
+        self.assertEqual(summary.cited_fraction, 0.0)
+        self.assertEqual(summary.corroborated_fraction, 0.0)
+
+
+def _node(node_id, role, timing="baseline", observed=True):
+    return CausalNode(node_id, node_id.replace("_", " ").title(), role, timing, observed)
+
+
+def _edge(source, target):
+    return CausalEdge(source, target, f"Assumed causal relation {source}->{target}")
+
+
+class AdjustmentSetSummaryTests(unittest.TestCase):
+    """Synthetic DAG built directly from `causal.roadmap` primitives (not
+    through the LLM/HypothesisArtifact bridge) so every category
+    `adjustment_set_summary` reports can be exercised in one graph:
+
+    - `confounder1`/`confounder2` each sit on their own independent backdoor
+      path (a direct edge to both exposure and outcome) -- neither is
+      optional, so both must appear in *every* minimum adjustment set (core).
+    - `node_a`/`node_b` sit on a single shared backdoor path as a chain
+      (`node_a -> node_b -> exposure`, `node_a -> outcome`): conditioning on
+      either one blocks that path, so they are interchangeable
+      (alternatives), never both required together.
+    - `unused_confounder` carries the `confounder` role but has no edge to
+      exposure at all, so it never lies on any backdoor path and can never
+      be required by identification, however it is labeled.
+    """
+
+    def _build_dag(self) -> CausalDAG:
+        return CausalDAG(
+            nodes=(
+                _node("exposure", "exposure", "treatment"),
+                _node("outcome", "outcome", "outcome"),
+                _node("confounder1", "confounder"),
+                _node("confounder2", "confounder"),
+                _node("node_a", "prognostic"),
+                _node("node_b", "other"),
+                _node("unused_confounder", "confounder"),
+            ),
+            edges=(
+                _edge("exposure", "outcome"),
+                _edge("confounder1", "exposure"),
+                _edge("confounder1", "outcome"),
+                _edge("confounder2", "exposure"),
+                _edge("confounder2", "outcome"),
+                _edge("node_a", "outcome"),
+                _edge("node_a", "node_b"),
+                _edge("node_b", "exposure"),
+            ),
+            exposure_id="exposure",
+            outcome_id="outcome",
+        )
+
+    def _identification(self) -> DAGIdentificationResult:
+        dag = self._build_dag()
+        sets = dag.minimum_adjustment_sets()
+        return DAGIdentificationResult(
+            dag=dag,
+            confounder_count=sum(1 for node in dag.nodes if node.role == "confounder"),
+            identified_by_backdoor_adjustment=bool(sets),
+            minimum_adjustment_sets=sets,
+            technical_notes=(),
+        )
+
+    def test_core_alternative_and_unused_are_correctly_partitioned(self):
+        identification = self._identification()
+        # Sanity check on the fixture itself before trusting the summary of it.
+        self.assertEqual(
+            set(identification.minimum_adjustment_sets),
+            {
+                tuple(sorted(("confounder1", "confounder2", "node_a"))),
+                tuple(sorted(("confounder1", "confounder2", "node_b"))),
+            },
+        )
+
+        summary = adjustment_set_summary(identification)
+        self.assertEqual(summary.set_count, 2)
+        self.assertEqual(summary.set_size, 3)
+        self.assertEqual(set(summary.core_variable_labels), {"Confounder1", "Confounder2"})
+        self.assertEqual(set(summary.alternative_variable_labels), {"Node A", "Node B"})
+        self.assertEqual(summary.unused_confounder_labels, ("Unused Confounder",))
+
+    def test_unidentified_dag_reports_all_confounders_as_unused(self):
+        dag = CausalDAG(
+            nodes=(
+                _node("exposure", "exposure", "treatment"),
+                _node("outcome", "outcome", "outcome"),
+                _node("latent_confounder", "confounder", observed=False),
+            ),
+            edges=(
+                _edge("exposure", "outcome"),
+                _edge("latent_confounder", "exposure"),
+                _edge("latent_confounder", "outcome"),
+            ),
+            exposure_id="exposure",
+            outcome_id="outcome",
+        )
+        identification = DAGIdentificationResult(
+            dag=dag, confounder_count=1, identified_by_backdoor_adjustment=False,
+            minimum_adjustment_sets=(), technical_notes=(),
+        )
+        summary = adjustment_set_summary(identification)
+        self.assertEqual(summary.set_count, 0)
+        self.assertEqual(summary.set_size, 0)
+        self.assertEqual(summary.core_variable_labels, ())
+        self.assertEqual(summary.alternative_variable_labels, ())
+        self.assertEqual(summary.unused_confounder_labels, ("Latent Confounder",))
+
+
+class ReviewDagIncludesMetricsTests(unittest.TestCase):
+    def test_review_dag_bundles_evidence_and_adjustment_summaries(self):
+        hypothesis = HypothesisAgent().run(protocol([confounder("SOFA score")]))
+        review = review_dag(hypothesis)
+        self.assertEqual(review.evidence.total_items, 1)
+        self.assertEqual(review.evidence.literature_only, 1)
+        self.assertEqual(review.adjustment.set_count, 1)
+        self.assertEqual(review.adjustment.core_variable_labels, ("SOFA score",))
+        self.assertIn("evidence", review.to_dict())
+        self.assertIn("adjustment", review.to_dict())
 
 
 if __name__ == "__main__":

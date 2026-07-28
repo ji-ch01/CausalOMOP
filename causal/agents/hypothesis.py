@@ -59,12 +59,23 @@ class DAGVariable:
     """One candidate DAG variable with an explicit causal role. Always provisional.
 
     `pmid` is optional: "" means the role was asserted without a literature
-    citation (still requires a `rationale`), a non-empty PMID/OpenAlex id
-    means the role is literature-grounded. `observed` marks whether the
-    variable is expected to be measurable at all (False = latent/unmeasured).
+    citation (still requires a `rationale`), a non-empty id means the role is
+    grounded — either a PubMed/OpenAlex citation, or (see
+    `causal.knowledge_graph`) a `KGEdge.citation_id` when a knowledge-graph
+    relation was the only evidence available for this variable, with no
+    retrieved abstract discussing it. `observed` marks whether the variable
+    is expected to be measurable at all (False = latent/unmeasured).
     `certainty` (see `causal.roadmap.EDGE_CERTAINTY`) is orthogonal to `pmid`:
     a cited role can still be `contested` or `unknown_direction` if the
     literature itself disagrees on the relationship.
+
+    `kg_evidence_id` is a second, independent evidence slot: when `pmid` is a
+    literature citation, a non-empty `kg_evidence_id` records that the
+    knowledge graph *also*, independently, confirms the same relation to
+    treatment or outcome — i.e. two independent sources agree, not just one
+    restating the other. It is never the sole grounding for a variable (an
+    ungrounded `pmid` with only `kg_evidence_id` set does not happen; a
+    KG-only variable puts the KG id in `pmid` itself instead).
 
     `temporal_classification` (see `DAG_VARIABLE_TEMPORAL_CLASSES`) is a
     second, independent assertion about when the variable is determined
@@ -81,6 +92,7 @@ class DAGVariable:
     pmid: str = ""
     observed: bool = True
     certainty: str = "established"
+    kg_evidence_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -95,6 +107,7 @@ class CovariateRelation:
     rationale: str
     pmid: str = ""
     certainty: str = "established"
+    kg_evidence_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -266,6 +279,7 @@ class HypothesisAgent:
             pmid = item.get("pmid", "")
             observed = item.get("observed", True)
             certainty = item.get("certainty", "established")
+            kg_evidence_id = item.get("kg_evidence_id", "")
             if not isinstance(label, str) or not label.strip():
                 raise ValueError("candidate_dag entry requires a non-empty label")
             if role not in DAG_VARIABLE_ROLES:
@@ -291,13 +305,16 @@ class HypothesisAgent:
                 raise ValueError("candidate_dag observed must be a boolean")
             if certainty not in EDGE_CERTAINTY:
                 raise ValueError(f"candidate_dag certainty must be one of {EDGE_CERTAINTY}")
+            if not isinstance(kg_evidence_id, str):
+                raise ValueError("candidate_dag kg_evidence_id must be a string")
             label = label.strip()
             if label in seen_labels:
                 raise ValueError(f"candidate_dag defines '{label}' more than once")
             seen_labels.add(label)
             variables.append(
                 DAGVariable(
-                    label, role, rationale.strip(), temporal_classification, pmid.strip(), observed, certainty
+                    label, role, rationale.strip(), temporal_classification, pmid.strip(), observed, certainty,
+                    kg_evidence_id.strip(),
                 )
             )
         return tuple(variables)
@@ -320,6 +337,7 @@ class HypothesisAgent:
             rationale = item.get("rationale")
             pmid = item.get("pmid", "")
             certainty = item.get("certainty", "established")
+            kg_evidence_id = item.get("kg_evidence_id", "")
             if not isinstance(source, str) or not source.strip():
                 raise ValueError("covariate_relations entry requires a non-empty source")
             if not isinstance(target, str) or not target.strip():
@@ -330,6 +348,8 @@ class HypothesisAgent:
                 raise ValueError("covariate_relations pmid must be a string")
             if certainty not in EDGE_CERTAINTY:
                 raise ValueError(f"covariate_relations certainty must be one of {EDGE_CERTAINTY}")
+            if not isinstance(kg_evidence_id, str):
+                raise ValueError("covariate_relations kg_evidence_id must be a string")
             source, target = source.strip(), target.strip()
             if source == target:
                 raise ValueError("covariate_relations entry cannot relate a variable to itself")
@@ -337,7 +357,11 @@ class HypothesisAgent:
                 raise ValueError(f"covariate_relations source '{source}' is not a declared candidate_dag label")
             if target not in known_labels:
                 raise ValueError(f"covariate_relations target '{target}' is not a declared candidate_dag label")
-            relations.append(CovariateRelation(source, target, rationale.strip(), pmid.strip(), certainty))
+            relations.append(
+                CovariateRelation(
+                    source, target, rationale.strip(), pmid.strip(), certainty, kg_evidence_id.strip()
+                )
+            )
         return tuple(relations)
 
     @staticmethod
