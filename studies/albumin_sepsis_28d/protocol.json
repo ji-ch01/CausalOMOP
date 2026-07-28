@@ -24,10 +24,44 @@
     "Do not promote text-matched concepts to executable concept sets without human validation"
   ],
   "concept_sets": {
-    "sepsis": {"status": "candidate_pending_human_approval", "concept_ids": [132797]},
-    "septic_shock": {"status": "candidate_pending_human_approval", "concept_ids": [196236]},
-    "albumin": {"status": "present_but_unmapped_to_standard_concept", "concept_ids": []},
-    "crystalloids": {"status": "partially_mapped_requires_product_rules", "concept_ids": []}
+    "sepsis": {
+      "role": "population", "domain": "condition",
+      "status": "candidate_pending_human_approval", "concept_ids": [132797]
+    },
+    "septic_shock": {
+      "role": "effect_modifier", "domain": "condition",
+      "status": "candidate_pending_human_approval", "concept_ids": [196236]
+    },
+    "albumin": {
+      "role": "treatment", "domain": "drug",
+      "status": "present_but_unmapped_to_standard_concept", "concept_ids": [],
+      "source_value_rule": "(?i)^Albumin(?:, Human)?\\b"
+    },
+    "crystalloids": {
+      "role": "treatment_and_comparator", "domain": "drug",
+      "status": "partially_mapped_requires_product_rules", "concept_ids": [],
+      "source_value_rule": "(?i)(Lactated Ringers|Sodium Chloride).*(Bag|Bottle|Injection)$",
+      "lookup_term": "sodium chloride"
+    }
+  },
+  "query_concept_sets": {
+    "population": {"domain": "condition", "concept_ids": [132797]},
+    "treatment": {"domain": "drug", "concept_ids": []},
+    "comparator": {"domain": "drug", "concept_ids": []},
+    "outcome": {"domain": "death", "concept_ids": []}
+  },
+  "query_settings": {
+    "exposure_contrast": "add_on",
+    "care_site_names": [
+      "Medical Intensive Care Unit (MICU)",
+      "Cardiac Vascular Intensive Care Unit (CVICU)",
+      "Medical/Surgical Intensive Care Unit (MICU/SICU)",
+      "Surgical Intensive Care Unit (SICU)",
+      "Trauma SICU (TSICU)",
+      "Coronary Care Unit (CCU)",
+      "Neuro Surgical Intensive Care Unit (Neuro SICU)"
+    ],
+    "min_age_years": 18
   },
   "first_pass_covariates": [
     "age", "sex", "race", "emergency admission", "SOFA", "lactate",

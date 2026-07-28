@@ -130,6 +130,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("does not estimate a causal effect", report)
         self.assertNotIn("causal effect is", report.lower())
 
+    def test_demo_report_surfaces_grace_period_outcome_overlap_diagnostic(self):
+        run_dir = Path(self.temp.name) / "runs"
+        state = self.manager.start(self.protocol)
+        (run_dir / state.run_id / "feasibility.json").write_text(json.dumps({
+            "status": "provisional_cohort_feasibility",
+            "causal_effect_estimated": False,
+            "counts": {
+                "eligible_persons": 100,
+                "outcome_events": 20,
+                "outcome_events_during_grace_period": 4,
+            },
+            "warnings": ["Counts are for pipeline feasibility and must not be interpreted causally."],
+        }), encoding="utf-8")
+
+        report = self.manager.build_demo_report(state.run_id).read_text(encoding="utf-8")
+
+        self.assertIn("Outcome events during grace period: **4**", report)
+
 
 class WorkflowCovariateReviewTests(unittest.TestCase):
     def setUp(self):
@@ -265,6 +283,72 @@ class WorkflowMajorConfounderGateTests(unittest.TestCase):
             self.state.run_id, "age", "reject", "Dr. Chen",
             "Cohort is age-restricted at enrollment.",
         )
+        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+        self.assertEqual(state.gates["protocol"].status, "approved")
+
+
+class WorkflowIdentificationGateTests(unittest.TestCase):
+    """The protocol/DAG gate must also refuse approval when the declared DAG
+    is not identified by backdoor adjustment -- e.g. a confounder was
+    classified but marked latent/unobserved, so no baseline set can block
+    the backdoor path it opens. See `_block_if_not_identified`."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE"
+            },
+            "first_pass_covariates": ["age"],
+            "concept_sets": {"treatment": {"status": "approved"}},
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        self.state = self.manager.run_hypothesis_agent(state.run_id)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_protocol_gate_cannot_be_approved_when_the_only_confounder_is_unobserved(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "accept", "Dr. Chen",
+            "Baseline age affects both treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            observed=False,
+        )
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+
+    def test_protocol_gate_approves_when_the_confounder_is_observed(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "accept", "Dr. Chen",
+            "Baseline age affects both treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+        )
+        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+        self.assertEqual(state.gates["protocol"].status, "approved")
+
+    def test_protocol_gate_can_still_be_rejected_while_unidentified(self):
+        self.manager.review_covariate(
+            self.state.run_id, "age", "accept", "Dr. Chen",
+            "Baseline age affects both treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            observed=False,
+        )
+        self.manager.decide_gate(self.state.run_id, "protocol", "provisional", "tester")
+        self.manager.decide_gate(self.state.run_id, "protocol", "rejected", "tester")
+
+    def test_empty_dag_is_trivially_identified_and_not_blocked_here(self):
+        """An empty candidate_dag is trivially backdoor-identified (no path
+        to block); this gate must not be the thing that catches that --
+        `_block_if_major_confounders_unresolved` is."""
         state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
         self.assertEqual(state.gates["protocol"].status, "approved")
 

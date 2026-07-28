@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from causal.agents.query_validation import QueryValidationAgent
 from causal.config import BigQueryDatasets
+from causal.queries.feasibility import ConceptSetSpec, feasibility_sql
 
 
 REQUIRED_OMOP_TABLES = (
@@ -24,17 +26,6 @@ class PreflightResult:
     @property
     def ready(self) -> bool:
         return not self.missing_tables
-
-
-DEFAULT_ICU_CARE_SITES = (
-    "Medical Intensive Care Unit (MICU)",
-    "Cardiac Vascular Intensive Care Unit (CVICU)",
-    "Medical/Surgical Intensive Care Unit (MICU/SICU)",
-    "Surgical Intensive Care Unit (SICU)",
-    "Trauma SICU (TSICU)",
-    "Coronary Care Unit (CCU)",
-    "Neuro Surgical Intensive Care Unit (Neuro SICU)",
-)
 
 
 class BigQueryOMOPGateway:
@@ -184,112 +175,59 @@ class BigQueryOMOPGateway:
         ])
         return [dict(row.items()) for row in self.client.query(sql, job_config=config).result()]
 
-    def albumin_sepsis_feasibility(
+    def feasibility(
         self,
-        icu_care_sites: tuple[str, ...] = DEFAULT_ICU_CARE_SITES,
-        sepsis_seed_concept_id: int = 132797,
+        *,
+        population: ConceptSetSpec,
+        treatment: ConceptSetSpec,
+        comparator: ConceptSetSpec,
+        outcome: ConceptSetSpec,
         grace_period_hours: int = 24,
         follow_up_days: int = 28,
+        min_age_years: int | None = 18,
+        care_site_names: tuple[str, ...] = (),
     ) -> dict[str, Any]:
-        """Run provisional cohort counts; this deliberately estimates no effect."""
-        if not icu_care_sites or sepsis_seed_concept_id <= 0:
-            raise ValueError("ICU care sites and a positive sepsis seed are required")
+        """Run provisional cohort counts for one target-trial question.
+
+        This deliberately estimates no causal effect: it returns aggregate
+        eligibility/exposure/outcome counts only, for pipeline feasibility.
+        """
         try:
-            from google.cloud import bigquery
+            from google.cloud import bigquery  # noqa: F401  (import-guard only)
         except ImportError as exc:
             raise RuntimeError("Install requirements-bigquery.txt") from exc
-        sql = f"""
-        WITH sepsis_concepts AS (
-          SELECT descendant_concept_id AS concept_id
-          FROM {self.datasets.table('omop', 'concept_ancestor')}
-          WHERE ancestor_concept_id = @sepsis_seed
-          UNION DISTINCT SELECT @sepsis_seed
-        ),
-        first_icu AS (
-          SELECT
-            vd.person_id, vd.visit_occurrence_id, vd.visit_detail_id,
-            vd.visit_detail_start_datetime AS index_datetime,
-            cs.care_site_name
-          FROM {self.datasets.table('omop', 'visit_detail')} vd
-          JOIN {self.datasets.table('omop', 'care_site')} cs USING (care_site_id)
-          WHERE cs.care_site_name IN UNNEST(@icu_names)
-            AND vd.visit_detail_start_datetime IS NOT NULL
-          QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY vd.person_id ORDER BY vd.visit_detail_start_datetime, vd.visit_detail_id
-          ) = 1
-        ),
-        eligible AS (
-          SELECT DISTINCT i.*
-          FROM first_icu i
-          JOIN {self.datasets.table('omop', 'person')} p USING (person_id)
-          JOIN {self.datasets.table('omop', 'condition_occurrence')} co
-            ON co.person_id = i.person_id
-           AND co.visit_occurrence_id = i.visit_occurrence_id
-          JOIN sepsis_concepts sc
-            ON co.condition_concept_id = sc.concept_id
-          WHERE EXTRACT(YEAR FROM DATE(i.index_datetime)) - p.year_of_birth >= 18
-        ),
-        exposure AS (
-          SELECT
-            e.person_id,
-            COUNTIF(REGEXP_CONTAINS(de.drug_source_value, r'(?i)^Albumin(?:, Human)?\\b')) > 0 AS has_albumin,
-            COUNTIF(REGEXP_CONTAINS(
-              de.drug_source_value,
-              r'(?i)(Lactated Ringers|Sodium Chloride).*(Bag|Bottle|Injection)$'
-            )) > 0 AS has_crystalloid
-          FROM eligible e
-          LEFT JOIN {self.datasets.table('omop', 'drug_exposure')} de
-            ON de.person_id = e.person_id
-           AND de.visit_occurrence_id = e.visit_occurrence_id
-           AND de.drug_exposure_start_datetime >= e.index_datetime
-           AND de.drug_exposure_start_datetime < DATETIME_ADD(e.index_datetime, INTERVAL @grace HOUR)
-          GROUP BY e.person_id
-        ),
-        analytic AS (
-          SELECT
-            e.person_id,
-            x.has_albumin,
-            x.has_crystalloid,
-            d.death_date IS NOT NULL
-              AND d.death_date >= DATE(e.index_datetime)
-              AND d.death_date <= DATE_ADD(DATE(e.index_datetime), INTERVAL @follow_up DAY) AS death_28d
-          FROM eligible e
-          JOIN exposure x USING (person_id)
-          LEFT JOIN {self.datasets.table('omop', 'death')} d USING (person_id)
+        sql = feasibility_sql(
+            self.datasets,
+            population=population,
+            treatment=treatment,
+            comparator=comparator,
+            outcome=outcome,
+            grace_period_hours=grace_period_hours,
+            follow_up_days=follow_up_days,
+            min_age_years=min_age_years,
+            care_site_names=care_site_names,
         )
-        SELECT
-          COUNT(*) AS eligible_persons,
-          COUNTIF(has_crystalloid) AS any_crystalloid,
-          COUNTIF(has_albumin) AS any_albumin,
-          COUNTIF(has_crystalloid AND has_albumin) AS albumin_plus_crystalloid,
-          COUNTIF(has_crystalloid AND NOT has_albumin) AS crystalloid_only,
-          COUNTIF(NOT has_crystalloid AND NOT has_albumin) AS neither_exposure,
-          COUNTIF(death_28d) AS deaths_28d,
-          COUNTIF(death_28d AND has_crystalloid AND has_albumin) AS deaths_albumin_plus_crystalloid,
-          COUNTIF(death_28d AND has_crystalloid AND NOT has_albumin) AS deaths_crystalloid_only
-        FROM analytic
-        """
-        config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("icu_names", "STRING", list(icu_care_sites)),
-            bigquery.ScalarQueryParameter("sepsis_seed", "INT64", sepsis_seed_concept_id),
-            bigquery.ScalarQueryParameter("grace", "INT64", grace_period_hours),
-            bigquery.ScalarQueryParameter("follow_up", "INT64", follow_up_days),
-        ])
-        rows = list(self.client.query(sql, job_config=config).result())
+        validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")
+        if not validation.passed:
+            raise RuntimeError(
+                f"Feasibility SQL failed governance validation: {', '.join(validation.violations)}"
+            )
+        rows = list(self.client.query(sql).result())
         counts = dict(rows[0].items()) if rows else {}
         return {
-            "status": "provisional_source_value_phenotype",
+            "status": "provisional_cohort_feasibility",
             "causal_effect_estimated": False,
-            "icu_care_sites": list(icu_care_sites),
-            "sepsis_seed_concept_id": sepsis_seed_concept_id,
             "grace_period_hours": grace_period_hours,
             "follow_up_days": follow_up_days,
             "counts": counts,
             "warnings": [
-                "Sepsis uses a diagnosis concept set, not the published Sepsis-3 phenotype.",
-                "Albumin and crystalloid exposure use unvalidated source-value regular expressions.",
-                "Sodium-chloride products may include non-resuscitation administrations.",
+                "Concept sets reflect current human-approved mappings only; unmapped "
+                "roles will fail with a clear error rather than silently degrading.",
                 "Counts are for pipeline feasibility and must not be interpreted causally.",
+                "outcome_events_during_grace_period counts events that occurred inside "
+                "the exposure-ascertainment window itself, before treatment status was "
+                "determined; a large share of outcome_events falling here warrants review "
+                "before trusting the arm each such person was assigned to.",
             ],
         }
 

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from causal.bigquery import BigQueryOMOPGateway, REQUIRED_OMOP_TABLES
 from causal.config import BigQueryDatasets
+from causal.queries import ConceptSetSpec
 
 
 class FakeClient:
@@ -34,7 +35,12 @@ class FoundationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gateway.audit_visit_details(0)
         with self.assertRaises(ValueError):
-            gateway.albumin_sepsis_feasibility(())
+            gateway.feasibility(
+                population=ConceptSetSpec(domain="condition", concept_ids=(132797,)),
+                treatment=ConceptSetSpec(domain="drug", concept_ids=()),
+                comparator=ConceptSetSpec(domain="drug", concept_ids=(2,)),
+                outcome=ConceptSetSpec(domain="death"),
+            )
 
 
 if __name__ == "__main__":

@@ -9,17 +9,21 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from causal.orchestrator.state import ApprovalGate, NEXT_PHASE, RunState
-from causal.agents import DataScienceAgent, ExecutionAgent, HypothesisAgent
+from causal.agents import DataScienceAgent, ExecutionAgent, HypothesisAgent, QueryValidationAgent
+from causal.agents.dag_identification import assess_identification
 from causal.agents.hypothesis import DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
 from causal.agents.user_question import GeneratedHypothesis
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
 from causal.data_builder import AnalyticCohortBuilder
 from causal.mcp_client import OMCPClient
-from causal.queries import albumin_sepsis_feasibility_sql
+from causal.queries import EXPOSURE_CONTRASTS, ConceptSetSpec, feasibility_sql
 
+
+QUERY_ROLES = ("population", "treatment", "comparator", "outcome")
 
 REQUIRED_GATES = {
     "protocol_review": "protocol",
@@ -37,6 +41,59 @@ def _make_run_id(study_id: str) -> str:
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"{timestamp}_{study_id}-{uuid.uuid4().hex[:8]}"
+
+
+def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
+    """Read the human-approved, per-question concept sets a cohort/feasibility
+    query is built from -- population/treatment/comparator/outcome, each with
+    an OMOP domain and its approved concept_ids. Distinct from `concept_sets`
+    (used by the Data Science Agent's phenotype review), because a query's
+    domain/role wiring is a query-generation concern, not a review concern.
+    """
+    raw = protocol.get("query_concept_sets")
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            "Protocol requires query_concept_sets (population/treatment/comparator/outcome), "
+            "each with an approved domain and concept_ids, before a cohort or feasibility "
+            "query can be generated for this question"
+        )
+    specs: dict[str, ConceptSetSpec] = {}
+    for role in QUERY_ROLES:
+        definition = raw.get(role)
+        if not isinstance(definition, dict):
+            raise RuntimeError(f"query_concept_sets is missing role '{role}'")
+        domain = definition.get("domain")
+        if not isinstance(domain, str) or not domain:
+            raise RuntimeError(f"query_concept_sets['{role}'] requires a domain")
+        concept_ids = tuple(int(value) for value in definition.get("concept_ids", ()))
+        specs[role] = ConceptSetSpec(domain=domain, concept_ids=concept_ids)
+    return specs
+
+
+def _load_query_settings(protocol: dict) -> dict[str, Any]:
+    settings = protocol.get("query_settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    return {
+        "care_site_names": tuple(str(value) for value in settings.get("care_site_names", ())),
+        "min_age_years": settings.get("min_age_years", 18),
+    }
+
+
+def _load_exposure_contrast(protocol: dict) -> str:
+    """Read the human-approved treatment/comparator inclusion semantics for
+    the analytic cohort (see `causal.queries.feasibility.EXPOSURE_CONTRASTS`).
+    Kept separate from `_load_query_settings` because `feasibility_sql`
+    reports all exposure combinations unfiltered and does not take this
+    parameter -- only `AnalyticCohortBuilder`'s person-level cohort does.
+    """
+    settings = protocol.get("query_settings")
+    if not isinstance(settings, dict):
+        return "add_on"
+    value = settings.get("exposure_contrast", "add_on")
+    if value not in EXPOSURE_CONTRASTS:
+        raise RuntimeError(f"query_settings.exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
+    return value
 
 
 class WorkflowManager:
@@ -150,6 +207,7 @@ class WorkflowManager:
             raise ValueError("status must be approved, rejected, or provisional")
         if gate == "protocol" and status == "approved":
             self._block_if_major_confounders_unresolved(run_id)
+            self._block_if_not_identified(run_id)
         state.gates[gate].decide(status, reviewer, comment)  # type: ignore[arg-type]
         state.record("gate_decided", f"{gate}={status} by {reviewer}")
         self.save(state)
@@ -286,6 +344,39 @@ class WorkflowManager:
                 "rationale, or explicitly reject it with a reviewer and rationale."
             )
 
+    def _block_if_not_identified(self, run_id: str) -> None:
+        """The DAG-approval gate ("protocol") cannot be approved while the
+        declared candidate_dag fails backdoor identification: the run may
+        never have called the Hypothesis Agent yet, so absence of
+        hypothesis.json is not itself a blocker here (mirrors
+        `_block_if_major_confounders_unresolved`). Once hypothesis.json
+        exists, `assess_identification` is authoritative. This does not
+        replace `_block_if_major_confounders_unresolved`: an empty
+        candidate_dag is trivially identified (see
+        `causal.agents.dag_identification` for why), so this check mainly
+        catches a major confounder that was classified but marked
+        unobserved/latent -- no valid baseline adjustment set can exist for
+        it -- or a DAG with more adjustment candidates than
+        `assess_identification` can exhaustively verify.
+        """
+        hypothesis_path = self.runs_dir / run_id / "hypothesis.json"
+        if not hypothesis_path.is_file():
+            return
+        protocol_path = self.runs_dir / run_id / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        hypothesis = HypothesisAgent().run(protocol)
+        result = assess_identification(hypothesis)
+        if not result.identified_by_backdoor_adjustment:
+            detail = "; ".join(result.technical_notes) or (
+                "no valid baseline adjustment set blocks every backdoor path "
+                "(a classified confounder may be unobserved/latent)"
+            )
+            raise ValueError(
+                "Cannot approve the protocol/DAG gate: the declared causal DAG is not "
+                f"identified by backdoor adjustment ({detail}). Run `workflow dag-export` "
+                "to inspect the graph, or reclassify/resolve the blocking variable."
+            )
+
     def _write_hypothesis(self, run_id: str, protocol: dict) -> None:
         artifact = HypothesisAgent().run(protocol).to_dict()
         artifact_path = self.runs_dir / run_id / "hypothesis.json"
@@ -389,21 +480,42 @@ class WorkflowManager:
         readiness = json.loads(
             (run_dir / "execution_readiness.json").read_text(encoding="utf-8")
         )
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        specs = _load_concept_specs(protocol)
+        settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
         sql, manifest = AnalyticCohortBuilder().build(
             state.study_id,
             datasets or BigQueryDatasets.from_env(),
+            population=specs["population"],
+            treatment=specs["treatment"],
+            comparator=specs["comparator"],
+            outcome=specs["outcome"],
+            grace_period_hours=hypothesis["grace_period_hours"],
+            follow_up_days=hypothesis["follow_up_days"],
             execution_allowed=bool(readiness["analytic_dataset_build_allowed"]),
+            exposure_contrast=exposure_contrast,
+            **settings,
         )
+        validation = QueryValidationAgent().run(sql, purpose="person_level_dataset")
+        if not validation.passed:
+            raise RuntimeError(
+                f"Cohort SQL failed governance validation: {', '.join(validation.violations)}"
+            )
         (run_dir / "cohort.sql").write_text(sql, encoding="utf-8")
         (run_dir / "cohort_manifest.json").write_text(
             json.dumps(manifest.to_dict(), indent=2), encoding="utf-8"
         )
-        for artifact in ("cohort.sql", "cohort_manifest.json"):
+        (run_dir / "cohort_query_validation.json").write_text(
+            json.dumps(validation.to_dict(), indent=2), encoding="utf-8"
+        )
+        for artifact in ("cohort.sql", "cohort_manifest.json", "cohort_query_validation.json"):
             if artifact not in state.artifacts:
                 state.artifacts.append(artifact)
         state.record(
             "cohort_plan_generated",
-            f"cohort.sql; execution_allowed={manifest.execution_allowed}",
+            f"cohort.sql; execution_allowed={manifest.execution_allowed}; query_validation=passed",
         )
         self.save(state)
         return state
@@ -421,9 +533,25 @@ class WorkflowManager:
         self.run_execution_readiness(run_id)
         state = self.load(run_id)
         run_dir = self.runs_dir / run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        specs = _load_concept_specs(protocol)
+        settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
         context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
         response = client.causal_select(
-            AnalyticCohortBuilder().profile_sql(state.study_id, datasets),
+            AnalyticCohortBuilder().profile_sql(
+                state.study_id,
+                datasets,
+                population=specs["population"],
+                treatment=specs["treatment"],
+                comparator=specs["comparator"],
+                outcome=specs["outcome"],
+                grace_period_hours=hypothesis["grace_period_hours"],
+                follow_up_days=hypothesis["follow_up_days"],
+                exposure_contrast=exposure_contrast,
+                **settings,
+            ),
             "aggregate_feasibility",
             context,
         )
@@ -473,9 +601,25 @@ class WorkflowManager:
         self.run_execution_readiness(run_id)
         state = self.load(run_id)
         run_dir = self.runs_dir / run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        specs = _load_concept_specs(protocol)
+        settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
         context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
         response = client.causal_select(
-            AnalyticCohortBuilder().followup_audit_sql(state.study_id, datasets),
+            AnalyticCohortBuilder().followup_audit_sql(
+                state.study_id,
+                datasets,
+                population=specs["population"],
+                treatment=specs["treatment"],
+                comparator=specs["comparator"],
+                outcome=specs["outcome"],
+                grace_period_hours=hypothesis["grace_period_hours"],
+                follow_up_days=hypothesis["follow_up_days"],
+                exposure_contrast=exposure_contrast,
+                **settings,
+            ),
             "aggregate_feasibility",
             context,
         )
@@ -575,13 +719,14 @@ class WorkflowManager:
             counts = feasibility.get("counts", {})
             lines.extend([
                 "", "## Provisional feasibility counts", "",
-                "> These counts use a diagnosis-based sepsis phenotype and unvalidated source values. They are not a causal estimate.",
+                "> These counts use human-approved concept sets for this question's population/treatment/comparator/outcome. They are not a causal estimate.",
                 "",
                 f"- Eligible persons: **{counts.get('eligible_persons', '—')}**",
-                f"- Albumin plus crystalloids: **{counts.get('albumin_plus_crystalloid', '—')}**",
-                f"- Crystalloids only: **{counts.get('crystalloid_only', '—')}**",
+                f"- Treatment plus comparator: **{counts.get('treatment_and_comparator', '—')}**",
+                f"- Comparator only: **{counts.get('comparator_only', '—')}**",
                 f"- No recognized exposure: **{counts.get('neither_exposure', '—')}**",
-                f"- Deaths within 28 days, all groups: **{counts.get('deaths_28d', '—')}**",
+                f"- Outcome events, all groups: **{counts.get('outcome_events', '—')}**",
+                f"- Outcome events during grace period: **{counts.get('outcome_events_during_grace_period', '—')}**",
                 "", "### Feasibility warnings", "",
             ])
             lines.extend(f"- {warning}" for warning in feasibility.get("warnings", ()))
@@ -619,11 +764,11 @@ class WorkflowManager:
         if followup_audit:
             counts = followup_audit.get("counts", {})
             lines.extend([
-                "", "## Nominal 28-day follow-up audit", "",
+                "", "## Nominal follow-up audit", "",
                 "> This is an aggregate observability diagnostic. The censoring definition is not clinically approved.",
                 "",
-                f"- Observation period covers 28 days: **{counts.get('observation_period_covers_28d', '—')}**",
-                f"- Known death within 28 days: **{counts.get('known_death_within_28d', '—')}**",
+                f"- Observation period covers follow-up: **{counts.get('observation_period_covers_follow_up', '—')}**",
+                f"- Known death within follow-up: **{counts.get('known_death_within_follow_up', '—')}**",
                 f"- Nominal follow-up complete: **{counts.get('nominal_followup_complete', '—')}**",
                 f"- Nominal follow-up incomplete: **{counts.get('nominal_followup_incomplete', '—')}**",
                 f"- No observation period at index: **{counts.get('no_observation_period_at_index', '—')}**",
@@ -662,8 +807,20 @@ class WorkflowManager:
             raise RuntimeError("The provisional phenotype is restricted to exploratory runs")
         if state.gates["clinical_mapping"].status != "provisional":
             raise RuntimeError("clinical_mapping must be explicitly provisional")
-        result = gateway.albumin_sepsis_feasibility()
         run_dir = self.runs_dir / run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        specs = _load_concept_specs(protocol)
+        settings = _load_query_settings(protocol)
+        result = gateway.feasibility(
+            population=specs["population"],
+            treatment=specs["treatment"],
+            comparator=specs["comparator"],
+            outcome=specs["outcome"],
+            grace_period_hours=hypothesis["grace_period_hours"],
+            follow_up_days=hypothesis["follow_up_days"],
+            **settings,
+        )
         artifact_path = run_dir / "feasibility.json"
         temporary = artifact_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -692,12 +849,29 @@ class WorkflowManager:
         self.run_execution_readiness(run_id)
         state = self.load(run_id)
         run_dir = self.runs_dir / run_id
-        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
-        response = client.causal_select(
-            albumin_sepsis_feasibility_sql(datasets),
-            "aggregate_feasibility",
-            context,
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        specs = _load_concept_specs(protocol)
+        settings = _load_query_settings(protocol)
+        grace_period_hours = hypothesis["grace_period_hours"]
+        follow_up_days = hypothesis["follow_up_days"]
+        sql = feasibility_sql(
+            datasets,
+            population=specs["population"],
+            treatment=specs["treatment"],
+            comparator=specs["comparator"],
+            outcome=specs["outcome"],
+            grace_period_hours=grace_period_hours,
+            follow_up_days=follow_up_days,
+            **settings,
         )
+        validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")
+        if not validation.passed:
+            raise RuntimeError(
+                f"Feasibility SQL failed governance validation: {', '.join(validation.violations)}"
+            )
+        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
+        response = client.causal_select(sql, "aggregate_feasibility", context)
         rows = list(csv.DictReader(io.StringIO(response.text)))
         if len(rows) != 1:
             detail = response.text.replace("\n", " ")[:500]
@@ -710,18 +884,21 @@ class WorkflowManager:
             if key and value not in (None, "")
         }
         result = {
-            "status": "provisional_source_value_phenotype",
+            "status": "provisional_cohort_feasibility",
             "execution_transport": "omcp",
             "causal_effect_estimated": False,
-            "grace_period_hours": 24,
-            "follow_up_days": 28,
+            "grace_period_hours": grace_period_hours,
+            "follow_up_days": follow_up_days,
             "counts": counts,
             "mcp_metadata": response.metadata,
             "warnings": [
-                "Sepsis uses a diagnosis concept set, not the published Sepsis-3 phenotype.",
-                "Albumin and crystalloid exposure use unvalidated source-value regular expressions.",
-                "Sodium-chloride products may include non-resuscitation administrations.",
+                "Concept sets reflect current human-approved mappings only; unmapped "
+                "roles will fail with a clear error rather than silently degrading.",
                 "Counts are for pipeline feasibility and must not be interpreted causally.",
+                "outcome_events_during_grace_period counts events that occurred inside "
+                "the exposure-ascertainment window itself, before treatment status was "
+                "determined; a large share of outcome_events falling here warrants review "
+                "before trusting the arm each such person was assigned to.",
             ],
         }
         artifact_path = run_dir / "feasibility.json"
