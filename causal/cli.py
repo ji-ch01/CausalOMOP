@@ -9,9 +9,10 @@ import sys
 from causal.bigquery import BigQueryOMOPGateway, make_google_client
 from causal.config import BigQueryDatasets
 from causal.agents import HypothesisAgent, UserQuestionHypothesisService
-from causal.agents.dag_identification import assess_identification
+from causal.agents.dag_identification import review_dag
 from causal.agents.hypothesis import DAG_VARIABLE_ROLES
 from causal.agents.user_question import LLMRawOutput
+from causal.knowledge_graph import OptimusKGClient
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
 from causal.mcp_client import OMCPClient
@@ -59,6 +60,14 @@ def main() -> int:
     workflow_question.add_argument(
         "--skip-literature", action="store_true",
         help="skip PubMed/OpenAlex retrieval and the literature-grounded DAG draft",
+    )
+    workflow_question.add_argument(
+        "--skip-knowledge-graph", action="store_true",
+        help="skip OptimusKG retrieval when proposing the candidate DAG",
+    )
+    workflow_question.add_argument(
+        "--skip-critique", action="store_true",
+        help="skip the independent critique/revision round after the DAG draft",
     )
     workflow_status = workflow_sub.add_parser("status")
     workflow_status.add_argument("run_id")
@@ -146,12 +155,18 @@ def main() -> int:
                 None if args.skip_literature
                 else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
             )
+            knowledge_graph = (
+                None if args.skip_knowledge_graph or not OptimusKGClient.is_available()
+                else OptimusKGClient()
+            )
             generated = UserQuestionHypothesisService().generate(
                 args.question,
                 resolved_llm.call,
                 data_source=datasets.fq_dataset("omop"),
                 literature=literature,
+                knowledge_graph=knowledge_graph,
                 on_llm_output=_print_raw_llm_output,
+                enable_critique=not args.skip_critique,
             )
             state = manager.start_generated(
                 generated, args.mode, f"{resolved_llm.provider}:{resolved_llm.model}"
@@ -216,7 +231,8 @@ def main() -> int:
             protocol_path = manager.runs_dir / args.run_id / "protocol.json"
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             hypothesis = HypothesisAgent().run(protocol)
-            result = assess_identification(hypothesis)
+            review = review_dag(hypothesis)
+            result = review.identification
             adjustment_set = (
                 result.minimum_adjustment_sets[0]
                 if args.highlight_adjustment_set and result.minimum_adjustment_sets
@@ -228,7 +244,22 @@ def main() -> int:
                 f"confounder_count={result.confounder_count}",
                 file=sys.stderr,
             )
-            for warning in result.warnings:
+            print(
+                f"// adjustment_sets={review.adjustment.set_count} "
+                f"set_size={review.adjustment.set_size} "
+                f"core={list(review.adjustment.core_variable_labels)} "
+                f"alternatives={list(review.adjustment.alternative_variable_labels)} "
+                f"unused_confounders={list(review.adjustment.unused_confounder_labels)}",
+                file=sys.stderr,
+            )
+            print(
+                f"// evidence: literature_only={review.evidence.literature_only} "
+                f"kg_only={review.evidence.kg_only} corroborated={review.evidence.corroborated} "
+                f"uncited={review.evidence.uncited} "
+                f"cited_fraction={review.evidence.cited_fraction:.2f}",
+                file=sys.stderr,
+            )
+            for warning in result.technical_notes:
                 print(f"// warning: {warning}", file=sys.stderr)
             return 0
         else:
