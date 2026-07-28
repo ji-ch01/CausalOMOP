@@ -52,6 +52,45 @@ _GATE_COLORS = {
     "pending": "#757575",
 }
 
+_GATE_INFO: dict[str, dict[str, str]] = {
+    "protocol": {
+        "title": "Protocol & causal DAG",
+        "phase": "protocol_review",
+        "description": (
+            "Approves the normalized causal question (population / treatment / comparator / "
+            "outcome) and the causal DAG proposed for it — the assumed confounders, mediators, "
+            "and colliders. Must be approved (major confounders resolved, DAG identified by "
+            "backdoor adjustment) before proceeding."
+        ),
+    },
+    "clinical_mapping": {
+        "title": "Clinical concept mapping",
+        "phase": "concept_mapping",
+        "description": (
+            "Approves the OMOP concept sets (ICD/RxNorm/LOINC codes, etc.) used to operationalize "
+            "population / treatment / comparator / outcome for querying. In **exploratory** mode, "
+            "a `provisional` decision is enough to proceed with an unvalidated first-pass "
+            "phenotype; **final** mode requires full `approved`."
+        ),
+    },
+    "analysis_plan": {
+        "title": "Analysis plan",
+        "phase": "analysis_plan",
+        "description": (
+            "Approves the statistical design (data source, phenotypes, planned feasibility "
+            "checks) before the pipeline is allowed to build the analytic cohort and execute."
+        ),
+    },
+    "results": {
+        "title": "Results review",
+        "phase": "results_review",
+        "description": (
+            "Approves the final causal effect estimate and diagnostics before the demo report "
+            "is finalized."
+        ),
+    },
+}
+
 _NODE_COLORS = {
     "exposure": "#4C78A8",
     "outcome": "#E45756",
@@ -101,6 +140,20 @@ def _list_runs() -> list[str]:
     )
 
 
+def _reviewer_default() -> str:
+    """Sidebar-entered reviewer name, reused so a reviewer stepping through
+    several gates/covariates in one sitting doesn't retype it each time."""
+    return st.session_state.get("reviewer_name", "")
+
+
+def _run_option_label(run_id: str) -> str:
+    question = _source_question(RUNS_DIR / run_id)
+    if not question:
+        return run_id
+    preview = question if len(question) <= 70 else f"{question[:67]}..."
+    return f"{run_id}  —  {preview}"
+
+
 def _hypothesis_artifact_from_dict(data: dict[str, Any]) -> HypothesisArtifact:
     dag_variables = tuple(
         DAGVariable(
@@ -117,6 +170,7 @@ def _hypothesis_artifact_from_dict(data: dict[str, Any]) -> HypothesisArtifact:
             pmid=v.get("pmid", ""),
             observed=v.get("observed", True),
             certainty=v.get("certainty", "established"),
+            kg_evidence_id=v.get("kg_evidence_id", ""),
         )
         for v in data.get("candidate_dag", ())
     )
@@ -127,6 +181,7 @@ def _hypothesis_artifact_from_dict(data: dict[str, Any]) -> HypothesisArtifact:
             rationale=r["rationale"],
             pmid=r.get("pmid", ""),
             certainty=r.get("certainty", "established"),
+            kg_evidence_id=r.get("kg_evidence_id", ""),
         )
         for r in data.get("covariate_relations", ())
     )
@@ -188,6 +243,9 @@ def _dag_to_dot(dag: CausalDAG) -> str:
     return "\n".join(lines)
 
 
+_PHASE_TO_GATE = {info["phase"]: gate_name for gate_name, info in _GATE_INFO.items()}
+
+
 def _render_phase_tracker(current_phase: str) -> None:
     current_index = PHASES.index(current_phase)
     columns = st.columns(len(PHASES))
@@ -198,23 +256,54 @@ def _render_phase_tracker(current_phase: str) -> None:
             marker = "▶️"
         else:
             marker = "⬜"
-        column.markdown(f"{marker}  \n**{phase}**" if index == current_index else f"{marker}  \n{phase}")
+        label = f"{phase} 🔒" if phase in _PHASE_TO_GATE else phase
+        column.markdown(f"{marker}  \n**{label}**" if index == current_index else f"{marker}  \n{label}")
+    st.caption("🔒 = leaving this phase requires an approval gate decision (see the Gates & Validation tab).")
 
 
-def _render_gates_tab(manager: WorkflowManager, state: RunState) -> None:
+def _render_gates_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
     st.subheader("Approval gates")
+    st.caption(
+        "The pipeline has 4 human sign-off points, each tied to one phase of the run (🔒 in the "
+        "tracker above). A phase can't advance to the next until its gate is `approved` — or, for "
+        "clinical mapping in exploratory mode, `provisional`."
+    )
+
+    hypothesis = _read_json(run_dir / "hypothesis.json")
+    if hypothesis is not None and state.gates["protocol"].status != "approved":
+        try:
+            artifact = _hypothesis_artifact_from_dict(hypothesis)
+            identification = review_dag(artifact).identification
+            if identification.identified_by_backdoor_adjustment:
+                st.success(
+                    "Causal DAG is identified by backdoor adjustment — the protocol gate "
+                    "is clear to approve on that front. See the Hypothesis & DAG tab for details."
+                )
+            else:
+                st.error(
+                    "Causal DAG is **not** identified by backdoor adjustment — approving the "
+                    "protocol gate will be rejected until this is resolved. See the Hypothesis "
+                    "& DAG tab for the blocking notes."
+                )
+        except (KeyError, ValueError):
+            pass
+
     for gate_name, gate in state.gates.items():
+        info = _GATE_INFO.get(gate_name, {"title": gate_name, "phase": "—", "description": ""})
         with st.container(border=True):
             header_col, badge_col = st.columns([3, 1])
-            header_col.markdown(f"**{gate_name}**")
+            header_col.markdown(f"**{info['title']}** &nbsp; `{gate_name}`", unsafe_allow_html=True)
             badge_col.markdown(_badge(gate.status), unsafe_allow_html=True)
+            st.caption(f"Gates leaving phase `{info['phase']}`. {info['description']}")
             if gate.reviewer:
                 st.caption(
                     f"Last decision by {html.escape(gate.reviewer)} at {gate.decided_at}"
                     + (f" — {html.escape(gate.comment)}" if gate.comment else "")
                 )
             with st.form(key=f"gate_form_{gate_name}"):
-                reviewer = st.text_input("Reviewer", key=f"reviewer_{gate_name}")
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"reviewer_{gate_name}"
+                )
                 comment = st.text_area("Comment (optional)", key=f"comment_{gate_name}")
                 status = st.selectbox(
                     "Decision",
@@ -278,6 +367,8 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         return
     identification = review.identification
     clinical = review.clinical
+    evidence = review.evidence
+    adjustment = review.adjustment
 
     st.caption(f"Active comparator represented on the DAG: **{artifact.comparator or '—'}**")
 
@@ -293,6 +384,32 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         for adjustment_set in identification.minimum_adjustment_sets:
             labels = [identification.dag.node_map[node_id].label for node_id in adjustment_set]
             st.markdown(f"- {', '.join(labels) if labels else '(empty set)'}")
+        if adjustment.core_variable_labels or adjustment.alternative_variable_labels:
+            st.caption(
+                "**Core** (in every minimum set — required, not optional): "
+                f"{', '.join(adjustment.core_variable_labels) or '—'}. "
+                "**Alternative** (in some but not all — interchangeable for backdoor-blocking, "
+                "may still differ clinically): "
+                f"{', '.join(adjustment.alternative_variable_labels) or '—'}."
+            )
+        if adjustment.unused_confounder_labels:
+            st.warning(
+                "Declared confounder(s) that never appear in any minimum adjustment set — "
+                "either redundant given the rest of the DAG, or worth double-checking the role "
+                "assignment: " + ", ".join(adjustment.unused_confounder_labels)
+            )
+
+    if evidence.total_items:
+        evidence_metric_cols = st.columns(4)
+        evidence_metric_cols[0].metric("Evidence: literature only", evidence.literature_only)
+        evidence_metric_cols[1].metric("Evidence: knowledge graph only", evidence.kg_only)
+        evidence_metric_cols[2].metric("Evidence: corroborated (both)", evidence.corroborated)
+        evidence_metric_cols[3].metric("Evidence: uncited", evidence.uncited)
+        st.caption(
+            f"{evidence.cited_fraction:.0%} of DAG items ({evidence.total_items} total) carry at least "
+            f"one citation; {evidence.corroborated_fraction:.0%} are corroborated by two independent "
+            "sources (literature and knowledge graph)."
+        )
 
     if identification.technical_notes:
         st.info(
@@ -310,6 +427,41 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
 
     st.graphviz_chart(_dag_to_dot(identification.dag))
 
+    evidence_rows = [
+        {
+            "Item": variable.label,
+            "Role": variable.role.replace("_", " "),
+            "Evidence id": variable.pmid or "—",
+            "KG-corroborated": "✓" if variable.kg_evidence_id else "",
+        }
+        for variable in artifact.candidate_dag
+    ] + [
+        {
+            "Item": f"{relation.source} → {relation.target}",
+            "Role": "covariate relation",
+            "Evidence id": relation.pmid or "—",
+            "KG-corroborated": "✓" if relation.kg_evidence_id else "",
+        }
+        for relation in artifact.covariate_relations
+    ]
+    if evidence_rows:
+        st.markdown("**Evidence sources**")
+        st.caption(
+            "Evidence id is a PubMed/OpenAlex citation or a knowledge-graph relation id. "
+            "KG-corroborated marks items where the knowledge graph independently confirmed "
+            "a literature-cited relation."
+        )
+        st.dataframe(evidence_rows, width="stretch")
+
+    dag_unresolved = (_read_json(run_dir / "protocol.json") or {}).get("candidate_dag_unresolved") or []
+    if dag_unresolved:
+        st.markdown("**Flagged unresolved by the drafting model**")
+        st.caption(
+            "The DAG-drafting step itself could not confidently classify these — distinct "
+            "from the human covariate review below."
+        )
+        st.json(dag_unresolved)
+
     if artifact.unresolved_covariates:
         st.divider()
         st.subheader("Unresolved covariate review")
@@ -323,7 +475,9 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             is_major = label in major_set
             with st.container(border=True), st.form(key=f"covariate_form_{label}"):
                 st.markdown(f"**{label}**" + (" 🔴 major confounder" if is_major else ""))
-                reviewer = st.text_input("Reviewer", key=f"covariate_reviewer_{label}")
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"covariate_reviewer_{label}"
+                )
                 decision_choice = st.selectbox(
                     "Decision",
                     ("reject",) + DAG_VARIABLE_ROLES,
@@ -362,13 +516,98 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                 when = f" ({rejection.decided_at})" if rejection.decided_at else ""
                 st.markdown(f"- **{rejection.label}** rejected by {rejection.reviewer}{detail}{when}")
 
+    if artifact.design_constraints:
+        st.divider()
+        st.subheader("Generation notes")
+        st.caption(
+            "Auditable notes recorded while this draft was generated, including whether an "
+            "independent critique step reviewed and revised the DAG."
+        )
+        for note in artifact.design_constraints:
+            st.markdown(f"- {note}")
 
-def _render_analysis_plan_tab(run_dir: Path) -> None:
-    plan = _read_json(run_dir / "analysis_plan.json")
-    if plan is None:
-        st.info("No analysis_plan.json for this run yet.")
+    llm_outputs = _read_json(run_dir / "llm_outputs.json")
+    if llm_outputs and llm_outputs.get("outputs"):
+        st.divider()
+        with st.expander(f"Generation audit trail ({len(llm_outputs['outputs'])} LLM call(s))"):
+            st.caption(
+                f"Model `{llm_outputs.get('model', 'unknown')}`, prompt version "
+                f"`{llm_outputs.get('prompt_version', '—')}`. Raw, unedited LLM responses."
+            )
+            for index, output in enumerate(llm_outputs["outputs"], start=1):
+                st.markdown(f"**{index}. `{output.get('stage', 'unknown')}`**")
+                st.code(output.get("raw_text", ""), language="json")
+
+
+def _render_concept_mapping_section(run_dir: Path) -> None:
+    """Concept mapping (`concept_sets` / `query_concept_sets`) lives in
+    `protocol.json`, not `analysis_plan.json` — so it's shown even before the
+    Data Science Agent has run. Today this data is only ever populated via
+    the `causalomop concepts <term>` CLI search followed by manual
+    protocol.json edits; there is no in-app concept search yet.
+    """
+    protocol = _read_json(run_dir / "protocol.json")
+    concept_sets = (protocol or {}).get("concept_sets") or {}
+    query_concept_sets = (protocol or {}).get("query_concept_sets") or {}
+    if not concept_sets and not query_concept_sets:
         return
 
+    st.subheader("Concept mapping")
+    st.caption(
+        "OMOP concept sets used to operationalize this question. Mapped outside this app today "
+        "(`causalomop concepts <term>` to search the vocabulary, then a manual protocol.json "
+        "edit) — this is a read-only view of what has been mapped so far."
+    )
+
+    if concept_sets:
+        st.markdown("**Phenotype review concept sets** (`concept_sets`, reviewed via the Data Science Agent)")
+        st.dataframe(
+            [
+                {
+                    "name": name,
+                    "role": definition.get("role", "—"),
+                    "domain": definition.get("domain") or "—",
+                    "status": definition.get("status", "—"),
+                    "concept_ids": ", ".join(str(c) for c in definition.get("concept_ids", ())) or "none yet",
+                    "label": definition.get("label", ""),
+                }
+                for name, definition in concept_sets.items()
+                if isinstance(definition, dict)
+            ],
+            width="stretch",
+        )
+
+    if query_concept_sets:
+        st.markdown("**Query-generation concept sets** (`query_concept_sets`, used to build cohort/feasibility SQL)")
+        st.dataframe(
+            [
+                {
+                    "role": role,
+                    "domain": definition.get("domain") or "—",
+                    "concept_ids": ", ".join(str(c) for c in definition.get("concept_ids", ())) or "none yet",
+                }
+                for role, definition in query_concept_sets.items()
+                if isinstance(definition, dict)
+            ],
+            width="stretch",
+        )
+        if any(not d.get("concept_ids") for d in query_concept_sets.values() if isinstance(d, dict)):
+            st.warning(
+                "One or more roles have no concept_ids yet — cohort/feasibility SQL generation "
+                "will fail until these are filled in."
+            )
+
+
+def _render_analysis_plan_tab(run_dir: Path) -> None:
+    _render_concept_mapping_section(run_dir)
+
+    plan = _read_json(run_dir / "analysis_plan.json")
+    if plan is None:
+        st.info("No analysis_plan.json for this run yet (run the Data Science Agent to generate it).")
+        return
+
+    st.divider()
+    st.subheader("Analysis plan")
     col1, col2 = st.columns(2)
     col1.markdown(f"**Data source**  \n`{plan.get('data_source', '—')}`")
     col1.markdown(f"**Design**  \n`{plan.get('design', '—')}`")
@@ -383,13 +622,33 @@ def _render_analysis_plan_tab(run_dir: Path) -> None:
                 {
                     "name": p.get("name"),
                     "role": p.get("role"),
+                    "domain": p.get("domain"),
                     "mode": p.get("mode"),
                     "status": p.get("status"),
+                    "concept_ids": ", ".join(str(c) for c in p.get("concept_ids", ())) or "—",
+                    "source_value_rule": p.get("source_value_rule") or "—",
+                    "omop_tables": ", ".join(p.get("omop_tables", ())),
                 }
                 for p in phenotypes
             ],
             width="stretch",
         )
+        for p in phenotypes:
+            candidates = p.get("concept_candidates") or []
+            if candidates:
+                with st.expander(f"Candidate OMOP concepts for '{p.get('name')}' ({len(candidates)})"):
+                    st.dataframe(
+                        [
+                            {
+                                "concept_id": c.get("concept_id"),
+                                "concept_name": c.get("concept_name"),
+                                "vocabulary_id": c.get("vocabulary_id"),
+                                "domain_id": c.get("domain_id"),
+                            }
+                            for c in candidates
+                        ],
+                        width="stretch",
+                    )
 
     checks = plan.get("feasibility_checks") or []
     if checks:
@@ -410,7 +669,10 @@ def _render_feasibility_tab(run_dir: Path) -> None:
     if feasibility:
         any_rendered = True
         st.subheader("Provisional feasibility counts")
-        st.caption("Diagnosis-based phenotype, unvalidated source values — not a causal estimate.")
+        st.caption(
+            "Uses human-approved concept sets for this question's population/treatment/"
+            "comparator/outcome — not a causal estimate."
+        )
         st.json(feasibility.get("counts", {}))
         for warning in feasibility.get("warnings", ()):
             st.warning(warning)
@@ -424,6 +686,24 @@ def _render_feasibility_tab(run_dir: Path) -> None:
         cols[2].metric("Delivery to LLM allowed", str(cohort_manifest.get("delivery_to_llm_allowed", False)))
         for issue in cohort_manifest.get("unresolved_issues", ()):
             st.markdown(f"- `{issue}`")
+
+    query_validation = _read_json(run_dir / "cohort_query_validation.json")
+    if query_validation:
+        any_rendered = True
+        st.subheader("Cohort query governance check")
+        st.caption(
+            "Deterministic checks only — no unbound parameters, no `SELECT *`, only expected "
+            "OMOP tables. Does not judge clinical correctness of the query."
+        )
+        cols = st.columns(2)
+        cols[0].metric("Status", query_validation.get("status", "unknown"))
+        estimated_bytes = query_validation.get("estimated_bytes_processed")
+        cols[1].metric(
+            "Estimated bytes scanned",
+            f"{estimated_bytes:,}" if isinstance(estimated_bytes, int) else "not dry-run",
+        )
+        for violation in query_validation.get("violations", ()):
+            st.error(f"`{violation}`")
 
     if cohort_profile:
         any_rendered = True
@@ -563,10 +843,23 @@ def main() -> None:
         st.session_state["run_selector"] = pending_selection
 
     with st.sidebar:
+        st.text_input(
+            "Your name",
+            key="reviewer_name",
+            help="Pre-fills the reviewer field on every gate and covariate decision below.",
+        )
+        st.divider()
         st.header("Runs")
         run_ids = _list_runs()
         run_id = (
-            st.selectbox("Select a run", run_ids, key="run_selector") if run_ids else None
+            st.selectbox(
+                "Select a run",
+                run_ids,
+                key="run_selector",
+                format_func=_run_option_label,
+            )
+            if run_ids
+            else None
         )
         st.divider()
         _render_new_question_section(manager)
@@ -591,7 +884,7 @@ def main() -> None:
         ["Gates & Validation", "Hypothesis & DAG", "Analysis Plan", "Feasibility & Cohort", "Demo Report & History"]
     )
     with tabs[0]:
-        _render_gates_tab(manager, state)
+        _render_gates_tab(manager, state, run_dir)
     with tabs[1]:
         _render_hypothesis_tab(manager, run_id, run_dir)
     with tabs[2]:
