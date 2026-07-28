@@ -100,6 +100,14 @@ informatics literature rather than invented from scratch:
   This is the first worked example used to validate the pipeline end-to-end,
   not a constraint on what the pipeline can study — see
   [MIMIC-IV OMOP Setup](#mimic-iv-omop-setup).
+- **Second candidate validation study** — Wang, X., Zhang, K., Wu, Y., Zhang,
+  Z., Li, Y., Han, R., & Liang, F. (2026). Target trial emulation of early
+  acetaminophen use and mortality in critically ill stroke patients.
+  *Scientific Reports*.
+  [doi:10.1038/s41598-026-46381-5](https://doi.org/10.1038/s41598-026-46381-5).
+  Also a target-trial emulation on MIMIC-IV ICU data; planned as a second
+  reference to check the causal-question and identification process and
+  results against a published study.
 
 ## Implementation Status
 
