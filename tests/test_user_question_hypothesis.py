@@ -3,13 +3,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.user_question import (
     UserQuestionHypothesisService,
     _covariate_search_term,
+    _evidence_level_map,
     _kg_reinforcement,
 )
 from causal.knowledge_graph.optimuskg_client import KGEdge
-from causal.literature.orchestrator import LiteratureOrchestrator
+from causal.literature.orchestrator import LiteratureArticle, LiteratureOrchestrator
 from causal.literature.pubmed import PubMedClient, PubMedConfig
 from causal.orchestrator import WorkflowManager
 
@@ -258,7 +260,7 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         self.assertEqual(result.hypothesis.candidate_dag[0].pmid, "111")
         self.assertEqual(result.hypothesis.candidate_dag[0].label, "Baseline severity")
         self.assertEqual([item.stage for item in result.llm_outputs], [
-            "target_trial_draft", "literature_dag_draft", "literature_dag_critique"
+            "target_trial_draft", "literature_dag_draft", "literature_dag_critique_round1"
         ])
         self.assertEqual(
             result.protocol["literature_evidence"]["retrieved_citations"],
@@ -560,7 +562,7 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         )
         self.assertEqual(len(calls), 3)
         self.assertEqual([item.stage for item in result.llm_outputs], [
-            "target_trial_draft", "literature_dag_draft", "literature_dag_critique"
+            "target_trial_draft", "literature_dag_draft", "literature_dag_critique_round1"
         ])
         self.assertEqual(len(result.protocol["candidate_dag"]), 1)
         self.assertEqual(result.protocol["candidate_dag"][0]["label"], "Baseline severity")
@@ -569,6 +571,9 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         )
 
     def test_critique_requests_revision_and_generator_revises(self):
+        """Round 1 requests a revision; round 2's re-critique approves it --
+        exercises the full bounded loop's happy path, not just a single pass.
+        """
         calls = []
 
         def llm(prompt: str) -> str:
@@ -595,16 +600,94 @@ class UserQuestionHypothesisTests(unittest.TestCase):
                         {"target": "Baseline severity", "issue": "the cited abstract does not support this direction"}
                     ],
                 })
-            self.assertIn("Baseline severity", prompt)
-            self.assertIn("the cited abstract does not support this direction", prompt)
+            if len(calls) == 4:
+                self.assertIn("Baseline severity", prompt)
+                self.assertIn("the cited abstract does not support this direction", prompt)
+                return json.dumps({
+                    "candidate_dag": [
+                        {
+                            "label": "Baseline severity",
+                            "role": "outcome_cause_only",
+                            "pmid": "111",
+                            "temporal_classification": "pre_treatment",
+                            "rationale": "Revised: the abstract only supports an outcome effect, not treatment choice.",
+                        }
+                    ],
+                    "covariate_relations": [],
+                })
+            return json.dumps({"verdict": "approve", "concerns": []})
+
+        result = self.service.generate(
+            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH)
+        )
+        self.assertEqual(len(calls), 5)
+        self.assertEqual([item.stage for item in result.llm_outputs], [
+            "target_trial_draft", "literature_dag_draft",
+            "literature_dag_critique_round1", "literature_dag_revision_round1",
+            "literature_dag_critique_round2",
+        ])
+        self.assertEqual(result.protocol["candidate_dag"][0]["role"], "outcome_cause_only")
+        self.assertTrue(
+            any("approved on re-critique" in note for note in result.protocol["design_constraints"])
+        )
+
+    def test_second_critique_round_catches_issue_introduced_by_first_revision(self):
+        """The exact gap this loop closes: round 1's revision introduces a new
+        problem (here, a `certainty` a second abstract contests) that only a
+        second critique round can catch. With the default 2-round bound, the
+        loop then exhausts using round 2's revision.
+        """
+        calls = []
+
+        def llm(prompt: str) -> str:
+            calls.append(prompt)
+            if len(calls) == 1:
+                return json.dumps(valid_response())
+            if len(calls) == 2:
+                return json.dumps({
+                    "candidate_dag": [
+                        {
+                            "label": "Baseline severity",
+                            "role": "confounder",
+                            "pmid": "111",
+                            "temporal_classification": "pre_treatment",
+                            "rationale": "Baseline severity is linked to treatment choice and to mortality.",
+                        }
+                    ],
+                    "covariate_relations": [],
+                })
+            if len(calls) == 3:
+                return json.dumps({
+                    "verdict": "revise",
+                    "concerns": [{"target": "Baseline severity", "issue": "direction not supported"}],
+                })
+            if len(calls) == 4:
+                return json.dumps({
+                    "candidate_dag": [
+                        {
+                            "label": "Baseline severity",
+                            "role": "confounder",
+                            "pmid": "111",
+                            "temporal_classification": "pre_treatment",
+                            "rationale": "Revised: reasserted as established.",
+                        }
+                    ],
+                    "covariate_relations": [],
+                })
+            if len(calls) == 5:
+                return json.dumps({
+                    "verdict": "revise",
+                    "concerns": [{"target": "Baseline severity", "issue": "a second abstract contests this"}],
+                })
             return json.dumps({
                 "candidate_dag": [
                     {
                         "label": "Baseline severity",
-                        "role": "outcome_cause_only",
+                        "role": "confounder",
                         "pmid": "111",
                         "temporal_classification": "pre_treatment",
-                        "rationale": "Revised: the abstract only supports an outcome effect, not treatment choice.",
+                        "rationale": "Final revision: flagged as contested per the second abstract.",
+                        "certainty": "contested",
                     }
                 ],
                 "covariate_relations": [],
@@ -613,14 +696,124 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         result = self.service.generate(
             QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH)
         )
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 6)
         self.assertEqual([item.stage for item in result.llm_outputs], [
-            "target_trial_draft", "literature_dag_draft", "literature_dag_critique", "literature_dag_revision"
+            "target_trial_draft", "literature_dag_draft",
+            "literature_dag_critique_round1", "literature_dag_revision_round1",
+            "literature_dag_critique_round2", "literature_dag_revision_round2",
         ])
+        self.assertEqual(result.protocol["candidate_dag"][0]["certainty"], "contested")
+        self.assertTrue(
+            any(
+                "reached the maximum number of critique rounds" in note
+                for note in result.protocol["design_constraints"]
+            )
+        )
+
+    def test_malformed_second_round_critique_falls_back_to_first_revision(self):
+        calls = []
+
+        def llm(prompt: str) -> str:
+            calls.append(prompt)
+            if len(calls) == 1:
+                return json.dumps(valid_response())
+            if len(calls) == 2:
+                return json.dumps({
+                    "candidate_dag": [
+                        {
+                            "label": "Baseline severity",
+                            "role": "confounder",
+                            "pmid": "111",
+                            "temporal_classification": "pre_treatment",
+                            "rationale": "Baseline severity is linked to treatment choice and to mortality.",
+                        }
+                    ],
+                    "covariate_relations": [],
+                })
+            if len(calls) == 3:
+                return json.dumps({
+                    "verdict": "revise",
+                    "concerns": [{"target": "Baseline severity", "issue": "check the certainty"}],
+                })
+            if len(calls) == 4:
+                return json.dumps({
+                    "candidate_dag": [
+                        {
+                            "label": "Baseline severity",
+                            "role": "confounder",
+                            "pmid": "111",
+                            "temporal_classification": "pre_treatment",
+                            "rationale": "Revised: certainty clarified.",
+                            "certainty": "plausible",
+                        }
+                    ],
+                    "covariate_relations": [],
+                })
+            return "not valid JSON"
+
+        result = self.service.generate(
+            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH)
+        )
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(result.protocol["candidate_dag"][0]["certainty"], "plausible")
+        self.assertTrue(
+            any("critique round 2 failed" in note for note in result.protocol["design_constraints"])
+        )
+
+    def test_loop_exhausted_without_final_approval_uses_last_revision(self):
+        calls = []
+
+        def llm(prompt: str) -> str:
+            calls.append(prompt)
+            if len(calls) == 1:
+                return json.dumps(valid_response())
+            if len(calls) == 2:
+                return json.dumps({
+                    "candidate_dag": [
+                        {
+                            "label": "Baseline severity",
+                            "role": "confounder",
+                            "pmid": "111",
+                            "temporal_classification": "pre_treatment",
+                            "rationale": "Baseline severity is linked to treatment choice and to mortality.",
+                        }
+                    ],
+                    "covariate_relations": [],
+                })
+            if len(calls) == 3:
+                return json.dumps({
+                    "verdict": "revise",
+                    "concerns": [{"target": "Baseline severity", "issue": "check the direction"}],
+                })
+            return json.dumps({
+                "candidate_dag": [
+                    {
+                        "label": "Baseline severity",
+                        "role": "outcome_cause_only",
+                        "pmid": "111",
+                        "temporal_classification": "pre_treatment",
+                        "rationale": "Revised once; no further critique round is budgeted.",
+                    }
+                ],
+                "covariate_relations": [],
+            })
+
+        result = self.service.generate(
+            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH),
+            max_critique_rounds=1,
+        )
+        self.assertEqual(len(calls), 4)
         self.assertEqual(result.protocol["candidate_dag"][0]["role"], "outcome_cause_only")
         self.assertTrue(
-            any("revised after critique" in note for note in result.protocol["design_constraints"])
+            any(
+                "reached the maximum number of critique rounds" in note
+                for note in result.protocol["design_constraints"]
+            )
         )
+
+    def test_max_critique_rounds_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            self.service.generate(QUESTION, lambda prompt: "", max_critique_rounds=0)
 
     def test_malformed_critique_response_degrades_to_pre_critique_dag(self):
         calls = []
@@ -651,7 +844,7 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         self.assertEqual(len(result.protocol["candidate_dag"]), 1)
         self.assertEqual(result.protocol["candidate_dag"][0]["label"], "Baseline severity")
         self.assertTrue(
-            any("critique step failed" in note for note in result.protocol["design_constraints"])
+            any("critique round 1 failed" in note for note in result.protocol["design_constraints"])
         )
 
     def test_malformed_revision_response_degrades_to_pre_revision_dag(self):
@@ -730,7 +923,8 @@ class UserQuestionHypothesisTests(unittest.TestCase):
             })
 
         result = self.service.generate(
-            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH)
+            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH),
+            max_critique_rounds=1,
         )
         self.assertEqual(len(calls), 4)
         self.assertEqual(result.protocol["candidate_dag"], [])
@@ -871,6 +1065,135 @@ class UserQuestionHypothesisTests(unittest.TestCase):
             any("flagged unresolved" in note for note in result.protocol["design_constraints"])
         )
 
+    def test_tournament_size_must_be_within_bounds(self):
+        with self.assertRaises(ValueError):
+            self.service.generate(QUESTION, lambda prompt: "", tournament_size=0)
+        with self.assertRaises(ValueError):
+            self.service.generate(QUESTION, lambda prompt: "", tournament_size=MAX_TOURNAMENT_SIZE + 1)
+
+    def test_tournament_mode_merges_two_disjoint_candidates(self):
+        calls = []
+
+        def candidate_draft(label: str) -> str:
+            return json.dumps({
+                "candidate_dag": [
+                    {
+                        "label": label,
+                        "role": "confounder",
+                        "pmid": "111",
+                        "temporal_classification": "pre_treatment",
+                        "rationale": f"{label} is linked to treatment choice and to mortality.",
+                    }
+                ],
+                "covariate_relations": [],
+            })
+
+        def llm(prompt: str) -> str:
+            calls.append(prompt)
+            n = len(calls)
+            if n == 1:
+                return json.dumps(valid_response())
+            if n == 2:
+                return candidate_draft("Baseline severity")
+            if n == 4:
+                return candidate_draft("Comorbidity burden")
+            return json.dumps({"verdict": "approve", "concerns": []})
+
+        result = self.service.generate(
+            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH),
+            tournament_size=2,
+        )
+        self.assertEqual(len(calls), 6)
+        labels = {variable["label"] for variable in result.protocol["candidate_dag"]}
+        self.assertEqual(labels, {"Baseline severity", "Comorbidity burden"})
+        self.assertEqual([item.stage for item in result.llm_outputs], [
+            "target_trial_draft",
+            "literature_dag_draft_candidate1",
+            "literature_dag_critique_candidate1_round1",
+            "literature_dag_draft_candidate2",
+            "literature_dag_critique_candidate2_round1",
+            "literature_dag_critique_merged_round1",
+        ])
+        tournament_meta = result.protocol["dag_tournament"]
+        self.assertEqual(tournament_meta["candidate_count"], 2)
+        self.assertEqual(tournament_meta["survivor_count"], 2)
+        self.assertEqual(tournament_meta["dropped_duplicate_count"], 0)
+        self.assertEqual(tournament_meta["conflicts"], [])
+        self.assertTrue(any("tournament mode" in note for note in result.protocol["design_constraints"]))
+
+    def test_tournament_mode_dedups_identical_candidates(self):
+        calls = []
+        dag_json = json.dumps({
+            "candidate_dag": [
+                {
+                    "label": "Baseline severity",
+                    "role": "confounder",
+                    "pmid": "111",
+                    "temporal_classification": "pre_treatment",
+                    "rationale": "Baseline severity is linked to treatment choice and to mortality.",
+                }
+            ],
+            "covariate_relations": [],
+        })
+
+        def llm(prompt: str) -> str:
+            calls.append(prompt)
+            n = len(calls)
+            if n == 1:
+                return json.dumps(valid_response())
+            if n in (2, 4):
+                return dag_json
+            return json.dumps({"verdict": "approve", "concerns": []})
+
+        result = self.service.generate(
+            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH),
+            tournament_size=2,
+        )
+        self.assertEqual(len(result.protocol["candidate_dag"]), 1)
+        tournament_meta = result.protocol["dag_tournament"]
+        self.assertEqual(tournament_meta["survivor_count"], 1)
+        self.assertEqual(tournament_meta["dropped_duplicate_count"], 1)
+
+    def test_tournament_mode_flags_a_disagreeing_role_as_a_conflict(self):
+        calls = []
+
+        def draft_with_role(role: str) -> str:
+            return json.dumps({
+                "candidate_dag": [
+                    {
+                        "label": "age",
+                        "role": role,
+                        "pmid": "111",
+                        "temporal_classification": "pre_treatment",
+                        "rationale": "Age is linked to treatment choice and to mortality.",
+                    }
+                ],
+                "covariate_relations": [],
+            })
+
+        def llm(prompt: str) -> str:
+            calls.append(prompt)
+            n = len(calls)
+            if n == 1:
+                return json.dumps(valid_response())
+            if n == 2:
+                return draft_with_role("confounder")
+            if n == 4:
+                return draft_with_role("effect_modifier")
+            return json.dumps({"verdict": "approve", "concerns": []})
+
+        result = self.service.generate(
+            QUESTION, llm, literature=fake_literature(GROUNDED_ESEARCH, GROUNDED_EFETCH),
+            tournament_size=2,
+        )
+        self.assertEqual(result.protocol["candidate_dag"], [])
+        conflicts = result.protocol["dag_tournament"]["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["kind"], "role_conflict")
+        self.assertTrue(
+            any("merge conflict" in note for note in result.protocol["design_constraints"])
+        )
+
 
 class CovariateSearchTermTests(unittest.TestCase):
     """Population terms are mandatory, not just another OR option alongside
@@ -934,6 +1257,138 @@ class KGReinforcementTests(unittest.TestCase):
         )
         result = _kg_reinforcement("age", ("Treatment A", "All-cause mortality"), (edge,), edge.citation_id)
         self.assertEqual(result, "")
+
+
+class EvidenceLevelTests(unittest.TestCase):
+    """`_evidence_level_map` and `_parse_dag_response` together populate
+    `evidence_level` on every accepted variable/relation (see
+    `causal.agents.hypothesis.EVIDENCE_LEVELS`), the input
+    `causal.agents.dag_identification.confidence_grade` grades on.
+    """
+
+    def test_evidence_level_map_covers_literature_and_kg_citations(self):
+        article = LiteratureArticle(
+            source="pubmed", citation_id="111", title="t", abstract="a",
+            evidence_level="systematic_review",
+        )
+        edge = KGEdge(
+            source_id="A1", source_label="Age", predicate="associated_with",
+            target_id="A2", target_label="Mortality",
+        )
+        levels = _evidence_level_map((article,), (edge,))
+        self.assertEqual(levels, {"111": "systematic_review", edge.citation_id: "kg_structured"})
+
+    def test_parse_dag_response_tags_literature_and_kg_cited_variables(self):
+        # `_parse_dag_response` only ever accepts a variable whose `pmid` is
+        # an id actually shown to the model (`known_citation_ids`); "" is
+        # never a member of that set, so an "uncited" `evidence_level` (see
+        # the next test) can only arise from a human-authored/-reviewed
+        # entry (`WorkflowManager.review_covariate`), never from this gate.
+        edge = KGEdge(
+            source_id="A1", source_label="Baseline severity", predicate="associated_with",
+            target_id="A2", target_label="Mortality",
+        )
+        evidence_levels = {"111": "rct", edge.citation_id: "kg_structured"}
+        raw = json.dumps({
+            "candidate_dag": [
+                {
+                    "label": "age", "role": "confounder", "temporal_classification": "pre_treatment",
+                    "pmid": "111", "rationale": "Cited by article 111.",
+                },
+                {
+                    "label": "baseline severity", "role": "confounder",
+                    "temporal_classification": "pre_treatment",
+                    "pmid": edge.citation_id, "rationale": "Cited by the knowledge graph only.",
+                },
+            ],
+            "covariate_relations": [],
+            "unresolved": [],
+        })
+        known_ids = {"111", edge.citation_id}
+        variables, _, rejected, _ = UserQuestionHypothesisService._parse_dag_response(
+            raw, known_ids, (edge,), "Treatment A", "Mortality", evidence_levels,
+        )
+        self.assertEqual(rejected, 0)
+        by_label = {item["label"]: item for item in variables}
+        self.assertEqual(by_label["age"]["evidence_level"], "rct")
+        self.assertEqual(by_label["baseline severity"]["evidence_level"], "kg_structured")
+
+    def test_parse_dag_response_never_accepts_an_uncited_pmid(self):
+        raw = json.dumps({
+            "candidate_dag": [
+                {
+                    "label": "clinical judgment", "role": "confounder",
+                    "temporal_classification": "pre_treatment",
+                    "pmid": "", "rationale": "Expert-asserted, no citation.",
+                },
+            ],
+            "covariate_relations": [],
+            "unresolved": [],
+        })
+        variables, _, rejected, _ = UserQuestionHypothesisService._parse_dag_response(
+            raw, {"111"}, (), "Treatment A", "Mortality", {},
+        )
+        self.assertEqual(rejected, 1)
+        self.assertEqual(variables, [])
+
+    def test_parse_dag_response_defaults_to_unclassified_for_an_unmapped_citation(self):
+        raw = json.dumps({
+            "candidate_dag": [
+                {
+                    "label": "age", "role": "confounder", "temporal_classification": "pre_treatment",
+                    "pmid": "111", "rationale": "Cited by article 111.",
+                },
+            ],
+            "covariate_relations": [],
+            "unresolved": [],
+        })
+        variables, _, rejected, _ = UserQuestionHypothesisService._parse_dag_response(
+            raw, {"111"}, (), "Treatment A", "Mortality", None,
+        )
+        self.assertEqual(rejected, 0)
+        self.assertEqual(variables[0]["evidence_level"], "unclassified")
+
+
+class DagDomainParsingTests(unittest.TestCase):
+    """`_parse_dag_response` now accepts a `domain` proposed by the
+    DAG-drafting LLM (`causal/prompts/dag.md`) -- it is the one field in
+    this shape that degrades to `""` on anything unrecognized instead of
+    rejecting the whole variable, since it is only ever a provisional guess
+    a human reviewer can still correct (`WorkflowManager.
+    review_covariate_domain`)."""
+
+    def _accept_one(self, extra_item_fields: dict) -> dict:
+        raw = json.dumps({
+            "candidate_dag": [{
+                "label": "SOFA score", "role": "confounder",
+                "temporal_classification": "pre_treatment",
+                "pmid": "111", "rationale": "Cited by article 111.",
+                **extra_item_fields,
+            }],
+            "covariate_relations": [],
+            "unresolved": [],
+        })
+        variables, _, rejected, _ = UserQuestionHypothesisService._parse_dag_response(
+            raw, {"111"}, (), "Treatment A", "Mortality", {"111": "rct"},
+        )
+        self.assertEqual(rejected, 0)
+        return variables[0]
+
+    def test_accepts_a_valid_domain(self):
+        variable = self._accept_one({"domain": "measurement"})
+        self.assertEqual(variable["domain"], "measurement")
+
+    def test_defaults_to_empty_when_domain_omitted(self):
+        variable = self._accept_one({})
+        self.assertEqual(variable["domain"], "")
+
+    def test_drops_an_unrecognized_domain_to_empty_instead_of_rejecting(self):
+        variable = self._accept_one({"domain": "not_a_real_domain"})
+        self.assertEqual(variable["domain"], "")
+
+    def test_drops_a_non_string_domain_to_empty_instead_of_rejecting(self):
+        variable = self._accept_one({"domain": 4301868})
+        self.assertEqual(variable["domain"], "")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from causal.agents.dag_identification import confidence_grade, review_dag
+from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.hypothesis import (
     DAG_VARIABLE_DOMAINS,
     DAG_VARIABLE_ROLES,
@@ -502,6 +503,22 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "from the human covariate review below."
         )
         st.json(dag_unresolved)
+
+    tournament = (_read_json(run_dir / "protocol.json") or {}).get("dag_tournament")
+    if isinstance(tournament, dict):
+        st.markdown("**Population/tournament DAG drafting**")
+        st.caption(
+            f"{tournament.get('candidate_count')} independent candidate(s) drafted; "
+            f"{tournament.get('dropped_duplicate_count')} dropped as SHD-duplicates; "
+            f"{tournament.get('survivor_count')} survivor(s) merged by deterministic edge union "
+            "(see docs/dag_generation_audit.md §9)."
+        )
+        conflicts = tournament.get("conflicts") or []
+        if conflicts:
+            st.warning(
+                "Merge conflicts require human review (never silently resolved):\n"
+                + "\n".join(f"- [{conflict['kind']}] {conflict['description']}" for conflict in conflicts)
+            )
 
     if artifact.unresolved_covariates:
         st.divider()
@@ -1173,7 +1190,8 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
     with st.expander("➕ New run from a clinical question"):
         st.caption(
             "Calls the configured LLM provider (and PubMed/OpenAlex unless skipped) "
-            "and may incur API costs. Can take up to a couple of minutes."
+            "and may incur API costs. Can take up to a couple of minutes — longer with "
+            "more critique rounds or a tournament size above 1."
         )
         with st.form(key="new_question_form"):
             question = st.text_area("Clinical question", key="new_question_text")
@@ -1183,6 +1201,31 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
             )
             skip_literature = st.checkbox(
                 "Skip literature grounding (PubMed/OpenAlex)", key="new_question_skip_lit"
+            )
+            skip_critique = st.checkbox(
+                "Skip DAG critique/revision round", key="new_question_skip_critique"
+            )
+            critique_col, tournament_col = st.columns(2)
+            max_critique_rounds = critique_col.number_input(
+                "Max critique rounds",
+                min_value=1,
+                max_value=5,
+                value=2,
+                disabled=skip_critique,
+                key="new_question_max_critique_rounds",
+                help="Bound on critique → revision → re-critique rounds after the DAG draft.",
+            )
+            tournament_size = tournament_col.number_input(
+                "Tournament size",
+                min_value=1,
+                max_value=MAX_TOURNAMENT_SIZE,
+                value=1,
+                key="new_question_tournament_size",
+                help=(
+                    "Draft N independent candidate DAGs and merge them via SHD dedup, "
+                    "lexicographic ranking, and deterministic edge union (1 = today's "
+                    "single-draft behavior, opt-in above that)."
+                ),
             )
             submitted = st.form_submit_button("Generate hypothesis draft")
 
@@ -1211,6 +1254,9 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
                 data_source=BigQueryDatasets.from_env().fq_dataset("omop"),
                 literature=literature,
                 on_llm_output=_on_llm_output,
+                enable_critique=not skip_critique,
+                max_critique_rounds=int(max_critique_rounds),
+                tournament_size=int(tournament_size),
             )
             state = manager.start_generated(
                 generated, mode, f"{resolved_llm.provider}:{resolved_llm.model}"

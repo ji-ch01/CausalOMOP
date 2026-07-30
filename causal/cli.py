@@ -10,6 +10,7 @@ from causal.bigquery import BigQueryOMOPGateway, make_google_client
 from causal.config import BigQueryDatasets
 from causal.agents import HypothesisAgent, UserQuestionHypothesisService
 from causal.agents.dag_identification import review_dag
+from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.hypothesis import (
     DAG_VARIABLE_AGGREGATIONS,
     DAG_VARIABLE_DOMAINS,
@@ -73,6 +74,18 @@ def main() -> int:
     workflow_question.add_argument(
         "--skip-critique", action="store_true",
         help="skip the independent critique/revision round after the DAG draft",
+    )
+    workflow_question.add_argument(
+        "--max-critique-rounds", type=int, default=None,
+        help="bound on critique->revision->re-critique rounds after the DAG draft (default: 2)",
+    )
+    workflow_question.add_argument(
+        "--tournament-size", type=int, default=None,
+        help=(
+            "draft N independent candidate DAGs and merge them via SHD dedup, "
+            f"lexicographic ranking, and deterministic edge union (default: 1, "
+            f"opt-in; max {MAX_TOURNAMENT_SIZE})"
+        ),
     )
     workflow_status = workflow_sub.add_parser("status")
     workflow_status.add_argument("run_id")
@@ -252,6 +265,11 @@ def main() -> int:
                 None if args.skip_knowledge_graph or not OptimusKGClient.is_available()
                 else OptimusKGClient()
             )
+            generate_kwargs = {}
+            if args.max_critique_rounds is not None:
+                generate_kwargs["max_critique_rounds"] = args.max_critique_rounds
+            if args.tournament_size is not None:
+                generate_kwargs["tournament_size"] = args.tournament_size
             generated = UserQuestionHypothesisService().generate(
                 args.question,
                 resolved_llm.call,
@@ -260,6 +278,7 @@ def main() -> int:
                 knowledge_graph=knowledge_graph,
                 on_llm_output=_print_raw_llm_output,
                 enable_critique=not args.skip_critique,
+                **generate_kwargs,
             )
             state = manager.start_generated(
                 generated, args.mode, f"{resolved_llm.provider}:{resolved_llm.model}"
@@ -419,6 +438,17 @@ def main() -> int:
             )
             for warning in result.technical_notes:
                 print(f"// warning: {warning}", file=sys.stderr)
+            tournament = protocol.get("dag_tournament")
+            if isinstance(tournament, dict):
+                print(
+                    f"// tournament: candidates={tournament.get('candidate_count')} "
+                    f"survivors={tournament.get('survivor_count')} "
+                    f"dropped_duplicates={tournament.get('dropped_duplicate_count')} "
+                    f"conflicts={len(tournament.get('conflicts', []))}",
+                    file=sys.stderr,
+                )
+                for conflict in tournament.get("conflicts", []):
+                    print(f"// tournament conflict [{conflict['kind']}]: {conflict['description']}", file=sys.stderr)
             return 0
         else:
             state = manager.advance(args.run_id)

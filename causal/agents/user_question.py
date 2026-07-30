@@ -15,7 +15,9 @@ from causal.agents.dag_critique import (
     format_structural_findings,
     parse_critique_response,
 )
+from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE, run_tournament
 from causal.agents.hypothesis import (
+    DAG_VARIABLE_DOMAINS,
     DAG_VARIABLE_ROLES,
     ROLE_ALLOWED_TEMPORAL_CLASSES,
     HypothesisAgent,
@@ -30,6 +32,17 @@ from causal.roadmap import EDGE_CERTAINTY
 def _parsed_certainty(item: dict) -> str:
     certainty = item.get("certainty", "established")
     return certainty if certainty in EDGE_CERTAINTY else "established"
+
+
+def _parsed_domain(item: dict) -> str:
+    """A malformed or unrecognized `domain` degrades to `""` ("not yet
+    assessed") rather than rejecting the whole variable -- see
+    `_parse_dag_response`'s docstring for why this one field is lenient
+    where `role`/`pmid`/`rationale` are not.
+    """
+    domain = item.get("domain", "")
+    domain = domain.strip() if isinstance(domain, str) else ""
+    return domain if domain in DAG_VARIABLE_DOMAINS else ""
 
 
 def _kg_reinforcement(
@@ -77,6 +90,24 @@ def _format_articles(articles: tuple[LiteratureArticle, ...]) -> str:
         f"{article.title} — {article.abstract[:_ABSTRACT_PREVIEW_CHARS]}"
         for article in articles
     )
+
+
+def _evidence_level_map(
+    articles: tuple[LiteratureArticle, ...], kg_edges: tuple[KGEdge, ...]
+) -> dict[str, str]:
+    """Map a citation id to the evidence tier it was retrieved at.
+
+    Literature articles already carry `evidence_level` (systematic_review /
+    rct / observational / unclassified, see `causal.literature.orchestrator`).
+    A knowledge-graph edge has no such literature hierarchy — it is a
+    structured fact, not a graded publication — so every KG citation id maps
+    to `"kg_structured"` instead. An id with `pmid == ""` (expert-asserted,
+    uncited) is handled separately by the caller as `"uncited"`, since that
+    case has no citation id to look up here.
+    """
+    levels = {article.citation_id: article.evidence_level for article in articles}
+    levels.update({edge.citation_id: "kg_structured" for edge in kg_edges})
+    return levels
 
 
 def _format_kg_relations(kg_edges: tuple[KGEdge, ...]) -> str:
@@ -220,6 +251,13 @@ _KG_ANCHOR_FIELDS = ("population", "treatment", "comparator", "outcome")
 _MAX_COVARIATES_SEARCHED = 12
 _COVARIATE_RETMAX_PER_SOURCE = 4
 _MAX_COVARIATE_ARTICLES_PER_LABEL = 1
+#: Bounded critique -> revision -> re-critique loop (see
+#: `_critique_and_revise_dag`): at most this many critique calls, each
+#: followed by at most one revision call if the critique requests changes.
+#: A revision can introduce a new issue the first critique never had a
+#: chance to see; re-critiquing it (up to this bound) is what closes that
+#: gap, without allowing unbounded LLM back-and-forth.
+_MAX_CRITIQUE_ROUNDS = 2
 
 
 @dataclass(frozen=True)
@@ -273,7 +311,13 @@ class UserQuestionHypothesisService:
         knowledge_graph: OptimusKGClient | None = None,
         on_llm_output: LLMOutputCallback | None = None,
         enable_critique: bool = True,
+        max_critique_rounds: int = _MAX_CRITIQUE_ROUNDS,
+        tournament_size: int = 1,
     ) -> GeneratedHypothesis:
+        if max_critique_rounds < 1:
+            raise ValueError("max_critique_rounds must be at least 1")
+        if not 1 <= tournament_size <= MAX_TOURNAMENT_SIZE:
+            raise ValueError(f"tournament_size must be between 1 and {MAX_TOURNAMENT_SIZE}")
         raw = llm(self.build_prompt(question))
         first_output = LLMRawOutput("target_trial_draft", raw)
         llm_outputs = [first_output]
@@ -292,6 +336,8 @@ class UserQuestionHypothesisService:
                 llm_outputs,
                 on_llm_output,
                 enable_critique,
+                max_critique_rounds,
+                tournament_size,
             )
         return GeneratedHypothesis(
             protocol,
@@ -308,6 +354,8 @@ class UserQuestionHypothesisService:
         llm_outputs: list[LLMRawOutput],
         on_llm_output: LLMOutputCallback | None,
         enable_critique: bool = True,
+        max_critique_rounds: int = _MAX_CRITIQUE_ROUNDS,
+        tournament_size: int = 1,
     ) -> dict:
         """Best-effort literature/KG grounding: never blocks producing a protocol draft.
 
@@ -326,13 +374,22 @@ class UserQuestionHypothesisService:
         reinforcing evidence id) rather than silently discarded once the
         `pmid` slot is already filled by the literature citation.
 
-        When `enable_critique` and the draft is non-empty, a third LLM call
-        (see `_critique_and_revise_dag`) independently challenges the draft
-        before it reaches `protocol["candidate_dag"]`, with at most one
-        bounded revision round. This never approves or rejects anything --
-        the result is exactly as provisional as an uncritiqued draft would
-        have been, still gated by `HypothesisAgent` and the human `protocol`
-        approval gate in `causal.orchestrator.workflow`.
+        When `enable_critique` and the draft is non-empty, a bounded
+        critique -> revision -> re-critique loop (see
+        `_critique_and_revise_dag`, at most `max_critique_rounds` critique
+        calls) independently challenges the draft before it reaches
+        `protocol["candidate_dag"]`. This never approves or rejects anything
+        -- the result is exactly as provisional as an uncritiqued draft
+        would have been, still gated by `HypothesisAgent` and the human
+        `protocol` approval gate in `causal.orchestrator.workflow`.
+
+        `tournament_size` (default 1: today's exact single-draft behavior,
+        unchanged) opts into the population/tournament mode (see
+        `causal.agents.dag_tournament` and
+        docs/dag_generation_audit.md SS9): `tournament_size` independent
+        candidates are each drafted and critiqued exactly like the
+        single-draft path below, then deduped/ranked/merged, then given
+        one further critique round on the merged result.
         """
         target = protocol.get("target_trial", {})
         articles: tuple[LiteratureArticle, ...] = ()
@@ -365,47 +422,57 @@ class UserQuestionHypothesisService:
             known_citation_ids = {article.citation_id for article in articles} | {
                 edge.citation_id for edge in kg_edges
             }
+            evidence_levels = _evidence_level_map(articles, kg_edges)
             listed = _format_articles(articles)
             kg_listed = _format_kg_relations(kg_edges)
             dag_prompt = self._build_dag_prompt(target, articles, kg_edges)
-            try:
-                raw = llm(dag_prompt)
-                dag_output = LLMRawOutput("literature_dag_draft", raw)
-                llm_outputs.append(dag_output)
-                if on_llm_output is not None:
-                    on_llm_output(dag_output)
-                variables, relations, rejected, unresolved = self._parse_dag_response(
-                    raw, known_citation_ids, kg_edges, treatment, outcome,
-                )
-            except ValueError:
-                variables, relations, rejected, unresolved = [], [], 0, []
-            reinforced = sum(1 for variable in variables if variable.get("kg_evidence_id"))
-            note = (
-                f"{len(variables)} candidate DAG variable(s) and "
-                f"{len(relations)} covariate relation(s) proposed from {len(articles)} retrieved "
-                f"article(s) ({len(covariate_hits)} first-pass covariate(s) had dedicated targeted "
-                f"evidence) and {len(kg_edges)} knowledge-graph relation(s)"
-            )
-            if reinforced:
-                note += (
-                    f"; {reinforced} variable(s) independently corroborated by both "
-                    "literature and the knowledge graph"
-                )
-            if rejected:
-                note += f"; {rejected} entr(y/ies) rejected for ungrounded or invalid content"
-            if unresolved:
-                note += (
-                    f"; {len(unresolved)} first-pass covariate(s) flagged unresolved "
-                    "by the drafting LLM"
-                )
-            if enable_critique and variables:
-                variables, relations, extra_rejected, unresolved, critique_note = self._critique_and_revise_dag(
+            if tournament_size > 1:
+                variables, relations, rejected, unresolved, note = self._run_tournament(
                     protocol, target, listed, kg_listed, dag_prompt,
-                    variables, relations, unresolved, known_citation_ids, kg_edges,
-                    treatment, outcome, llm, llm_outputs, on_llm_output,
+                    known_citation_ids, kg_edges, treatment, outcome, evidence_levels,
+                    llm, llm_outputs, on_llm_output, enable_critique, max_critique_rounds,
+                    tournament_size, len(articles), len(covariate_hits),
                 )
-                rejected += extra_rejected
-                note += critique_note
+            else:
+                try:
+                    raw = llm(dag_prompt)
+                    dag_output = LLMRawOutput("literature_dag_draft", raw)
+                    llm_outputs.append(dag_output)
+                    if on_llm_output is not None:
+                        on_llm_output(dag_output)
+                    variables, relations, rejected, unresolved = self._parse_dag_response(
+                        raw, known_citation_ids, kg_edges, treatment, outcome, evidence_levels,
+                    )
+                except ValueError:
+                    variables, relations, rejected, unresolved = [], [], 0, []
+                reinforced = sum(1 for variable in variables if variable.get("kg_evidence_id"))
+                note = (
+                    f"{len(variables)} candidate DAG variable(s) and "
+                    f"{len(relations)} covariate relation(s) proposed from {len(articles)} retrieved "
+                    f"article(s) ({len(covariate_hits)} first-pass covariate(s) had dedicated targeted "
+                    f"evidence) and {len(kg_edges)} knowledge-graph relation(s)"
+                )
+                if reinforced:
+                    note += (
+                        f"; {reinforced} variable(s) independently corroborated by both "
+                        "literature and the knowledge graph"
+                    )
+                if rejected:
+                    note += f"; {rejected} entr(y/ies) rejected for ungrounded or invalid content"
+                if unresolved:
+                    note += (
+                        f"; {len(unresolved)} first-pass covariate(s) flagged unresolved "
+                        "by the drafting LLM"
+                    )
+                if enable_critique and variables:
+                    variables, relations, extra_rejected, unresolved, critique_note = self._critique_and_revise_dag(
+                        protocol, target, listed, kg_listed, dag_prompt,
+                        variables, relations, unresolved, known_citation_ids, kg_edges,
+                        treatment, outcome, evidence_levels, llm, llm_outputs, on_llm_output,
+                        max_critique_rounds,
+                    )
+                    rejected += extra_rejected
+                    note += critique_note
 
         protocol["candidate_dag"] = variables
         protocol["covariate_relations"] = relations
@@ -436,66 +503,202 @@ class UserQuestionHypothesisService:
         kg_edges: tuple[KGEdge, ...],
         treatment: str,
         outcome: str,
+        evidence_levels: dict[str, str],
         llm: LLMCallable,
         llm_outputs: list[LLMRawOutput],
         on_llm_output: LLMOutputCallback | None,
+        max_rounds: int = _MAX_CRITIQUE_ROUNDS,
+        stage_suffix: str = "",
     ) -> tuple[list[dict], list[dict], int, list[dict], str]:
-        """Independently challenge a non-empty DAG draft, with at most one
-        bounded revision round, before it reaches `protocol["candidate_dag"]`.
+        """Independently challenge a non-empty DAG draft through a bounded
+        critique -> revision -> re-critique loop (at most `max_rounds`
+        critique calls, each followed by at most one revision call) before
+        it reaches `protocol["candidate_dag"]`.
 
-        Never raises: a malformed critique or revision response degrades to
-        the pre-step DAG with an explanatory note appended to the caller's
-        `note`, exactly like the surrounding "never blocks the draft"
-        contract in `_attach_literature_dag`. A revised proposal is parsed
-        by the same `_parse_dag_response` gate as the original draft -- the
-        critique loop never gets a separate, looser trust path.
+        A single critique-and-revise pass cannot catch an issue the
+        revision itself introduces -- re-critiquing the revision (up to
+        `max_rounds`) is what closes that gap. Never raises: a malformed
+        critique or revision response at any round stops the loop and keeps
+        the last successfully-parsed state, with an explanatory note
+        appended to the caller's `note`, exactly like the surrounding
+        "never blocks the draft" contract in `_attach_literature_dag`. Every
+        revision at every round is parsed by the same `_parse_dag_response`
+        gate as the original draft -- the critique loop never gets a
+        separate, looser trust path. `build_pre_check` is re-run each round
+        on the CURRENT state (not the original draft), so a later round's
+        critique sees what the previous round actually produced.
+
+        `stage_suffix` (e.g. `"_candidate2"`, `"_merged"`) only distinguishes
+        `llm_outputs` stage tags when this loop runs more than once per
+        `generate()` call (tournament mode, see
+        `causal.agents.dag_tournament`); the default `""` reproduces the
+        single-draft pipeline's exact tags (`literature_dag_critique_round1`,
+        ...) unchanged.
         """
-        review = build_pre_check(protocol, variables, relations)
-        findings_text = format_structural_findings(review)
-        proposed_dag_json = json.dumps(
-            {"candidate_dag": variables, "covariate_relations": relations, "unresolved": unresolved},
-            indent=2,
-        )
-        critique_prompt = build_critique_prompt(
-            self.dag_critique_prompt_path, target, listed, kg_listed, proposed_dag_json, findings_text,
-        )
-        try:
-            raw = llm(critique_prompt)
-            critique_output = LLMRawOutput("literature_dag_critique", raw)
-            llm_outputs.append(critique_output)
-            if on_llm_output is not None:
-                on_llm_output(critique_output)
-            critique = parse_critique_response(raw)
-        except ValueError:
-            return variables, relations, 0, unresolved, (
-                "; DAG critique step failed or returned malformed output, "
-                "using pre-critique candidate_dag"
+        total_rejected = 0
+        for round_number in range(1, max_rounds + 1):
+            review = build_pre_check(protocol, variables, relations)
+            findings_text = format_structural_findings(review)
+            proposed_dag_json = json.dumps(
+                {"candidate_dag": variables, "covariate_relations": relations, "unresolved": unresolved},
+                indent=2,
             )
+            critique_prompt = build_critique_prompt(
+                self.dag_critique_prompt_path, target, listed, kg_listed, proposed_dag_json, findings_text,
+            )
+            try:
+                raw = llm(critique_prompt)
+                critique_output = LLMRawOutput(f"literature_dag_critique{stage_suffix}_round{round_number}", raw)
+                llm_outputs.append(critique_output)
+                if on_llm_output is not None:
+                    on_llm_output(critique_output)
+                critique = parse_critique_response(raw)
+            except ValueError:
+                return variables, relations, total_rejected, unresolved, (
+                    f"; DAG critique round {round_number} failed or returned malformed output, "
+                    "using the candidate_dag from before this round"
+                )
 
-        if critique.verdict == "approve":
-            return variables, relations, 0, unresolved, (
-                "; candidate_dag reviewed by an independent critique step and approved without changes"
-            )
+            if critique.verdict == "approve":
+                if round_number == 1:
+                    return variables, relations, total_rejected, unresolved, (
+                        "; candidate_dag reviewed by an independent critique step and approved without changes"
+                    )
+                return variables, relations, total_rejected, unresolved, (
+                    f"; candidate_dag revised after critique ({round_number - 1} round(s) of revision) "
+                    f"and approved on re-critique (round {round_number})"
+                )
 
-        revision_prompt = build_revision_prompt(dag_prompt, proposed_dag_json, critique)
-        try:
-            raw_revision = llm(revision_prompt)
-            revision_output = LLMRawOutput("literature_dag_revision", raw_revision)
-            llm_outputs.append(revision_output)
-            if on_llm_output is not None:
-                on_llm_output(revision_output)
-            rev_variables, rev_relations, rev_rejected, rev_unresolved = self._parse_dag_response(
-                raw_revision, known_citation_ids, kg_edges, treatment, outcome,
-            )
-        except ValueError:
-            return variables, relations, 0, unresolved, (
-                f"; DAG critique requested {len(critique.concerns)} change(s) but the revision "
-                "step failed or returned malformed output, using pre-revision candidate_dag"
-            )
+            revision_prompt = build_revision_prompt(dag_prompt, proposed_dag_json, critique)
+            try:
+                raw_revision = llm(revision_prompt)
+                revision_output = LLMRawOutput(
+                    f"literature_dag_revision{stage_suffix}_round{round_number}", raw_revision
+                )
+                llm_outputs.append(revision_output)
+                if on_llm_output is not None:
+                    on_llm_output(revision_output)
+                rev_variables, rev_relations, rev_rejected, rev_unresolved = self._parse_dag_response(
+                    raw_revision, known_citation_ids, kg_edges, treatment, outcome, evidence_levels,
+                )
+            except ValueError:
+                return variables, relations, total_rejected, unresolved, (
+                    f"; DAG critique round {round_number} requested {len(critique.concerns)} change(s) but "
+                    "the revision step failed or returned malformed output, using the pre-revision candidate_dag"
+                )
 
-        return rev_variables, rev_relations, rev_rejected, rev_unresolved, (
-            f"; candidate_dag revised after critique ({len(critique.concerns)} concern(s) addressed)"
+            variables, relations, unresolved = rev_variables, rev_relations, rev_unresolved
+            total_rejected += rev_rejected
+
+        return variables, relations, total_rejected, unresolved, (
+            f"; candidate_dag revised after critique ({max_rounds} round(s)) but reached the maximum "
+            "number of critique rounds without a final approval -- the last revision is used as-is"
         )
+
+    def _run_tournament(
+        self,
+        protocol: dict,
+        target: dict,
+        listed: str,
+        kg_listed: str,
+        dag_prompt: str,
+        known_citation_ids: set[str],
+        kg_edges: tuple[KGEdge, ...],
+        treatment: str,
+        outcome: str,
+        evidence_levels: dict[str, str],
+        llm: LLMCallable,
+        llm_outputs: list[LLMRawOutput],
+        on_llm_output: LLMOutputCallback | None,
+        enable_critique: bool,
+        max_critique_rounds: int,
+        tournament_size: int,
+        article_count: int,
+        covariate_hit_count: int,
+    ) -> tuple[list[dict], list[dict], int, list[dict], str]:
+        """Population/tournament DAG-drafting mode (Phase 3 of the 4-part
+        extension roadmap; see `causal.agents.dag_tournament` and
+        docs/dag_generation_audit.md SS9 for the full design).
+
+        Drafts `tournament_size` independent candidates from the same
+        `dag_prompt` -- each through its own bounded critique -> revision ->
+        re-critique loop, exactly like the single-draft path this branches
+        from -- then dedups/ranks/merges them
+        (`causal.agents.dag_tournament.run_tournament`) and runs one further
+        critique round on the merged result (a structural union cannot judge
+        clinical plausibility on its own).
+        """
+        total_rejected = 0
+        candidates_raw: list[tuple[list[dict], list[dict], list[dict], str]] = []
+        for candidate_index in range(tournament_size):
+            stage_suffix = f"_candidate{candidate_index + 1}"
+            try:
+                raw = llm(dag_prompt)
+                dag_output = LLMRawOutput(f"literature_dag_draft{stage_suffix}", raw)
+                llm_outputs.append(dag_output)
+                if on_llm_output is not None:
+                    on_llm_output(dag_output)
+                variables, relations, rejected, unresolved = self._parse_dag_response(
+                    raw, known_citation_ids, kg_edges, treatment, outcome, evidence_levels,
+                )
+            except ValueError:
+                variables, relations, rejected, unresolved = [], [], 0, []
+            total_rejected += rejected
+
+            candidate_note = ""
+            if enable_critique and variables:
+                variables, relations, extra_rejected, unresolved, candidate_note = self._critique_and_revise_dag(
+                    protocol, target, listed, kg_listed, dag_prompt,
+                    variables, relations, unresolved, known_citation_ids, kg_edges,
+                    treatment, outcome, evidence_levels, llm, llm_outputs, on_llm_output,
+                    max_critique_rounds, stage_suffix,
+                )
+                total_rejected += extra_rejected
+
+            candidates_raw.append((variables, relations, unresolved, candidate_note))
+
+        result = run_tournament(protocol, tuple(candidates_raw))
+        variables = list(result.merged_variables)
+        relations = list(result.merged_relations)
+        unresolved = list(result.merged_unresolved)
+
+        critique_note = ""
+        if enable_critique and variables:
+            variables, relations, extra_rejected, unresolved, critique_note = self._critique_and_revise_dag(
+                protocol, target, listed, kg_listed, dag_prompt,
+                variables, relations, unresolved, known_citation_ids, kg_edges,
+                treatment, outcome, evidence_levels, llm, llm_outputs, on_llm_output,
+                1, "_merged",
+            )
+            total_rejected += extra_rejected
+
+        note = (
+            f"tournament mode: {tournament_size} independent candidate DAG(s) drafted from "
+            f"{article_count} retrieved article(s) ({covariate_hit_count} first-pass covariate(s) "
+            f"had dedicated targeted evidence) and {len(kg_edges)} knowledge-graph relation(s); "
+            f"{result.dropped_duplicate_count} duplicate candidate(s) dropped (SHD-based dedup), "
+            f"{len(result.survivors)} survivor(s) merged by deterministic edge union"
+        )
+        if result.conflicts:
+            note += f"; {len(result.conflicts)} merge conflict(s) require human review: " + "; ".join(
+                f"[{conflict.kind}] {conflict.description}" for conflict in result.conflicts
+            )
+        if total_rejected:
+            note += (
+                f"; {total_rejected} entr(y/ies) rejected across all candidates for "
+                "ungrounded or invalid content"
+            )
+        note += critique_note
+
+        protocol["dag_tournament"] = {
+            "candidate_count": tournament_size,
+            "survivor_count": len(result.survivors),
+            "dropped_duplicate_count": result.dropped_duplicate_count,
+            "candidates": [candidate.summary_dict() for candidate in result.survivors],
+            "conflicts": [conflict.to_dict() for conflict in result.conflicts],
+        }
+
+        return variables, relations, total_rejected, unresolved, note
 
     @staticmethod
     def _fetch_kg_relations(protocol: dict, knowledge_graph: OptimusKGClient) -> tuple[KGEdge, ...]:
@@ -651,6 +854,7 @@ class UserQuestionHypothesisService:
         kg_edges: tuple[KGEdge, ...] = (),
         treatment: str = "",
         outcome: str = "",
+        evidence_levels: dict[str, str] | None = None,
     ) -> tuple[list[dict], list[dict], int, list[dict]]:
         """Returns (accepted_variables, accepted_relations, rejected_count, unresolved).
 
@@ -660,6 +864,16 @@ class UserQuestionHypothesisService:
         entries that failed *this* module's structural/grounding gate
         (bad role, uncited pmid, ...). An `unresolved` entry is not a
         grounding failure, so it is not counted toward `rejected`.
+
+        `domain` (see `DAG_VARIABLE_DOMAINS`) is the one field in this shape
+        that is optional even when present: unlike `role`/`pmid`/
+        `rationale`, an invalid or malformed `domain` never rejects the
+        whole variable -- it is simply dropped to `""` ("not yet assessed"),
+        the same sentinel a human-reviewed covariate starts at via
+        `WorkflowManager.review_covariate`. It is still only ever a
+        provisional guess a reviewer can correct (see
+        `WorkflowManager.review_covariate_domain`), never a concept-mapping
+        decision on its own.
         """
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("LLM returned an empty DAG response")
@@ -669,6 +883,13 @@ class UserQuestionHypothesisService:
             raise ValueError("DAG LLM response must be one valid JSON object") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("candidate_dag"), list):
             raise ValueError("DAG response must contain a candidate_dag list")
+
+        levels = evidence_levels or {}
+
+        def _evidence_level(pmid: str) -> str:
+            if not pmid:
+                return "uncited"
+            return levels.get(pmid, "unclassified")
 
         rejected = 0
         accepted_variables: list[dict] = []
@@ -694,6 +915,8 @@ class UserQuestionHypothesisService:
                     "observed": item.get("observed", True) if isinstance(item.get("observed", True), bool) else True,
                     "certainty": _parsed_certainty(item),
                     "kg_evidence_id": _kg_reinforcement(label, (treatment, outcome), kg_edges, item["pmid"]),
+                    "evidence_level": _evidence_level(item["pmid"]),
+                    "domain": _parsed_domain(item),
                 })
                 known_labels.add(label)
             else:
@@ -717,6 +940,7 @@ class UserQuestionHypothesisService:
                         "pmid": item["pmid"],
                         "rationale": item["rationale"].strip(),
                         "certainty": _parsed_certainty(item),
+                        "evidence_level": _evidence_level(item["pmid"]),
                     })
                 else:
                     rejected += 1
@@ -759,7 +983,6 @@ class UserQuestionHypothesisService:
             protocol.get("literature_search")
         )
         protocol["concept_sets"] = self._pending_concept_sets(protocol)
-        protocol["query_concept_sets"] = self._pending_query_concept_sets()
         protocol.setdefault("design_constraints", [])
         protocol["design_constraints"] = list(protocol["design_constraints"]) + [
             "LLM-generated draft requires human protocol approval",
@@ -787,18 +1010,5 @@ class UserQuestionHypothesisService:
                 "role": role,
                 "domain": "",
             }
-            for role in ("population", "treatment", "comparator", "outcome")
-        }
-
-    @staticmethod
-    def _pending_query_concept_sets() -> dict:
-        """Scaffold for the per-question feasibility/cohort SQL (see
-        `causal.queries.feasibility`). `domain` and `concept_ids` are filled
-        in during human concept-mapping review, same gate as `concept_sets`;
-        an empty domain blocks query generation with a clear error rather
-        than guessing an OMOP table.
-        """
-        return {
-            role: {"domain": "", "concept_ids": []}
             for role in ("population", "treatment", "comparator", "outcome")
         }
