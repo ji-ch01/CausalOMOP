@@ -10,7 +10,12 @@ from causal.bigquery import BigQueryOMOPGateway, make_google_client
 from causal.config import BigQueryDatasets
 from causal.agents import HypothesisAgent, UserQuestionHypothesisService
 from causal.agents.dag_identification import review_dag
-from causal.agents.hypothesis import DAG_VARIABLE_ROLES
+from causal.agents.hypothesis import (
+    DAG_VARIABLE_AGGREGATIONS,
+    DAG_VARIABLE_DOMAINS,
+    DAG_VARIABLE_ROLES,
+    DAG_VARIABLE_TEMPORAL_CLASSES,
+)
 from causal.agents.user_question import LLMRawOutput
 from causal.knowledge_graph import OptimusKGClient
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
@@ -90,6 +95,10 @@ def main() -> int:
         help="required when decision=accept",
     )
     workflow_covariate_review.add_argument(
+        "--temporal-classification", choices=DAG_VARIABLE_TEMPORAL_CLASSES,
+        help="required when decision=accept",
+    )
+    workflow_covariate_review.add_argument(
         "--comment", help="rationale; required when decision=accept"
     )
     workflow_covariate_review.add_argument("--pmid", default="")
@@ -100,10 +109,94 @@ def main() -> int:
         "--certainty", choices=("established", "plausible", "contested", "unknown_direction"),
         default="established",
     )
+    workflow_covariate_review.add_argument(
+        "--domain", choices=DAG_VARIABLE_DOMAINS,
+        help="optional OMOP domain; enables an OMCP concept lookup for this covariate later",
+    )
+    workflow_concept_set_map = workflow_sub.add_parser(
+        "concept-set-map",
+        help="record the OMOP domain + concept(s) for a protocol concept_sets entry",
+    )
+    workflow_concept_set_map.add_argument("run_id")
+    workflow_concept_set_map.add_argument("name", help="concept_sets key, e.g. 'population'")
+    workflow_concept_set_map.add_argument(
+        "--domain", required=True,
+        help=(
+            "one of condition/drug/procedure/measurement/observation, or 'death' "
+            "(only valid for an entry whose role is 'outcome') -- this is also what "
+            "feasibility/cohort SQL generation reads for this role, there is no separate mapping step"
+        ),
+    )
+    workflow_concept_set_map.add_argument(
+        "--concept-ids", type=int, nargs="+", default=[],
+        help="one or more OMOP concept_id values; required unless --status is non-approved or --domain death",
+    )
+    workflow_concept_set_map.add_argument("--reviewer", required=True)
+    workflow_concept_set_map.add_argument(
+        "--status", default="approved",
+        help="e.g. approved, no_standard_concept (free text; 'approved' requires --concept-ids unless --domain death)",
+    )
+    workflow_concept_set_map.add_argument("--comment")
+    workflow_concept_set_map.add_argument(
+        "--with-mcp", action="store_true",
+        help="verify each concept_id's real OMOP domain matches --domain through OMCP",
+    )
+    workflow_covariate_map_concepts = workflow_sub.add_parser(
+        "covariate-map-concepts",
+        help="record the OMOP concept(s) chosen for an already-accepted covariate",
+    )
+    workflow_covariate_map_concepts.add_argument("run_id")
+    workflow_covariate_map_concepts.add_argument("label")
+    workflow_covariate_map_concepts.add_argument(
+        "--concept-ids", type=int, nargs="+", default=[],
+        help="one or more OMOP concept_id values; required unless --mapping-status is non-approved",
+    )
+    workflow_covariate_map_concepts.add_argument("--reviewer", required=True)
+    workflow_covariate_map_concepts.add_argument(
+        "--mapping-status", default="approved",
+        help="e.g. approved, no_standard_concept (free text; 'approved' requires --concept-ids)",
+    )
+    workflow_covariate_map_concepts.add_argument("--comment")
+    workflow_covariate_map_concepts.add_argument(
+        "--with-mcp", action="store_true",
+        help="verify each concept_id's real OMOP domain matches the covariate's declared domain through OMCP",
+    )
+    workflow_covariate_review_domain = workflow_sub.add_parser(
+        "covariate-review-domain",
+        help="confirm or correct the OMOP domain for an already-accepted covariate",
+    )
+    workflow_covariate_review_domain.add_argument("run_id")
+    workflow_covariate_review_domain.add_argument("label")
+    workflow_covariate_review_domain.add_argument("domain", choices=DAG_VARIABLE_DOMAINS)
+    workflow_covariate_review_domain.add_argument("--reviewer", required=True)
+    workflow_covariate_review_domain.add_argument("--comment")
+    workflow_covariate_review_aggregation = workflow_sub.add_parser(
+        "covariate-review-aggregation",
+        help="record how to combine repeated occurrences of an already-mapped covariate",
+    )
+    workflow_covariate_review_aggregation.add_argument("run_id")
+    workflow_covariate_review_aggregation.add_argument("label")
+    workflow_covariate_review_aggregation.add_argument("aggregation", choices=DAG_VARIABLE_AGGREGATIONS)
+    workflow_covariate_review_aggregation.add_argument("--reviewer", required=True)
+    workflow_covariate_review_aggregation.add_argument("--comment")
+    workflow_covariate_review_window = workflow_sub.add_parser(
+        "covariate-review-window",
+        help="override the auto-derived ascertainment window for an already-accepted covariate",
+    )
+    workflow_covariate_review_window.add_argument("run_id")
+    workflow_covariate_review_window.add_argument("label")
+    workflow_covariate_review_window.add_argument("window_start_hours", type=int)
+    workflow_covariate_review_window.add_argument("window_end_hours", type=int)
+    workflow_covariate_review_window.add_argument("--reviewer", required=True)
+    workflow_covariate_review_window.add_argument("--comment")
     workflow_advance = workflow_sub.add_parser("advance")
     workflow_advance.add_argument("run_id")
     workflow_hypothesis = workflow_sub.add_parser("hypothesis")
     workflow_hypothesis.add_argument("run_id")
+    workflow_registry_build = workflow_sub.add_parser(
+        "registry-build", help="write registry.json from protocol.json's concept_sets/candidate_dag"
+    )
+    workflow_registry_build.add_argument("run_id")
     workflow_plan = workflow_sub.add_parser("plan")
     workflow_plan.add_argument("run_id")
     workflow_plan.add_argument(
@@ -177,6 +270,23 @@ def main() -> int:
             state = manager.decide_gate(args.run_id, args.gate, args.status, args.reviewer, args.comment)
         elif args.workflow_command == "hypothesis":
             state = manager.run_hypothesis_agent(args.run_id)
+        elif args.workflow_command == "registry-build":
+            state = manager.build_variable_registry(args.run_id)
+        elif args.workflow_command == "concept-set-map":
+            concept_lookup = (
+                OMCPClient(project=datasets.project, dataset=datasets.omop)
+                if args.with_mcp else None
+            )
+            state = manager.map_concept_set(
+                args.run_id,
+                args.name,
+                args.domain,
+                args.concept_ids,
+                args.reviewer,
+                status=args.status,
+                comment=args.comment,
+                concept_lookup=concept_lookup,
+            )
         elif args.workflow_command == "covariate-review":
             state = manager.review_covariate(
                 args.run_id,
@@ -185,9 +295,50 @@ def main() -> int:
                 args.reviewer,
                 args.comment,
                 role=args.role,
+                temporal_classification=args.temporal_classification,
                 pmid=args.pmid,
                 observed=not args.unobserved,
                 certainty=args.certainty,
+                domain=args.domain,
+            )
+        elif args.workflow_command == "covariate-map-concepts":
+            concept_lookup = (
+                OMCPClient(project=datasets.project, dataset=datasets.omop)
+                if args.with_mcp else None
+            )
+            state = manager.map_covariate_concepts(
+                args.run_id,
+                args.label,
+                args.concept_ids,
+                args.reviewer,
+                mapping_status=args.mapping_status,
+                comment=args.comment,
+                concept_lookup=concept_lookup,
+            )
+        elif args.workflow_command == "covariate-review-domain":
+            state = manager.review_covariate_domain(
+                args.run_id,
+                args.label,
+                args.domain,
+                args.reviewer,
+                comment=args.comment,
+            )
+        elif args.workflow_command == "covariate-review-aggregation":
+            state = manager.review_covariate_aggregation(
+                args.run_id,
+                args.label,
+                args.aggregation,
+                args.reviewer,
+                comment=args.comment,
+            )
+        elif args.workflow_command == "covariate-review-window":
+            state = manager.review_covariate_window(
+                args.run_id,
+                args.label,
+                args.window_start_hours,
+                args.window_end_hours,
+                args.reviewer,
+                comment=args.comment,
             )
         elif args.workflow_command == "plan":
             lookup = (
@@ -257,6 +408,13 @@ def main() -> int:
                 f"kg_only={review.evidence.kg_only} corroborated={review.evidence.corroborated} "
                 f"uncited={review.evidence.uncited} "
                 f"cited_fraction={review.evidence.cited_fraction:.2f}",
+                file=sys.stderr,
+            )
+            print(
+                f"// confidence (GRADE-inspired): high={review.confidence.high} "
+                f"moderate={review.confidence.moderate} low={review.confidence.low} "
+                f"very_low={review.confidence.very_low} "
+                f"high_or_moderate_fraction={review.confidence.high_or_moderate_fraction:.2f}",
                 file=sys.stderr,
             )
             for warning in result.technical_notes:

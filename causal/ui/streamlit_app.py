@@ -2,15 +2,28 @@
 
 Run with: `streamlit run causal/ui/streamlit_app.py` from the repository root.
 
-This app only calls the existing `WorkflowManager` (load/decide_gate/advance/
+This app mainly calls the existing `WorkflowManager` (load/decide_gate/advance/
 build_demo_report) and reads the JSON artifacts it already writes under
-`artifacts/runs/<run_id>/`. It never calls an LLM or BigQuery/OMCP directly —
-those actions stay on the `causalomop` CLI.
+`artifacts/runs/<run_id>/`. A few actions do reach further, the same way the
+`causalomop` CLI does: drafting a hypothesis calls the configured LLM directly
+(see `_render_new_question_form`); mapping a `concept_sets`/`query_concept_sets`
+entry (`_render_concept_mapping_section`, mirrors `workflow concept-set-map`/
+`query-concept-set-map`) or approving a covariate's concept mapping
+(`_render_analysis_plan_tab`, mirrors `workflow covariate-map-concepts
+--with-mcp`) both call OMCP directly (`OMCPClient`) to search/verify OMOP
+concepts, unconditionally here rather than opt-in, since this app is where a
+reviewer with real BigQuery/OMOP access does the actual clinical mapping
+review, not a fast offline dev loop; and regenerating the analysis plan
+(`_render_regenerate_plan_section`, mirrors `workflow plan [--with-mcp]`)
+optionally calls OMCP too, opt-in there since refreshing OMOP concept
+*candidates* is a slower discovery aid, not a correctness gate.
 """
 
 from __future__ import annotations
 
+import csv
 import html
+import io
 import json
 import sys
 from pathlib import Path
@@ -25,8 +38,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from causal.agents.dag_identification import review_dag
+from causal.agents.dag_identification import confidence_grade, review_dag
 from causal.agents.hypothesis import (
+    DAG_VARIABLE_DOMAINS,
     DAG_VARIABLE_ROLES,
     DAG_VARIABLE_TEMPORAL_CLASSES,
     CovariateRelation,
@@ -38,8 +52,10 @@ from causal.agents.user_question import LLMRawOutput, UserQuestionHypothesisServ
 from causal.config import BigQueryDatasets
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
+from causal.mcp_client import OMCPClient
 from causal.orchestrator.state import PHASES, RunState
 from causal.orchestrator.workflow import WorkflowManager
+from causal.queries import COVARIATE_AGGREGATIONS_BY_DOMAIN, OUTCOME_DOMAINS
 from causal.roadmap import CausalDAG
 
 
@@ -171,6 +187,7 @@ def _hypothesis_artifact_from_dict(data: dict[str, Any]) -> HypothesisArtifact:
             observed=v.get("observed", True),
             certainty=v.get("certainty", "established"),
             kg_evidence_id=v.get("kg_evidence_id", ""),
+            evidence_level=v.get("evidence_level", "unclassified"),
         )
         for v in data.get("candidate_dag", ())
     )
@@ -182,6 +199,7 @@ def _hypothesis_artifact_from_dict(data: dict[str, Any]) -> HypothesisArtifact:
             pmid=r.get("pmid", ""),
             certainty=r.get("certainty", "established"),
             kg_evidence_id=r.get("kg_evidence_id", ""),
+            evidence_level=r.get("evidence_level", "unclassified"),
         )
         for r in data.get("covariate_relations", ())
     )
@@ -369,6 +387,7 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
     clinical = review.clinical
     evidence = review.evidence
     adjustment = review.adjustment
+    confidence = review.confidence
 
     st.caption(f"Active comparator represented on the DAG: **{artifact.comparator or '—'}**")
 
@@ -411,6 +430,18 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "sources (literature and knowledge graph)."
         )
 
+    if confidence.total_items:
+        confidence_metric_cols = st.columns(4)
+        confidence_metric_cols[0].metric("Confidence: high", confidence.high)
+        confidence_metric_cols[1].metric("Confidence: moderate", confidence.moderate)
+        confidence_metric_cols[2].metric("Confidence: low", confidence.low)
+        confidence_metric_cols[3].metric("Confidence: very low", confidence.very_low)
+        st.caption(
+            f"{confidence.high_or_moderate_fraction:.0%} of DAG items ({confidence.total_items} total) are "
+            "graded high or moderate confidence (GRADE-inspired: evidence tier, contested/unknown-direction "
+            "certainty, and cross-source corroboration — see docs/dag_generation_audit.md)."
+        )
+
     if identification.technical_notes:
         st.info(
             "Graph-theoretic notes (identification only — not a clinical judgment):\n"
@@ -432,7 +463,11 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "Item": variable.label,
             "Role": variable.role.replace("_", " "),
             "Evidence id": variable.pmid or "—",
+            "Evidence level": variable.evidence_level.replace("_", " "),
             "KG-corroborated": "✓" if variable.kg_evidence_id else "",
+            "Confidence": confidence_grade(
+                variable.pmid, variable.kg_evidence_id, variable.evidence_level, variable.certainty
+            ).replace("_", " "),
         }
         for variable in artifact.candidate_dag
     ] + [
@@ -440,7 +475,11 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "Item": f"{relation.source} → {relation.target}",
             "Role": "covariate relation",
             "Evidence id": relation.pmid or "—",
+            "Evidence level": relation.evidence_level.replace("_", " "),
             "KG-corroborated": "✓" if relation.kg_evidence_id else "",
+            "Confidence": confidence_grade(
+                relation.pmid, relation.kg_evidence_id, relation.evidence_level, relation.certainty
+            ).replace("_", " "),
         }
         for relation in artifact.covariate_relations
     ]
@@ -448,8 +487,10 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         st.markdown("**Evidence sources**")
         st.caption(
             "Evidence id is a PubMed/OpenAlex citation or a knowledge-graph relation id. "
+            "Evidence level is the citation's tier (systematic review > RCT > observational). "
             "KG-corroborated marks items where the knowledge graph independently confirmed "
-            "a literature-cited relation."
+            "a literature-cited relation. Confidence is the GRADE-inspired grade shown "
+            "aggregated above."
         )
         st.dataframe(evidence_rows, width="stretch")
 
@@ -489,6 +530,12 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                     DAG_VARIABLE_TEMPORAL_CLASSES,
                     key=f"covariate_temporal_{label}",
                 )
+                domain_choice = st.selectbox(
+                    "OMOP domain (optional; enables a concept lookup later)",
+                    ("",) + DAG_VARIABLE_DOMAINS,
+                    key=f"covariate_domain_{label}",
+                    format_func=lambda value: "Not yet assessed" if value == "" else value,
+                )
                 comment = st.text_area(
                     "Rationale" if decision_choice != "reject" else "Comment (optional)",
                     key=f"covariate_comment_{label}",
@@ -502,6 +549,7 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                             manager.review_covariate(
                                 run_id, label, "accept", reviewer, comment,
                                 role=decision_choice, temporal_classification=temporal_choice,
+                                domain=domain_choice or None,
                             )
                         st.success(f"'{label}' reviewed")
                         st.rerun()
@@ -539,71 +587,255 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                 st.code(output.get("raw_text", ""), language="json")
 
 
-def _render_concept_mapping_section(run_dir: Path) -> None:
-    """Concept mapping (`concept_sets` / `query_concept_sets`) lives in
-    `protocol.json`, not `analysis_plan.json` — so it's shown even before the
-    Data Science Agent has run. Today this data is only ever populated via
-    the `causalomop concepts <term>` CLI search followed by manual
-    protocol.json edits; there is no in-app concept search yet.
+def _omcp_lookup(client: OMCPClient, domain: str, term: str) -> Any:
+    """Dispatch to the right `OMCPClient` search method for `domain`, mirroring
+    `causal.agents.data_science.DataScienceAgent._lookup_candidates`'s own
+    condition/drug/(everything else) split -- the same rule, kept in one
+    place, now shared by the analysis-plan phenotype/covariate lookups
+    (via `DataScienceAgent`) and this app's live concept-mapping search."""
+    if domain == "condition":
+        return client.lookup_condition(term)
+    if domain == "drug":
+        return client.lookup_drug(term)
+    return client.lookup_concept(term, domain)
+
+
+def _parse_concept_rows(text: str, expected_domain: str) -> list[dict[str, Any]]:
+    """Parse an OMCP `Lookup_*`/`Get_Concepts_By_Id` CSV response into
+    reviewable rows, dropping anything that doesn't parse as a concept_id or
+    whose `domain_id` doesn't match `expected_domain` -- the same
+    defense-in-depth filter `DataScienceAgent._parse_concept_candidates`
+    applies, since the server already filters by domain and this is a
+    belt-and-suspenders check, not the primary guarantee."""
+    rows = []
+    for row in csv.DictReader(io.StringIO(text)):
+        try:
+            concept_id = int(row.get("concept_id", ""))
+        except (TypeError, ValueError):
+            continue
+        domain_id = str(row.get("domain_id", "")).strip()
+        if domain_id.lower() != expected_domain:
+            continue
+        rows.append({
+            "concept_id": concept_id,
+            "concept_name": str(row.get("concept_name", "")).strip(),
+            "vocabulary_id": str(row.get("vocabulary_id", "")).strip(),
+            "domain_id": domain_id,
+        })
+    return rows
+
+
+def _render_omcp_concept_search(*, state_key: str, domain: str, default_term: str) -> list[dict[str, Any]]:
+    """Search box + button driving one live OMCP concept lookup, with results
+    cached in `st.session_state[state_key]` so the multiselect/save step a
+    caller renders right after this (a separate `st.form`, since a search
+    button can't itself live inside the save form) sees the same result set
+    across the rerun that submitting it triggers. `state_key` should embed
+    the currently selected domain so switching domains hides stale results
+    from the previous one instead of showing a mismatched list.
+    """
+    term = st.text_input("Search term", value=default_term, key=f"{state_key}_term")
+    if st.button("Search OMCP", key=f"{state_key}_btn"):
+        try:
+            datasets = BigQueryDatasets.from_env()
+            client = OMCPClient(project=datasets.project, dataset=datasets.omop)
+            with st.spinner(f"Searching OMCP for {term!r} (domain={domain})..."):
+                response = _omcp_lookup(client, domain, term)
+            st.session_state[state_key] = _parse_concept_rows(response.text, domain)
+        except (ValueError, RuntimeError, OSError) as exc:
+            st.session_state[state_key] = []
+            st.error(str(exc))
+    return st.session_state.get(state_key, [])
+
+
+# role (as free-text as `concept_sets[name].role` allows) -> a *starting
+# guess* for which OMOP domain a phenotype in that role usually lives in.
+# Only ever picks the selectbox's initial position -- a reviewer sees and
+# can change it before anything is written -- but it beats always defaulting
+# to `options[0]` ("condition") purely by accident of tuple order regardless
+# of role, which is silently wrong for e.g. a drug-based treatment/comparator.
+_ROLE_DOMAIN_HINTS: dict[str, str] = {
+    "population": "condition",
+    "outcome": "condition",
+    "treatment": "drug",
+    "comparator": "drug",
+    "treatment_and_comparator": "drug",
+}
+
+
+def _default_domain_index(role: str, current_domain: str, options: tuple[str, ...]) -> int:
+    if current_domain in options:
+        return options.index(current_domain)
+    guess = _ROLE_DOMAIN_HINTS.get(role, options[0])
+    return options.index(guess) if guess in options else 0
+
+
+def _render_concept_set_mapping_forms(manager: WorkflowManager, run_id: str, concept_sets: dict) -> None:
+    """One search-and-approve form per `concept_sets` entry.
+
+    This is now the only concept-mapping step for population/treatment/
+    comparator/outcome: `_load_concept_specs` (feasibility/cohort SQL
+    generation) resolves its `ConceptSetSpec`s directly from `concept_sets`
+    by role, so there is no separate `query_concept_sets` form to keep in
+    sync with this one -- previously a reviewer had to map the same clinical
+    concept twice, with nothing checking the two agreed.
+    """
+    for name, definition in concept_sets.items():
+        if not isinstance(definition, dict):
+            continue
+        role = str(definition.get("role", ""))
+        current_domain = definition.get("domain") or ""
+        # `death` (the fixed OMOP `death` table, no concept search needed)
+        # is only offered for an outcome-role entry -- mirrors
+        # `causal.orchestrator.workflow.map_concept_set`'s own role-gated
+        # domain validation.
+        domain_options = OUTCOME_DOMAINS if role == "outcome" else DAG_VARIABLE_DOMAINS
+        with st.expander(
+            f"Map '{name}' (role: {role or '—'})",
+            expanded=definition.get("status") != "approved",
+        ):
+            domain_choice = st.selectbox(
+                "OMOP domain", domain_options,
+                index=_default_domain_index(role, current_domain, domain_options),
+                key=f"concept_set_domain_{name}",
+            )
+            if not current_domain:
+                st.caption(
+                    "Domain pre-selected as a starting guess based on this concept set's role "
+                    "-- confirm it's actually correct before searching/approving."
+                )
+            existing_ids = [int(c) for c in definition.get("concept_ids", ())]
+            if domain_choice == "death":
+                st.caption("`death` uses the fixed OMOP `death` table -- no concept search needed.")
+                name_by_id: dict[int, str] = {}
+                option_ids: list[int] = []
+            else:
+                candidates = _render_omcp_concept_search(
+                    state_key=f"concept_set_candidates_{name}_{domain_choice}",
+                    domain=domain_choice,
+                    default_term=(
+                        definition.get("lookup_term") or definition.get("label") or name.replace("_", " ")
+                    ),
+                )
+                name_by_id = {c["concept_id"]: c["concept_name"] for c in candidates}
+                option_ids = list(dict.fromkeys(existing_ids + list(name_by_id)))
+            with st.form(key=f"concept_set_map_form_{name}"):
+                if domain_choice == "death":
+                    chosen_ids: list[int] = []
+                else:
+                    chosen_ids = st.multiselect(
+                        "Approve concept_id(s)", options=option_ids, default=existing_ids,
+                        format_func=lambda cid: f"{cid} — {name_by_id.get(cid, '(previously approved, not in current search)')}",
+                        key=f"concept_set_map_ids_{name}",
+                    )
+                status_choice = st.selectbox(
+                    "Status", ("approved", "no_standard_concept", "pending_omop_mapping"),
+                    key=f"concept_set_status_{name}",
+                )
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"concept_set_reviewer_{name}"
+                )
+                submitted = st.form_submit_button("Save mapping")
+                if submitted:
+                    try:
+                        with st.spinner("Saving..."):
+                            manager.map_concept_set(
+                                run_id, name, domain_choice, chosen_ids, reviewer, status=status_choice,
+                            )
+                        st.success(f"Mapping saved for '{name}'")
+                        st.rerun()
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        st.error(str(exc))
+
+
+def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
+    """Concept mapping (`concept_sets`) lives in `protocol.json`, not
+    `analysis_plan.json` -- so it's shown even before the Data Science Agent
+    has run. Each entry below is editable: `Search OMCP` runs a live lookup
+    (see `_render_omcp_concept_search`), and `Save mapping` calls
+    `WorkflowManager.map_concept_set` -- mirroring `causalomop workflow
+    concept-set-map` on the CLI, which stays available for scripted/offline
+    use.
+
+    This is the single concept-mapping step for population/treatment/
+    comparator/outcome: it also feeds cohort/feasibility SQL generation
+    (`causal.orchestrator.workflow._load_concept_specs` resolves query
+    `ConceptSetSpec`s directly from `concept_sets`, by role). There used to
+    be a second, independent `query_concept_sets` mapping step for the same
+    role here, with nothing checking the two agreed -- removed.
     """
     protocol = _read_json(run_dir / "protocol.json")
     concept_sets = (protocol or {}).get("concept_sets") or {}
-    query_concept_sets = (protocol or {}).get("query_concept_sets") or {}
-    if not concept_sets and not query_concept_sets:
+    if not concept_sets:
         return
 
     st.subheader("Concept mapping")
     st.caption(
-        "OMOP concept sets used to operationalize this question. Mapped outside this app today "
-        "(`causalomop concepts <term>` to search the vocabulary, then a manual protocol.json "
-        "edit) — this is a read-only view of what has been mapped so far."
+        "OMOP concept sets used to operationalize this question's population/treatment/"
+        "comparator/outcome (and any other declared phenotype). Feeds both phenotype review "
+        "(the Data Science Agent) and cohort/feasibility SQL generation -- one mapping per role."
     )
 
-    if concept_sets:
-        st.markdown("**Phenotype review concept sets** (`concept_sets`, reviewed via the Data Science Agent)")
-        st.dataframe(
-            [
-                {
-                    "name": name,
-                    "role": definition.get("role", "—"),
-                    "domain": definition.get("domain") or "—",
-                    "status": definition.get("status", "—"),
-                    "concept_ids": ", ".join(str(c) for c in definition.get("concept_ids", ())) or "none yet",
-                    "label": definition.get("label", ""),
-                }
-                for name, definition in concept_sets.items()
-                if isinstance(definition, dict)
-            ],
-            width="stretch",
+    st.dataframe(
+        [
+            {
+                "name": name,
+                "role": definition.get("role", "—"),
+                "domain": definition.get("domain") or "—",
+                "status": definition.get("status", "—"),
+                "concept_ids": ", ".join(str(c) for c in definition.get("concept_ids", ())) or "none yet",
+                "label": definition.get("label", ""),
+            }
+            for name, definition in concept_sets.items()
+            if isinstance(definition, dict)
+        ],
+        width="stretch",
+    )
+    _render_concept_set_mapping_forms(manager, run_id, concept_sets)
+
+
+def _render_regenerate_plan_section(manager: WorkflowManager, run_id: str) -> None:
+    """Run the Data Science Agent from the app (mirrors `workflow plan
+    [--with-mcp]` on the CLI) so a reviewer can pick up covariate-review
+    changes (role, domain, concept mapping, aggregation, window) into a fresh
+    `analysis_plan.json` without leaving the app. Regenerating itself never
+    needs OMCP -- every field it derives comes from `hypothesis.json`/
+    `protocol.json` -- so refreshing OMOP concept *candidates* (a slower,
+    one-lookup-per-still-unmapped-phenotype-or-covariate discovery aid, not a
+    correctness gate like the concept-mapping domain check above) stays an
+    explicit opt-in here, unlike that check.
+    """
+    with st.form(key="regenerate_analysis_plan_form"):
+        refresh_candidates = st.checkbox(
+            "Also refresh OMOP concept candidates via OMCP (slower -- one lookup per "
+            "phenotype/covariate still pending a mapping)",
+            key="regenerate_plan_with_mcp",
         )
-
-    if query_concept_sets:
-        st.markdown("**Query-generation concept sets** (`query_concept_sets`, used to build cohort/feasibility SQL)")
-        st.dataframe(
-            [
-                {
-                    "role": role,
-                    "domain": definition.get("domain") or "—",
-                    "concept_ids": ", ".join(str(c) for c in definition.get("concept_ids", ())) or "none yet",
-                }
-                for role, definition in query_concept_sets.items()
-                if isinstance(definition, dict)
-            ],
-            width="stretch",
-        )
-        if any(not d.get("concept_ids") for d in query_concept_sets.values() if isinstance(d, dict)):
-            st.warning(
-                "One or more roles have no concept_ids yet — cohort/feasibility SQL generation "
-                "will fail until these are filled in."
-            )
+        regenerate = st.form_submit_button("Regenerate analysis plan")
+    if not regenerate:
+        return
+    try:
+        lookup = None
+        if refresh_candidates:
+            datasets = BigQueryDatasets.from_env()
+            lookup = OMCPClient(project=datasets.project, dataset=datasets.omop)
+        with st.spinner("Running the Data Science Agent..."):
+            manager.run_data_science_agent(run_id, lookup)
+        st.success("Analysis plan regenerated.")
+        st.rerun()
+    except (ValueError, RuntimeError, OSError) as exc:
+        st.error(str(exc))
 
 
-def _render_analysis_plan_tab(run_dir: Path) -> None:
-    _render_concept_mapping_section(run_dir)
+def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
+    _render_concept_mapping_section(manager, run_id, run_dir)
+
+    st.divider()
+    _render_regenerate_plan_section(manager, run_id)
 
     plan = _read_json(run_dir / "analysis_plan.json")
     if plan is None:
-        st.info("No analysis_plan.json for this run yet (run the Data Science Agent to generate it).")
+        st.info("No analysis_plan.json for this run yet (use the button above to generate it).")
         return
 
     st.divider()
@@ -649,6 +881,171 @@ def _render_analysis_plan_tab(run_dir: Path) -> None:
                         ],
                         width="stretch",
                     )
+
+    covariates = plan.get("covariates") or []
+    if covariates:
+        st.markdown("**Covariates** (from the reviewed causal DAG)")
+        st.dataframe(
+            [
+                {
+                    "name": c.get("name"),
+                    "causal_role": c.get("causal_role"),
+                    "adjustment_role": c.get("adjustment_role") or "—",
+                    "window_hours": f"{c.get('window_start_hours')} to {c.get('window_end_hours')}",
+                    "leakage_risk": c.get("leakage_risk"),
+                    "status": c.get("status"),
+                    "domain": c.get("domain") or "—",
+                    "mapping_status": c.get("mapping_status", "unmapped"),
+                    "concept_ids": ", ".join(str(cid) for cid in c.get("concept_ids", ())) or "—",
+                    "aggregation": c.get("aggregation", "definition_pending"),
+                }
+                for c in covariates
+            ],
+            width="stretch",
+        )
+        for c in covariates:
+            domain = c.get("domain")
+            with st.form(key=f"covariate_domain_form_{c.get('name')}"):
+                st.caption(
+                    f"OMOP domain for '{c.get('name')}' -- currently "
+                    f"{domain or 'not yet assessed'}. The DAG-drafting step proposes one from "
+                    "the literature it read, but it is only a starting guess; confirm or "
+                    "correct it before concept search/aggregation depend on it. Changing an "
+                    "already-set domain resets any concept mapping/aggregation already saved "
+                    "for this covariate."
+                )
+                domain_choice = st.selectbox(
+                    "OMOP domain", DAG_VARIABLE_DOMAINS,
+                    index=DAG_VARIABLE_DOMAINS.index(domain) if domain in DAG_VARIABLE_DOMAINS else 0,
+                    key=f"covariate_domain_choice_{c.get('name')}",
+                )
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"covariate_domain_reviewer_{c.get('name')}",
+                )
+                submitted = st.form_submit_button("Save domain")
+                if submitted:
+                    try:
+                        manager.review_covariate_domain(run_id, c.get("name"), domain_choice, reviewer)
+                        st.success(f"Domain saved for '{c.get('name')}'")
+                        st.rerun()
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
+
+            allowed_aggregations = COVARIATE_AGGREGATIONS_BY_DOMAIN.get(domain) if domain else None
+            if allowed_aggregations:
+                with st.form(key=f"covariate_aggregation_form_{c.get('name')}"):
+                    aggregation_choice = st.selectbox(
+                        f"Aggregation for '{c.get('name')}' (domain: {domain})",
+                        allowed_aggregations,
+                        key=f"covariate_aggregation_choice_{c.get('name')}",
+                    )
+                    reviewer = st.text_input(
+                        "Reviewer", value=_reviewer_default(),
+                        key=f"covariate_aggregation_reviewer_{c.get('name')}",
+                    )
+                    submitted = st.form_submit_button("Save aggregation")
+                    if submitted:
+                        try:
+                            manager.review_covariate_aggregation(
+                                run_id, c.get("name"), aggregation_choice, reviewer,
+                            )
+                            st.success(f"Aggregation saved for '{c.get('name')}'")
+                            st.rerun()
+                        except (ValueError, RuntimeError) as exc:
+                            st.error(str(exc))
+
+            with st.form(key=f"covariate_window_form_{c.get('name')}"):
+                st.caption(
+                    f"Ascertainment window for '{c.get('name')}' -- currently "
+                    f"{c.get('window_start_hours')}h to {c.get('window_end_hours')}h relative to index "
+                    "(auto-derived unless overridden below)."
+                )
+                col1, col2 = st.columns(2)
+                window_start = col1.number_input(
+                    "Window start (hours, ≤ 0)", value=int(c.get("window_start_hours") or 0),
+                    max_value=0, step=1, key=f"covariate_window_start_{c.get('name')}",
+                )
+                window_end = col2.number_input(
+                    "Window end (hours, ≤ 0)", value=int(c.get("window_end_hours") or 0),
+                    max_value=0, step=1, key=f"covariate_window_end_{c.get('name')}",
+                )
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"covariate_window_reviewer_{c.get('name')}",
+                )
+                submitted = st.form_submit_button("Save window")
+                if submitted:
+                    try:
+                        manager.review_covariate_window(
+                            run_id, c.get("name"), int(window_start), int(window_end), reviewer,
+                        )
+                        st.success(f"Window saved for '{c.get('name')}'")
+                        st.rerun()
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
+
+            candidates = c.get("concept_candidates") or []
+            if candidates:
+                with st.expander(f"Candidate OMOP concepts for '{c.get('name')}' ({len(candidates)})"):
+                    st.dataframe(
+                        [
+                            {
+                                "concept_id": candidate.get("concept_id"),
+                                "concept_name": candidate.get("concept_name"),
+                                "vocabulary_id": candidate.get("vocabulary_id"),
+                                "domain_id": candidate.get("domain_id"),
+                            }
+                            for candidate in candidates
+                        ],
+                        width="stretch",
+                    )
+                    name_by_id = {
+                        candidate.get("concept_id"): candidate.get("concept_name") for candidate in candidates
+                    }
+                    with st.form(key=f"covariate_map_form_{c.get('name')}"):
+                        chosen_ids = st.multiselect(
+                            "Approve concept_id(s) for this covariate",
+                            options=list(name_by_id),
+                            format_func=lambda cid: f"{cid} — {name_by_id.get(cid, '')}",
+                            key=f"covariate_map_ids_{c.get('name')}",
+                        )
+                        mapping_status_choice = st.selectbox(
+                            "Mapping status",
+                            ("approved", "no_standard_concept"),
+                            key=f"covariate_map_status_{c.get('name')}",
+                        )
+                        reviewer = st.text_input(
+                            "Reviewer", value=_reviewer_default(), key=f"covariate_map_reviewer_{c.get('name')}"
+                        )
+                        submitted = st.form_submit_button("Save concept mapping")
+                        if submitted:
+                            try:
+                                # Only "approved" mappings need OMCP's domain check
+                                # (see `WorkflowManager.map_covariate_concepts`) --
+                                # skip building a client for "no_standard_concept"
+                                # so a submodule/credentials issue can't block that
+                                # (already OMCP-free) reviewer decision.
+                                concept_lookup = None
+                                if mapping_status_choice == "approved":
+                                    datasets = BigQueryDatasets.from_env()
+                                    concept_lookup = OMCPClient(
+                                        project=datasets.project, dataset=datasets.omop
+                                    )
+                                with st.spinner("Verifying concept domain via OMCP..."):
+                                    manager.map_covariate_concepts(
+                                        run_id, c.get("name"), chosen_ids, reviewer,
+                                        mapping_status=mapping_status_choice,
+                                        concept_lookup=concept_lookup,
+                                    )
+                                st.success(f"Concept mapping saved for '{c.get('name')}'")
+                                st.rerun()
+                            except (ValueError, RuntimeError, OSError) as exc:
+                                st.error(str(exc))
+
+    excluded_from_adjustment = plan.get("excluded_from_adjustment") or []
+    if excluded_from_adjustment:
+        with st.expander(f"Excluded from adjustment ({len(excluded_from_adjustment)})"):
+            for entry in excluded_from_adjustment:
+                st.markdown(f"- {entry}")
 
     checks = plan.get("feasibility_checks") or []
     if checks:
@@ -888,7 +1285,7 @@ def main() -> None:
     with tabs[1]:
         _render_hypothesis_tab(manager, run_id, run_dir)
     with tabs[2]:
-        _render_analysis_plan_tab(run_dir)
+        _render_analysis_plan_tab(manager, run_id, run_dir)
     with tabs[3]:
         _render_feasibility_tab(run_dir)
     with tabs[4]:

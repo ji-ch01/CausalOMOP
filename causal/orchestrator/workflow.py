@@ -10,20 +10,36 @@ import re
 import shutil
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from causal.orchestrator.state import ApprovalGate, NEXT_PHASE, RunState
 from causal.agents import DataScienceAgent, ExecutionAgent, HypothesisAgent, QueryValidationAgent
-from causal.agents.dag_identification import assess_identification
-from causal.agents.hypothesis import DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
+from causal.agents.dag_identification import assess_identification, review_dag
+from causal.agents.hypothesis import DAG_VARIABLE_DOMAINS, DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
 from causal.agents.user_question import GeneratedHypothesis
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
 from causal.data_builder import AnalyticCohortBuilder
+from causal.mapping.registry import (
+    OMOPVariableRegistry,
+    build_extraction_plan,
+    extraction_plan_to_covariate_spec,
+    is_sql_executable,
+    variable_from_covariate_plan,
+)
 from causal.mcp_client import OMCPClient
-from causal.queries import EXPOSURE_CONTRASTS, ConceptSetSpec, feasibility_sql
+from causal.queries import (
+    COVARIATE_AGGREGATIONS_BY_DOMAIN,
+    DOMAIN_TABLES,
+    EXPOSURE_CONTRASTS,
+    OUTCOME_DOMAINS,
+    ConceptSetSpec,
+    CovariateSpec,
+    feasibility_sql,
+)
 
 
 QUERY_ROLES = ("population", "treatment", "comparator", "outcome")
@@ -122,30 +138,97 @@ def _make_run_id(study_id: str) -> str:
     return f"{timestamp}_{study_id}-{uuid.uuid4().hex[:8]}"
 
 
-def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
-    """Read the human-approved, per-question concept sets a cohort/feasibility
-    query is built from -- population/treatment/comparator/outcome, each with
-    an OMOP domain and its approved concept_ids. Distinct from `concept_sets`
-    (used by the Data Science Agent's phenotype review), because a query's
-    domain/role wiring is a query-generation concern, not a review concern.
+# treatment/comparator each have exactly one fallback role: `treatment_and_
+# comparator`, a single shared-backbone phenotype used by both arms of an
+# `add_on` design (e.g. "crystalloids" in
+# `studies/albumin_sepsis_28d/protocol.json`, the comparator/backbone
+# `crystalloids` alone, `crystalloids` plus `albumin` the treatment).
+# population/outcome have no fallback role.
+_ROLE_FALLBACK_ROLES: dict[str, tuple[str, ...]] = {
+    "treatment": ("treatment_and_comparator",),
+    "comparator": ("treatment_and_comparator",),
+}
+
+
+def _resolve_concept_spec(
+    by_role: dict[str, list[dict]], role: str, *fallback_roles: str
+) -> ConceptSetSpec | None:
+    """Resolve one query role's `ConceptSetSpec` from `concept_sets`, by role.
+
+    Tries `role` first, then each of `fallback_roles` in order (see
+    `_ROLE_FALLBACK_ROLES`). Returns `None` only when *no* `concept_sets`
+    entry declares any of these roles at all -- the caller decides what that
+    means (a hard requirement for population/treatment/comparator, a
+    `death`-table default for outcome). An entry that *does* declare the
+    role but is not yet approved raises immediately instead of falling
+    through to a fallback role or a default -- that would silently bypass
+    the approval gate rather than genuinely finding no entry.
     """
-    raw = protocol.get("query_concept_sets")
-    if not isinstance(raw, dict):
+    for candidate_role in (role, *fallback_roles):
+        entries = by_role.get(candidate_role, [])
+        if len(entries) > 1:
+            raise RuntimeError(
+                f"concept_sets has more than one entry declaring role '{candidate_role}' -- "
+                "a query needs exactly one"
+            )
+        if len(entries) == 1:
+            entry = entries[0]
+            domain = entry.get("domain")
+            if entry.get("status") != "approved" or not isinstance(domain, str) or not domain:
+                raise RuntimeError(
+                    f"concept_sets role '{candidate_role}' must be approved with a domain "
+                    "before a query can be generated for it"
+                )
+            concept_ids = tuple(int(value) for value in entry.get("concept_ids", ()))
+            return ConceptSetSpec(domain=domain, concept_ids=concept_ids)
+    return None
+
+
+def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
+    """Resolve the human-approved, per-question concept sets a cohort/
+    feasibility query is built from -- population/treatment/comparator/
+    outcome -- directly from `concept_sets`, by role (see
+    `_resolve_concept_spec`).
+
+    Previously read from a separate `query_concept_sets` store that a
+    reviewer had to map independently from `concept_sets`, with nothing
+    checking the two agreed -- a real divergence risk (the phenotype shown
+    as "approved" in the review-only plan could differ from what a query
+    actually selects) as well as duplicate review work for the same
+    concept. Unified so there is exactly one place a concept gets approved
+    for a role, read by every SQL generator (`feasibility_sql`,
+    `AnalyticCohortBuilder.build`, `profile_sql`, `followup_audit_sql`) and
+    by `DataScienceAgent`'s phenotype-review plan alike.
+    """
+    concept_sets = protocol.get("concept_sets")
+    if not isinstance(concept_sets, dict):
         raise RuntimeError(
-            "Protocol requires query_concept_sets (population/treatment/comparator/outcome), "
-            "each with an approved domain and concept_ids, before a cohort or feasibility "
+            "Protocol requires concept_sets (population/treatment/comparator/outcome, "
+            "each approved with a domain and concept_ids) before a cohort or feasibility "
             "query can be generated for this question"
         )
+    by_role: dict[str, list[dict]] = defaultdict(list)
+    for definition in concept_sets.values():
+        if isinstance(definition, dict) and isinstance(definition.get("role"), str):
+            by_role[definition["role"]].append(definition)
+
     specs: dict[str, ConceptSetSpec] = {}
     for role in QUERY_ROLES:
-        definition = raw.get(role)
-        if not isinstance(definition, dict):
-            raise RuntimeError(f"query_concept_sets is missing role '{role}'")
-        domain = definition.get("domain")
-        if not isinstance(domain, str) or not domain:
-            raise RuntimeError(f"query_concept_sets['{role}'] requires a domain")
-        concept_ids = tuple(int(value) for value in definition.get("concept_ids", ()))
-        specs[role] = ConceptSetSpec(domain=domain, concept_ids=concept_ids)
+        fallback_roles = _ROLE_FALLBACK_ROLES.get(role, ())
+        spec = _resolve_concept_spec(by_role, role, *fallback_roles)
+        if spec is None:
+            if role == "outcome":
+                # No role="outcome" concept set declared at all: the same
+                # "all-cause death via the standard OMOP `death` table"
+                # default `DataScienceAgent.run` falls back to when it finds
+                # no phenotype declaring role="outcome" either -- kept in
+                # sync so both readers of `concept_sets` agree on what an
+                # omitted outcome role means.
+                spec = ConceptSetSpec(domain="death", concept_ids=())
+            else:
+                wanted = f"role {role!r}" + (f" or {fallback_roles[0]!r}" if fallback_roles else "")
+                raise RuntimeError(f"concept_sets requires an approved entry with {wanted}")
+        specs[role] = spec
     return specs
 
 
@@ -173,6 +256,135 @@ def _load_exposure_contrast(protocol: dict) -> str:
     if value not in EXPOSURE_CONTRASTS:
         raise RuntimeError(f"query_settings.exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
     return value
+
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify_covariate_name(name: str) -> str:
+    slug = _SLUG_RE.sub("_", name.strip().lower()).strip("_")
+    return f"cov_{slug}" if slug else "cov_"
+
+
+def _load_covariate_specs(analysis_plan: dict) -> tuple[CovariateSpec, ...]:
+    """Ready, non-demographic covariates (see `causal.agents.data_science.
+    CovariatePlan.status`) turned into `CovariateSpec`s for
+    `AnalyticCohortBuilder.build()`, via `causal.mapping.registry` (see
+    `docs/causal_roadmap.md` migration step 4).
+
+    `status == "ready"` (computed by `DataScienceAgent._covariate` -- mapping
+    approved, aggregation and window reviewed, domain known) stays the
+    authoritative human-facing gate, exactly as before: a reviewer can still
+    force a covariate back out of the cohort SQL by resetting `status`
+    without touching its underlying mapping/aggregation/window fields, and
+    that override must be respected here, not silently re-derived away.
+    What changes is *how* a "ready" entry becomes a `CovariateSpec`: it is
+    parsed into an `OMOPVariableDefinition` (`variable_from_covariate_plan`)
+    and resolved via `build_extraction_plan`/`extraction_plan_to_covariate_spec`
+    -- the same conversion path `causal.mapping.registry` uses everywhere
+    else -- instead of this function building the dataclass directly from
+    raw dict fields a second time. A covariate's human-entered `name` is
+    slugified into a SQL column identifier here; `AnalyticCohortBuilder`
+    still re-validates uniqueness/safety as a defense-in-depth check at the
+    actual SQL-generation boundary (see `causal.queries.feasibility.
+    _covariate_ctes_columns_and_joins`). Demographic covariates never reach
+    here -- they keep `domain == ""` and are excluded by the `domain` check.
+    """
+    specs: list[CovariateSpec] = []
+    seen_columns: set[str] = set()
+    for item in analysis_plan.get("covariates", ()):
+        if not isinstance(item, dict) or item.get("status") != "ready" or not item.get("domain"):
+            continue
+        variable = variable_from_covariate_plan(item)
+        column_name = _slugify_covariate_name(variable.dag_node_label)
+        if column_name in seen_columns:
+            raise RuntimeError(
+                f"Covariate '{variable.dag_node_label}' produces a duplicate SQL column name "
+                f"'{column_name}' -- rename one of the colliding covariates"
+            )
+        seen_columns.add(column_name)
+        plan = build_extraction_plan(variable)
+        specs.append(extraction_plan_to_covariate_spec(variable, plan, column_name))
+    return tuple(specs)
+
+
+def _carry_forward_concept_candidates(
+    artifact: dict[str, Any], previous_plan_path: Path
+) -> tuple[dict[str, Any], bool]:
+    """When `run_data_science_agent` runs without a live `concept_lookup`
+    (no `--with-mcp`), the freshly rebuilt analysis plan has no
+    `concept_candidates` at all -- `DataScienceAgent` never attempted a
+    lookup. Without this, re-running `workflow plan` after having once run
+    it `--with-mcp` would silently discard the candidate list a reviewer may
+    still be working from. This only ever fills in a phenotype/covariate
+    that has *no* candidates in the fresh artifact (i.e. no lookup was
+    attempted this run) by name-matching the last plan that did have them;
+    it never overwrites a genuine empty result from an actual live lookup,
+    since this function is only called when `concept_lookup is None`. The
+    approved mapping itself (`concept_ids`/`mapping_status` in
+    `candidate_dag`) never depended on this file and is unaffected either
+    way.
+    """
+    if not previous_plan_path.is_file():
+        return artifact, False
+    try:
+        previous = json.loads(previous_plan_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return artifact, False
+
+    carried_any = False
+
+    def _carried(items: list[Any], previous_items: list[Any]) -> list[Any]:
+        nonlocal carried_any
+        previous_by_name = {
+            item.get("name"): item.get("concept_candidates") or []
+            for item in previous_items if isinstance(item, dict)
+        }
+        result = []
+        for item in items:
+            candidates = previous_by_name.get(item.get("name")) if isinstance(item, dict) else None
+            if isinstance(item, dict) and not item.get("concept_candidates") and candidates:
+                item = {**item, "concept_candidates": candidates}
+                carried_any = True
+            result.append(item)
+        return result
+
+    artifact = dict(artifact)
+    artifact["phenotypes"] = _carried(list(artifact.get("phenotypes", ())), list(previous.get("phenotypes", ())))
+    artifact["covariates"] = _carried(list(artifact.get("covariates", ())), list(previous.get("covariates", ())))
+    return artifact, carried_any
+
+
+def _mismatched_concept_domains(
+    csv_text: str, concept_ids: list[int], expected_domain: str
+) -> list[str]:
+    """Parse a `Get_Concepts_By_Id` CSV response and return one
+    human-readable note per concept_id that either wasn't found at all, or
+    whose real OMOP `domain_id` doesn't match `expected_domain` -- e.g. a
+    Drug-domain concept_id approved for a covariate declared
+    domain="measurement". Every domain in `causal.agents.hypothesis.
+    DAG_VARIABLE_DOMAINS` capitalizes exactly to its OMOP `domain_id`
+    (condition->Condition, drug->Drug, ...), so no separate mapping table is
+    needed here.
+    """
+    expected_domain_id = expected_domain.capitalize()
+    found: dict[int, str] = {}
+    for row in csv.DictReader(io.StringIO(csv_text)):
+        try:
+            found[int(row["concept_id"])] = row["domain_id"]
+        except (KeyError, ValueError, TypeError):
+            continue
+    mismatches = []
+    for concept_id in concept_ids:
+        actual_domain_id = found.get(concept_id)
+        if actual_domain_id is None:
+            mismatches.append(f"{concept_id}: not found in the concept table")
+        elif actual_domain_id != expected_domain_id:
+            mismatches.append(
+                f"{concept_id}: domain_id='{actual_domain_id}', expected '{expected_domain_id}' "
+                f"for declared domain '{expected_domain}'"
+            )
+    return mismatches
 
 
 class WorkflowManager:
@@ -326,6 +538,120 @@ class WorkflowManager:
         self.save(state)
         return state
 
+    def map_concept_set(
+        self,
+        run_id: str,
+        name: str,
+        domain: str,
+        concept_ids: list[int],
+        reviewer: str,
+        status: str = "approved",
+        comment: str | None = None,
+        concept_lookup: OMCPClient | None = None,
+    ) -> RunState:
+        """Record a human's OMOP domain + concept(s) for a protocol-declared
+        `concept_sets[name]` phenotype (population/treatment/comparator/
+        outcome/... -- see `causal.agents.data_science.DataScienceAgent.
+        _phenotype_from_concept_set`).
+
+        This is the single place a concept gets approved for a role: the
+        same `concept_sets` entry a reviewer maps here is what
+        `_load_concept_specs` resolves query-generation `ConceptSetSpec`s
+        from (see its docstring) -- there used to be a second, independent
+        `query_concept_sets` mapping step for the same role with nothing
+        checking the two agreed; that duplication is gone.
+
+        Distinct from `map_covariate_concepts` (the equivalent for baseline
+        covariates in `candidate_dag`): a `concept_sets` entry lives
+        directly on `protocol.json`, keyed by an arbitrary clinical name
+        rather than a fixed role (a study can declare more than one concept
+        set per role, e.g. `treatment_and_comparator`), and its `status`
+        also drives `HypothesisArtifact.unresolved_issues`/`executable`
+        (see `HypothesisAgent._unresolved_concept_sets`), so
+        `hypothesis.json` is regenerated here too, same as `review_covariate`.
+
+        Only `domain`/`concept_ids`/`status` are written here; `role`,
+        `source_value_rule`, and `lookup_term` (protocol-author-set) are left
+        untouched. `concept_lookup` is the same optional, opt-in domain
+        cross-check as `map_covariate_concepts` -- see its docstring.
+
+        `domain='death'` is only valid for an entry whose declared `role` is
+        `'outcome'` (see `OUTCOME_DOMAINS`) and needs no `concept_ids` -- the
+        fixed OMOP `death` table, not a concept domain like the rest.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("name is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("status is required")
+        status = status.strip()
+        try:
+            concept_ids = [int(concept_id) for concept_id in concept_ids]
+        except (TypeError, ValueError):
+            raise ValueError("concept_ids must be a list of integers")
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before mapping concept sets")
+
+        # Read-only peek at the entry's declared role, deliberately outside
+        # `_RunLock` (same rationale as `map_covariate_concepts`'s
+        # `declared_domain` peek): only an entry whose role is "outcome" may
+        # use `domain='death'`, everything else must resolve to a real
+        # concept domain.
+        existing_entry = json.loads(protocol_path.read_text(encoding="utf-8")).get(
+            "concept_sets", {}
+        ).get(name)
+        role = existing_entry.get("role") if isinstance(existing_entry, dict) else None
+        allowed_domains = OUTCOME_DOMAINS if role == "outcome" else tuple(DOMAIN_TABLES)
+        if domain not in allowed_domains:
+            raise ValueError(f"domain for role {role!r} must be one of {allowed_domains}")
+        if status == "approved" and domain != "death" and not concept_ids:
+            raise ValueError("status='approved' requires at least one concept_id unless domain='death'")
+
+        if concept_lookup is not None and concept_ids:
+            response = concept_lookup.get_concepts_by_id(concept_ids)
+            mismatches = _mismatched_concept_domains(response.text, concept_ids, domain)
+            if mismatches:
+                raise ValueError(
+                    f"Concept domain check failed for concept_sets['{name}']: " + "; ".join(mismatches)
+                )
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            concept_sets = protocol.get("concept_sets", {})
+            entry = concept_sets.get(name)
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"concept_sets has no entry named '{name}'")
+            before = {
+                "domain": entry.get("domain", ""),
+                "concept_ids": entry.get("concept_ids", []),
+                "status": entry.get("status", "missing"),
+            }
+            updated_entry = {**entry, "domain": domain, "concept_ids": concept_ids, "status": status}
+            protocol["concept_sets"] = {**concept_sets, name: updated_entry}
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            self._write_hypothesis(run_id, protocol)
+        detail = f"{name}: domain={domain}, {len(concept_ids)} concept(s), status={status} by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "concept_set_mapped", detail,
+            changes={
+                "before": before,
+                "after": {"domain": domain, "concept_ids": concept_ids, "status": status},
+            },
+        )
+        self.save(state)
+        return state
+
     def review_covariate(
         self,
         run_id: str,
@@ -339,6 +665,7 @@ class WorkflowManager:
         pmid: str = "",
         observed: bool = True,
         certainty: str = "established",
+        domain: str | None = None,
     ) -> RunState:
         """Record a human accept/reject decision for a pending first-pass covariate.
 
@@ -347,6 +674,26 @@ class WorkflowManager:
         audited exclusion instead of leaving the covariate silently absent.
         Either way, `hypothesis.json` is regenerated so the decision is
         immediately reflected in `assess_identification`.
+
+        `domain` is optional, unlike `role`/`temporal_classification`: a
+        covariate can be fully DAG-reviewed before its OMOP domain is known,
+        and today's callers overwhelmingly never set it. When given, it lets
+        `DataScienceAgent` attach reviewable OMOP concept candidates to the
+        resulting covariate (see `causal.agents.hypothesis.DAGVariable.domain`).
+
+        Re-accepting an already-accepted label (reconsidering its role/
+        temporal_classification/rationale) preserves whatever `concept_ids`/
+        `mapping_status`/`aggregation`/`window_start_hours`/`window_end_hours`
+        a prior `map_covariate_concepts`/`review_covariate_aggregation`/
+        `review_covariate_window` call already recorded for it -- those are
+        separate review actions (see their own docstrings) and this method
+        must not silently discard that work just because it only received
+        role/temporal_classification/rationale again. The one exception is
+        `domain` actually changing to a different, non-empty value: mapping
+        and aggregation are domain-specific (concept_ids were validated
+        against the old domain; aggregation choices come from
+        `COVARIATE_AGGREGATIONS_BY_DOMAIN`), so a real domain change resets
+        them rather than carrying over values that no longer make sense.
         """
         if decision not in {"accept", "reject"}:
             raise ValueError("decision must be accept or reject")
@@ -361,47 +708,416 @@ class WorkflowManager:
         protocol_path = run_dir / "protocol.json"
         if not (run_dir / "hypothesis.json").is_file():
             raise RuntimeError("Run the Hypothesis Agent before reviewing covariates")
-        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
 
-        candidate_dag = [item for item in protocol.get("candidate_dag", ()) if item.get("label") != label]
-        rejected_covariates = [
-            item for item in protocol.get("rejected_covariates", ()) if item.get("label") != label
-        ]
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
 
-        if decision == "accept":
-            if role not in DAG_VARIABLE_ROLES:
-                raise ValueError(f"role must be one of {DAG_VARIABLE_ROLES}")
-            if temporal_classification not in DAG_VARIABLE_TEMPORAL_CLASSES:
-                raise ValueError(
-                    f"temporal_classification must be one of {DAG_VARIABLE_TEMPORAL_CLASSES}"
+            previous_entry = next(
+                (item for item in protocol.get("candidate_dag", ()) if item.get("label") == label), None
+            )
+            candidate_dag = [item for item in protocol.get("candidate_dag", ()) if item.get("label") != label]
+            rejected_covariates = [
+                item for item in protocol.get("rejected_covariates", ()) if item.get("label") != label
+            ]
+
+            if decision == "accept":
+                if role not in DAG_VARIABLE_ROLES:
+                    raise ValueError(f"role must be one of {DAG_VARIABLE_ROLES}")
+                if temporal_classification not in DAG_VARIABLE_TEMPORAL_CLASSES:
+                    raise ValueError(
+                        f"temporal_classification must be one of {DAG_VARIABLE_TEMPORAL_CLASSES}"
+                    )
+                if domain is not None and domain not in DAG_VARIABLE_DOMAINS:
+                    raise ValueError(f"domain must be one of {DAG_VARIABLE_DOMAINS}")
+                if not comment or not comment.strip():
+                    raise ValueError("comment is required as the rationale when accepting a covariate")
+                previous_domain = (previous_entry or {}).get("domain") or ""
+                resolved_domain = domain if domain is not None else previous_domain
+                domain_changed = bool(previous_domain) and resolved_domain != previous_domain
+                new_entry = {
+                    "label": label,
+                    "role": role,
+                    "temporal_classification": temporal_classification,
+                    "rationale": comment.strip(),
+                    "pmid": pmid,
+                    "observed": observed,
+                    "certainty": certainty,
+                    "domain": resolved_domain,
+                }
+                if previous_entry and not domain_changed:
+                    for field in (
+                        "concept_ids", "mapping_status", "aggregation",
+                        "window_start_hours", "window_end_hours",
+                    ):
+                        if field in previous_entry:
+                            new_entry[field] = previous_entry[field]
+                candidate_dag.append(new_entry)
+            else:
+                new_entry = {
+                    "label": label,
+                    "reviewer": reviewer.strip(),
+                    "comment": (comment or "").strip(),
+                    "decided_at": datetime.now(timezone.utc).isoformat(),
+                }
+                rejected_covariates.append(new_entry)
+
+            protocol["candidate_dag"] = candidate_dag
+            protocol["rejected_covariates"] = rejected_covariates
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            self._write_hypothesis(run_id, protocol)
+        state.record(
+            "covariate_reviewed", f"{label}={decision} by {reviewer}",
+            changes={"before": previous_entry, "after": new_entry},
+        )
+        self.save(state)
+        return state
+
+    def review_covariate_domain(
+        self,
+        run_id: str,
+        label: str,
+        domain: str,
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's confirmation or correction of an already-classified
+        covariate's OMOP domain.
+
+        The DAG-drafting LLM (`causal/prompts/dag.md`) now proposes a
+        `domain` alongside `role`/`temporal_classification`, but that
+        proposal is exactly as provisional as the rest of the draft --
+        `DataScienceAgent` only attempts a concept lookup once a domain is
+        set (see `causal.agents.hypothesis.DAGVariable.domain`), so this is
+        the general path to set or fix it for *any* already-accepted
+        covariate, not only the ones a human classified from scratch via
+        `review_covariate` (which also accepts a `domain`, but only at
+        accept time). Distinct from `review_covariate` on purpose, same
+        family as `review_covariate_aggregation`/`review_covariate_window`:
+        it does not require re-supplying role/temporal_classification/
+        rationale just to confirm or fix a domain.
+
+        Changing `domain` to a value different from what was previously set
+        invalidates whatever `concept_ids`/`mapping_status`/`aggregation` a
+        prior `map_covariate_concepts`/`review_covariate_aggregation` call
+        recorded (they were validated against the old domain) -- reset to
+        their unset defaults rather than carrying over values that no
+        longer make sense. `window_start_hours`/`window_end_hours` are left
+        untouched: the ascertainment window is derived from
+        `temporal_classification`, not `domain`.
+        """
+        label = label.strip()
+        if not label:
+            raise ValueError("label is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if domain not in DAG_VARIABLE_DOMAINS:
+            raise ValueError(f"domain must be one of {DAG_VARIABLE_DOMAINS}")
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before reviewing a covariate domain")
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+
+            candidate_dag = protocol.get("candidate_dag", ())
+            entry = next((item for item in candidate_dag if item.get("label") == label), None)
+            if entry is None:
+                raise RuntimeError(
+                    f"'{label}' has no candidate_dag entry yet -- accept it via review_covariate first"
                 )
-            if not comment or not comment.strip():
-                raise ValueError("comment is required as the rationale when accepting a covariate")
-            candidate_dag.append({
-                "label": label,
-                "role": role,
-                "temporal_classification": temporal_classification,
-                "rationale": comment.strip(),
-                "pmid": pmid,
-                "observed": observed,
-                "certainty": certainty,
-            })
-        else:
-            rejected_covariates.append({
-                "label": label,
-                "reviewer": reviewer.strip(),
-                "comment": (comment or "").strip(),
-                "decided_at": datetime.now(timezone.utc).isoformat(),
-            })
+            previous_domain = entry.get("domain") or ""
+            updated_entry = {**entry, "domain": domain}
+            if previous_domain and previous_domain != domain:
+                updated_entry["concept_ids"] = []
+                updated_entry["mapping_status"] = "unmapped"
+                updated_entry["aggregation"] = "definition_pending"
+            protocol["candidate_dag"] = [
+                updated_entry if item.get("label") == label else item for item in candidate_dag
+            ]
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
 
-        protocol["candidate_dag"] = candidate_dag
-        protocol["rejected_covariates"] = rejected_covariates
-        temporary = protocol_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-        temporary.replace(protocol_path)
+            self._write_hypothesis(run_id, protocol)
+        detail = f"{label}: domain={domain} by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "covariate_domain_reviewed", detail,
+            changes={"before": {"domain": previous_domain}, "after": {"domain": domain}},
+        )
+        self.save(state)
+        return state
 
-        self._write_hypothesis(run_id, protocol)
-        state.record("covariate_reviewed", f"{label}={decision} by {reviewer}")
+    def map_covariate_concepts(
+        self,
+        run_id: str,
+        label: str,
+        concept_ids: list[int],
+        reviewer: str,
+        mapping_status: str = "approved",
+        comment: str | None = None,
+        concept_lookup: OMCPClient | None = None,
+    ) -> RunState:
+        """Record a human's chosen OMOP concept(s) for an already-classified covariate.
+
+        Distinct from `review_covariate` on purpose: classifying a
+        covariate's causal role (DAG review) and approving which OMOP
+        concept represents it (concept-mapping review) are different review
+        actions, often at different times, once `concept_candidates` exist
+        to review at all -- bundling them would force re-supplying
+        role/temporal_classification/rationale just to record a concept_id.
+        The `candidate_dag` entry must already exist (i.e. the covariate was
+        already accepted via `review_covariate`); every field but
+        `concept_ids`/`mapping_status` is left untouched.
+
+        `concept_lookup` (optional) verifies each approved concept_id's real
+        OMOP `domain_id` actually matches the covariate's declared `domain`
+        before writing -- a reviewer can type a concept_id directly (not
+        just pick one of the search results), so nothing else confirms it
+        belongs to the expected domain. Skipped entirely when omitted, same
+        as `run_data_science_agent`'s `concept_lookup`: this method stays
+        filesystem-only/offline-testable by default.
+        """
+        label = label.strip()
+        if not label:
+            raise ValueError("label is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if not isinstance(mapping_status, str) or not mapping_status.strip():
+            raise ValueError("mapping_status is required")
+        try:
+            concept_ids = [int(concept_id) for concept_id in concept_ids]
+        except (TypeError, ValueError):
+            raise ValueError("concept_ids must be a list of integers")
+        if mapping_status == "approved" and not concept_ids:
+            raise ValueError("mapping_status='approved' requires at least one concept_id")
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before mapping covariate concepts")
+
+        if concept_lookup is not None and mapping_status == "approved":
+            # Read-only peek at the declared domain, deliberately outside
+            # `_RunLock`: `concept_lookup.get_concepts_by_id` spawns an OMCP
+            # subprocess (can take seconds), and the lock exists to guard
+            # only the fast on-disk read-modify-write below, not a network
+            # round trip. A benign race here (the domain changing between
+            # this peek and the locked write) only makes this advisory
+            # check stale -- the actual write is still fully protected by
+            # the lock either way.
+            declared_domain = next(
+                (
+                    item.get("domain")
+                    for item in json.loads(protocol_path.read_text(encoding="utf-8")).get("candidate_dag", ())
+                    if item.get("label") == label
+                ),
+                None,
+            )
+            if declared_domain:
+                response = concept_lookup.get_concepts_by_id(concept_ids)
+                mismatches = _mismatched_concept_domains(response.text, concept_ids, declared_domain)
+                if mismatches:
+                    raise ValueError(
+                        f"Concept domain check failed for '{label}': " + "; ".join(mismatches)
+                    )
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+
+            candidate_dag = protocol.get("candidate_dag", ())
+            entry = next((item for item in candidate_dag if item.get("label") == label), None)
+            if entry is None:
+                raise RuntimeError(
+                    f"'{label}' has no candidate_dag entry yet -- accept it via review_covariate first"
+                )
+            updated_entry = {**entry, "concept_ids": concept_ids, "mapping_status": mapping_status.strip()}
+            protocol["candidate_dag"] = [
+                updated_entry if item.get("label") == label else item for item in candidate_dag
+            ]
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            self._write_hypothesis(run_id, protocol)
+        detail = f"{label}: {len(concept_ids)} concept(s), status={mapping_status} by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "covariate_concepts_mapped", detail,
+            changes={
+                "before": {
+                    "concept_ids": entry.get("concept_ids", []),
+                    "mapping_status": entry.get("mapping_status", "unmapped"),
+                },
+                "after": {"concept_ids": concept_ids, "mapping_status": mapping_status.strip()},
+            },
+        )
+        self.save(state)
+        return state
+
+    def review_covariate_aggregation(
+        self,
+        run_id: str,
+        label: str,
+        aggregation: str,
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's chosen aggregation rule for an already-mapped covariate.
+
+        Distinct from `map_covariate_concepts` on purpose, same as that
+        method is distinct from `review_covariate`: knowing which OMOP
+        concept(s) a covariate maps to answers "which rows"; this answers
+        "how to combine repeated occurrences of them into one column"
+        (see `causal.agents.hypothesis.DAGVariable.aggregation`) -- a
+        separate review action, often at a different time. The
+        `candidate_dag` entry must already exist and already have a
+        `domain` set (aggregation choices are domain-specific -- see
+        `COVARIATE_AGGREGATIONS_BY_DOMAIN`); every field but `aggregation`
+        is left untouched.
+        """
+        label = label.strip()
+        if not label:
+            raise ValueError("label is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if not isinstance(aggregation, str) or not aggregation.strip():
+            raise ValueError("aggregation is required")
+        aggregation = aggregation.strip()
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before reviewing covariate aggregation")
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+
+            candidate_dag = protocol.get("candidate_dag", ())
+            entry = next((item for item in candidate_dag if item.get("label") == label), None)
+            if entry is None:
+                raise RuntimeError(
+                    f"'{label}' has no candidate_dag entry yet -- accept it via review_covariate first"
+                )
+            domain = entry.get("domain") or ""
+            allowed = COVARIATE_AGGREGATIONS_BY_DOMAIN.get(domain)
+            if not allowed:
+                raise RuntimeError(
+                    f"'{label}' has no OMOP domain set yet -- set one via review_covariate first"
+                )
+            if aggregation not in allowed:
+                raise ValueError(f"aggregation for domain '{domain}' must be one of {allowed}")
+
+            updated_entry = {**entry, "aggregation": aggregation}
+            protocol["candidate_dag"] = [
+                updated_entry if item.get("label") == label else item for item in candidate_dag
+            ]
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            self._write_hypothesis(run_id, protocol)
+        detail = f"{label}: aggregation={aggregation} by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "covariate_aggregation_reviewed", detail,
+            changes={
+                "before": {"aggregation": entry.get("aggregation", "definition_pending")},
+                "after": {"aggregation": aggregation},
+            },
+        )
+        self.save(state)
+        return state
+
+    def review_covariate_window(
+        self,
+        run_id: str,
+        label: str,
+        window_start_hours: int,
+        window_end_hours: int,
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's override of the auto-derived ascertainment window
+        for an already-classified covariate.
+
+        By default `causal.agents.data_science.DataScienceAgent._covariate`
+        derives the window purely from `temporal_classification` (wide if
+        `pre_treatment`, a narrow `-24h..0` otherwise) -- there was no way
+        for a reviewer to correct it for a covariate that genuinely needs a
+        different window (e.g. a lab value only meaningfully defined over
+        the first 6h of an ICU stay). The `candidate_dag` entry must already
+        exist; every field but `window_start_hours`/`window_end_hours` is
+        left untouched. `window_end_hours <= 0` is enforced -- a baseline
+        covariate window cannot extend past the index event without
+        reintroducing the immortal-time bias this pipeline's grace-period
+        design already exists to avoid.
+        """
+        label = label.strip()
+        if not label:
+            raise ValueError("label is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        try:
+            window_start_hours = int(window_start_hours)
+            window_end_hours = int(window_end_hours)
+        except (TypeError, ValueError):
+            raise ValueError("window_start_hours and window_end_hours must be integers")
+        if not window_start_hours <= window_end_hours <= 0:
+            raise ValueError(
+                "window must satisfy window_start_hours <= window_end_hours <= 0"
+            )
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before reviewing a covariate window")
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+
+            candidate_dag = protocol.get("candidate_dag", ())
+            entry = next((item for item in candidate_dag if item.get("label") == label), None)
+            if entry is None:
+                raise RuntimeError(
+                    f"'{label}' has no candidate_dag entry yet -- accept it via review_covariate first"
+                )
+            updated_entry = {
+                **entry, "window_start_hours": window_start_hours, "window_end_hours": window_end_hours,
+            }
+            protocol["candidate_dag"] = [
+                updated_entry if item.get("label") == label else item for item in candidate_dag
+            ]
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            self._write_hypothesis(run_id, protocol)
+        detail = f"{label}: window={window_start_hours}h..{window_end_hours}h by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "covariate_window_reviewed", detail,
+            changes={
+                "before": {
+                    "window_start_hours": entry.get("window_start_hours"),
+                    "window_end_hours": entry.get("window_end_hours"),
+                },
+                "after": {"window_start_hours": window_start_hours, "window_end_hours": window_end_hours},
+            },
+        )
         self.save(state)
         return state
 
@@ -479,19 +1195,67 @@ class WorkflowManager:
             raise RuntimeError("Run the Hypothesis Agent first")
         hypothesis = json.loads(hypothesis_path.read_text(encoding="utf-8"))
         protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        # Rebuilt fresh from protocol, mirroring `_block_if_not_identified`,
+        # rather than trusted from hypothesis.json: by the time this phase is
+        # reachable the protocol gate is already approved, which guarantees
+        # the DAG is backdoor-identified, so this call cannot fail here.
+        adjustment = review_dag(HypothesisAgent().run(protocol)).adjustment.to_dict()
         artifact = DataScienceAgent().run(
-            hypothesis, protocol, concept_lookup=concept_lookup
+            hypothesis, protocol, concept_lookup=concept_lookup, adjustment=adjustment
         ).to_dict()
         artifact_path = run_dir / "analysis_plan.json"
+        carried_forward = False
+        if concept_lookup is None:
+            artifact, carried_forward = _carry_forward_concept_candidates(artifact, artifact_path)
         temporary = artifact_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
         temporary.replace(artifact_path)
         if "analysis_plan.json" not in state.artifacts:
             state.artifacts.append("analysis_plan.json")
-        source = "omcp_candidates" if concept_lookup is not None else "protocol_only"
+        if concept_lookup is not None:
+            source = "omcp_candidates"
+        elif carried_forward:
+            source = "carried_forward_candidates"
+        else:
+            source = "protocol_only"
         state.record(
             "agent_completed",
             f"data_science_agent->analysis_plan.json; mapping_source={source}",
+        )
+        self.save(state)
+        return state
+
+    def build_variable_registry(self, run_id: str) -> RunState:
+        """Write `registry.json` -- the versioned `causal.mapping.registry.
+        OMOPVariableRegistry` snapshot of every phenotype (`concept_sets`)
+        and DAG covariate (`candidate_dag`) declared for this run, rebuilt
+        fresh from `protocol.json` every time (same "rebuild, don't trust a
+        stale copy" convention as `_write_hypothesis`).
+
+        Only requires `protocol.json` -- unlike the analysis plan, the
+        registry does not depend on the Data Science Agent having run, since
+        it must never depend on OMOP data availability (see
+        `docs/causal_roadmap.md`): an unmapped or unobservable variable is
+        still a valid registry entry, only one `is_sql_executable(...)`
+        reports as not-yet-executable.
+        """
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not protocol_path.is_file():
+            raise RuntimeError("Run started without a protocol.json snapshot")
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        registry = OMOPVariableRegistry.from_protocol(protocol)
+        artifact_path = run_dir / "registry.json"
+        temporary = artifact_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(registry.to_dict(), indent=2), encoding="utf-8")
+        temporary.replace(artifact_path)
+        if "registry.json" not in state.artifacts:
+            state.artifacts.append("registry.json")
+        executable = sum(1 for variable in registry.variables if is_sql_executable(variable))
+        state.record(
+            "registry_built",
+            f"registry.json; {len(registry.variables)} variable(s), {executable} SQL-executable",
         )
         self.save(state)
         return state
@@ -563,9 +1327,13 @@ class WorkflowManager:
         )
         protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
         hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        # `run_execution_readiness` above already requires analysis_plan.json
+        # to exist, so it is guaranteed present here.
+        analysis_plan = json.loads((run_dir / "analysis_plan.json").read_text(encoding="utf-8"))
         specs = _load_concept_specs(protocol)
         settings = _load_query_settings(protocol)
         exposure_contrast = _load_exposure_contrast(protocol)
+        covariates = _load_covariate_specs(analysis_plan)
         sql, manifest = AnalyticCohortBuilder().build(
             state.study_id,
             datasets or BigQueryDatasets.from_env(),
@@ -577,6 +1345,7 @@ class WorkflowManager:
             follow_up_days=hypothesis["follow_up_days"],
             execution_allowed=bool(readiness["analytic_dataset_build_allowed"]),
             exposure_contrast=exposure_contrast,
+            covariates=covariates,
             **settings,
         )
         validation = QueryValidationAgent().run(sql, purpose="person_level_dataset")

@@ -44,12 +44,6 @@
       "lookup_term": "sodium chloride"
     }
   },
-  "query_concept_sets": {
-    "population": {"domain": "condition", "concept_ids": [132797]},
-    "treatment": {"domain": "drug", "concept_ids": []},
-    "comparator": {"domain": "drug", "concept_ids": []},
-    "outcome": {"domain": "death", "concept_ids": []}
-  },
   "query_settings": {
     "exposure_contrast": "add_on",
     "care_site_names": [
