@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import csv
 import io
+import os
+import re
 import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +34,82 @@ REQUIRED_GATES = {
     "analysis_plan": "analysis_plan",
     "results_review": "results",
 }
+
+# How long a stale `.review.lock` file (left behind by a crashed/killed
+# process -- this is advisory, not OS-enforced) is trusted before a new
+# acquisition attempt steals it. Every locked critical section here is a
+# handful of small JSON read/writes -- milliseconds -- so anything still
+# holding the lock this long is not a legitimate in-progress review.
+_LOCK_STALE_SECONDS = 30.0
+
+
+class _RunLock:
+    """Advisory, filesystem-based lock over one run's on-disk `protocol.json`
+    (and the `hypothesis.json` regenerated from it), so two reviewers acting
+    on the same covariate at the same time (`review_covariate`,
+    `map_covariate_concepts`, `review_covariate_aggregation` -- all
+    read-modify-write `candidate_dag`) get a clear, bounded wait or a
+    `TimeoutError` instead of the last writer silently discarding the
+    other's change. Not a database transaction, just enough to turn a silent
+    race into a loud one; `os.O_CREAT | os.O_EXCL` is atomic on both Windows
+    and POSIX, so no external dependency is needed for this.
+    """
+
+    def __init__(self, run_dir: Path, timeout_seconds: float = 10.0, poll_seconds: float = 0.05):
+        self._lock_path = run_dir / ".review.lock"
+        self._timeout_seconds = timeout_seconds
+        self._poll_seconds = poll_seconds
+
+    def __enter__(self) -> "_RunLock":
+        deadline = time.monotonic() + self._timeout_seconds
+        while True:
+            try:
+                fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return self
+            except FileExistsError:
+                self._steal_if_stale()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Could not acquire the review lock for this run within "
+                        f"{self._timeout_seconds}s -- another review is in progress"
+                    )
+                time.sleep(self._poll_seconds)
+
+    def _steal_if_stale(self) -> None:
+        try:
+            age_seconds = time.time() - self._lock_path.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if age_seconds > _LOCK_STALE_SECONDS:
+            self._lock_path.unlink(missing_ok=True)
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._lock_path.unlink(missing_ok=True)
+
+
+# Mirrors `omcp.governance.CausalExecutionContext._ID` exactly: `study_id` is
+# later embedded verbatim in both `run_id` (see `_make_run_id`, checked by
+# `WorkflowManager._state_path`) and `mcp_context.json`'s own `study_id`
+# field, which OMCP independently re-validates against that same pattern
+# before running any governed causal query. Validating it here, before any
+# run directory or file is written, turns a charset mistake into one clear
+# error at protocol-submission time instead of a `ValueError("Invalid
+# run_id")` raised mid-`start()` (after `protocol.json` was already copied
+# to an on-disk run directory with no `state.json`) or, worse, an opaque
+# "Governed causal query rejected" failure deep inside the OMCP subprocess.
+_STUDY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
+
+
+def _validate_study_id(study_id: str) -> str:
+    study_id = study_id.strip()
+    if not _STUDY_ID_RE.fullmatch(study_id):
+        raise ValueError(
+            f"Invalid study_id {study_id!r}: must start with a letter or digit and contain "
+            "only letters, digits, '_' or '-' (3-128 characters) -- required by the shared "
+            "run_id/OMCP causal-context contract"
+        )
+    return study_id
 
 
 def _make_run_id(study_id: str) -> str:
@@ -108,6 +187,7 @@ class WorkflowManager:
         study_id = protocol.get("study_id")
         if not isinstance(study_id, str) or not study_id.strip():
             raise ValueError("Protocol requires a non-empty study_id")
+        study_id = _validate_study_id(study_id)
 
         run_id = _make_run_id(study_id)
         run_dir = self.runs_dir / run_id
@@ -143,6 +223,7 @@ class WorkflowManager:
         study_id = generated.protocol.get("study_id")
         if not isinstance(study_id, str) or not study_id.strip():
             raise ValueError("Generated protocol requires a non-empty study_id")
+        study_id = _validate_study_id(study_id)
         run_id = _make_run_id(study_id)
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)

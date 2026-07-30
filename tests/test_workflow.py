@@ -1,9 +1,12 @@
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from causal.orchestrator import WorkflowManager
+from causal.orchestrator.workflow import _LOCK_STALE_SECONDS, _RunLock
 
 
 class WorkflowTests(unittest.TestCase):
@@ -21,6 +24,24 @@ class WorkflowTests(unittest.TestCase):
         state = self.manager.start(self.protocol)
         self.assertEqual(state.phase, "protocol_review")
         self.assertTrue((Path(self.temp.name) / "runs" / state.run_id / "protocol.json").is_file())
+
+    def test_start_rejects_a_study_id_with_characters_omcp_would_later_reject(self):
+        """`study_id` is embedded verbatim in `run_id` (checked by
+        `WorkflowManager._state_path`) and in `mcp_context.json` (checked by
+        `omcp.governance.CausalExecutionContext`, the same character class).
+        A charset mistake must fail loudly here, before any run directory or
+        file is written -- not mid-`start()` after `protocol.json` was
+        already copied to disk, and not deep inside an OMCP subprocess call."""
+        self.protocol.write_text(json.dumps({"study_id": "sepsis mortality"}), encoding="utf-8")
+        runs_dir = Path(self.temp.name) / "runs"
+        with self.assertRaises(ValueError):
+            self.manager.start(self.protocol)
+        self.assertEqual(list(runs_dir.iterdir()) if runs_dir.is_dir() else [], [])
+
+    def test_start_rejects_a_study_id_shorter_than_omcps_minimum(self):
+        self.protocol.write_text(json.dumps({"study_id": "ab"}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.manager.start(self.protocol)
 
     def test_gate_required_to_advance(self):
         state = self.manager.start(self.protocol)
@@ -351,6 +372,50 @@ class WorkflowIdentificationGateTests(unittest.TestCase):
         `_block_if_major_confounders_unresolved` is."""
         state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
         self.assertEqual(state.gates["protocol"].status, "approved")
+
+
+class RunLockTests(unittest.TestCase):
+    """`_RunLock` is what turns two reviewers editing the same run's
+    `protocol.json` at the same time from a silent last-write-wins race into
+    a bounded wait / clear failure (see `WorkflowMapCovariateConceptsTests`
+    and friends for the read-modify-write methods it protects)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.run_dir = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_acquire_and_release_removes_the_lock_file(self):
+        lock_path = self.run_dir / ".review.lock"
+        with _RunLock(self.run_dir):
+            self.assertTrue(lock_path.is_file())
+        self.assertFalse(lock_path.exists())
+
+    def test_second_acquire_times_out_while_held(self):
+        lock_path = self.run_dir / ".review.lock"
+        lock_path.touch()
+        with self.assertRaises(TimeoutError):
+            with _RunLock(self.run_dir, timeout_seconds=0.2, poll_seconds=0.02):
+                pass
+
+    def test_a_stale_lock_is_stolen_instead_of_blocking_forever(self):
+        """A lock file left behind by a crashed process must not permanently
+        block every future review on this run."""
+        lock_path = self.run_dir / ".review.lock"
+        lock_path.touch()
+        stale_time = time.time() - _LOCK_STALE_SECONDS - 1
+        os.utime(lock_path, (stale_time, stale_time))
+        with _RunLock(self.run_dir, timeout_seconds=1.0, poll_seconds=0.02):
+            pass  # Must not raise TimeoutError.
+
+    def test_lock_is_released_even_if_the_critical_section_raises(self):
+        lock_path = self.run_dir / ".review.lock"
+        with self.assertRaises(ValueError):
+            with _RunLock(self.run_dir):
+                raise ValueError("boom")
+        self.assertFalse(lock_path.exists())
 
 
 if __name__ == "__main__":
