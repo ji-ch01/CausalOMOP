@@ -88,6 +88,32 @@ OMOP availability must not determine the DAG. An important unobserved confounder
 stays in the causal model and becomes an identification limitation; it must not
 silently disappear because no convenient column exists.
 
+This artifact is implemented, as a first version, in `causal/mapping/registry.py`:
+`OMOPVariableDefinition` (one entry per DAG node) covers every field above plus
+the fields the initial prototype's scattered `protocol.json`/`candidate_dag`/
+`analysis_plan.json` fields never had one place for -- excluded concepts,
+optional descendant inclusion, a reviewer and review comment on the mapping
+itself, provenance, schema/vocabulary versioning, and the explicit distinction
+between a *candidate* concept and an *approved* one. `OMOPVariableRegistry.
+from_protocol` is the backward-compatible adapter (an existing `protocol.json`
+needs no schema change); `build_extraction_plan` and
+`extraction_plan_to_concept_set_spec`/`extraction_plan_to_covariate_spec`
+resolve an approved, observed entry down to the existing
+`causal.queries.feasibility` SQL builders without replacing them.
+`causal.mapping.audit` adds the aggregate-only mapping diagnostics (row/person
+counts, `concept_id = 0` rate, unmapped source values, non-standard/invalid
+concepts, observed units, descendant-expansion coverage) this section implies
+but does not itself specify.
+
+Not yet done: `causal.orchestrator.workflow._load_concept_specs` (the
+population/treatment/comparator/outcome query loader) still reads
+`protocol.json` directly rather than through the registry -- only the
+covariate loader (`_load_covariate_specs`) was rewired to consume it this
+round; there is no reviewer-facing workflow action yet to set
+`include_descendants`/`excluded_concept_ids` (`protocol.json` hand-editing
+only); and the audit queries are unit-tested on their SQL shape but not yet
+wired to run through OMCP.
+
 ## Role of LLM, literature retrieval and MCP
 
 - The LLM is a co-pilot that proposes structured artifacts and critiques known
@@ -116,7 +142,8 @@ Migration should proceed incrementally:
 3. Replace the single protocol gate with question, target-trial and
    DAG/identification review gates.
 4. Build an OMOP variable registry from approved DAG nodes rather than fixed
-   phenotype names.
+   phenotype names. **Implemented as a first version** -- see "OMOP
+   operationalization" above and `causal/mapping/registry.py`.
 5. Allow feasibility queries only after the required variables and windows are
    explicit.
 6. Add the observed-data estimand and estimator plan only after identification
