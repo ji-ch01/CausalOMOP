@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 
 GateStatus = Literal["pending", "approved", "rejected", "provisional"]
@@ -52,7 +52,7 @@ class RunState:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     gates: dict[str, ApprovalGate] = field(default_factory=dict)
-    history: list[dict[str, str]] = field(default_factory=list)
+    history: list[dict[str, Any]] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -64,7 +64,18 @@ class RunState:
         value["gates"] = {name: ApprovalGate(**gate) for name, gate in value.get("gates", {}).items()}
         return cls(**value)
 
-    def record(self, event: str, detail: str) -> None:
+    def record(self, event: str, detail: str, *, changes: dict[str, Any] | None = None) -> None:
+        """Append one audit-history entry. `detail` stays the human-readable
+        summary every event already had; `changes` (optional, `{"before":
+        ..., "after": ...}`) lets a caller also record the prior/new value
+        of whatever it mutated -- without it, `state.json` alone cannot
+        reconstruct what a review actually changed, only that something did.
+        Omitted (not stored as `None`) when a caller has nothing structured
+        to add, so events that never carried this keep their old shape.
+        """
         now = datetime.now(timezone.utc).isoformat()
         self.updated_at = now
-        self.history.append({"at": now, "event": event, "detail": detail})
+        entry: dict[str, Any] = {"at": now, "event": event, "detail": detail}
+        if changes is not None:
+            entry["changes"] = changes
+        self.history.append(entry)
