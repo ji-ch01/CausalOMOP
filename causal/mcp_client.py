@@ -65,11 +65,26 @@ class OMCPClient:
     ) -> MCPToolResponse:
         return asyncio.run(self._causal_select(query, operation, causal_context))
 
-    def lookup_drug(self, term: str) -> MCPToolResponse:
-        return asyncio.run(self._call_tool("Lookup_Drug", {"term": term}))
+    def lookup_drug(self, term: str, *, limit: int = 10, offset: int = 0) -> MCPToolResponse:
+        return asyncio.run(
+            self._call_tool("Lookup_Drug", {"term": term, "limit": limit, "offset": offset})
+        )
 
-    def lookup_condition(self, term: str) -> MCPToolResponse:
-        return asyncio.run(self._call_tool("Lookup_Condition", {"term": term}))
+    def lookup_condition(self, term: str, *, limit: int = 10, offset: int = 0) -> MCPToolResponse:
+        return asyncio.run(
+            self._call_tool("Lookup_Condition", {"term": term, "limit": limit, "offset": offset})
+        )
+
+    def lookup_concept(
+        self, term: str, domain: str, *, vocabulary_id: str | None = None, limit: int = 10, offset: int = 0
+    ) -> MCPToolResponse:
+        arguments: dict[str, Any] = {"term": term, "domain": domain, "limit": limit, "offset": offset}
+        if vocabulary_id is not None:
+            arguments["vocabulary_id"] = vocabulary_id
+        return asyncio.run(self._call_tool("Lookup_Concept", arguments))
+
+    def get_concepts_by_id(self, concept_ids: list[int]) -> MCPToolResponse:
+        return asyncio.run(self._call_tool("Get_Concepts_By_Id", {"concept_ids": concept_ids}))
 
     async def _causal_select(
         self,
