@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from causal.provenance import artifact_metadata
+from causal.queries.feasibility import COVARIATE_AGGREGATIONS_BY_DOMAIN
 from causal.roadmap import EDGE_CERTAINTY
 
 
@@ -37,6 +38,29 @@ DAG_VARIABLE_TEMPORAL_CLASSES = (
     "post_treatment",  # only arises, or is only measured, after treatment has started
 )
 
+# OMOP domain a variable's eventual concept mapping belongs to -- optional
+# here (unlike `role`/`temporal_classification`, which are always required),
+# since a variable can be fully DAG-reviewed before anyone has looked at OMOP
+# mapping at all. Mirrors `causal.agents.data_science._PHENOTYPE_DOMAIN_TABLES`'s
+# keys by convention (not import -- see that module's `adjustment` param for
+# why sibling agent modules share small vocab by duplication, not
+# cross-import). When present, it lets `DataScienceAgent` attach reviewable
+# `concept_candidates` to the resulting covariate the same way a
+# `concept_sets` phenotype already does.
+DAG_VARIABLE_DOMAINS = ("condition", "drug", "procedure", "measurement", "observation")
+
+# How to combine repeated occurrences of a covariate's mapped concept(s)
+# within its ascertainment window into one analytic-dataset column --
+# derived from `COVARIATE_AGGREGATIONS_BY_DOMAIN` (single source of truth,
+# shared with the SQL generator in `causal.queries.feasibility`) rather than
+# duplicated, since this vocabulary's meaning is inherently SQL-semantic, not
+# owned by this module the way `DAG_VARIABLE_DOMAINS` is. "definition_pending"
+# (the default, mirrors `mapping_status`'s "unmapped" sentinel) means "not
+# yet reviewed" -- not itself a valid choice to review *onto* a covariate.
+DAG_VARIABLE_AGGREGATIONS = tuple(
+    sorted({value for values in COVARIATE_AGGREGATIONS_BY_DOMAIN.values() for value in values})
+)
+
 # A causal role makes an implicit temporal claim (e.g. a confounder must precede
 # treatment to cause it). `temporal_classification` is asserted independently by
 # the classifier so this claim can be checked, not merely assumed: a variable
@@ -52,6 +76,22 @@ ROLE_ALLOWED_TEMPORAL_CLASSES: dict[str, tuple[str, ...]] = {
     "collider": ("post_treatment",),
     "selection": ("post_treatment",),
 }
+
+# How a variable/relation's citation was graded at retrieval time (see
+# `causal.literature.orchestrator`'s evidence-tier ranking for
+# systematic_review/rct/observational/unclassified). "kg_structured" marks a
+# knowledge-graph-only citation (no literature evidence hierarchy applies to
+# a structured KG fact); "uncited" marks an expert-asserted role with no
+# citation at all (`pmid == ""`). Feeds `causal.agents.dag_identification.
+# confidence_grade`, which is otherwise independent of this module.
+EVIDENCE_LEVELS = (
+    "systematic_review",
+    "rct",
+    "observational",
+    "unclassified",
+    "kg_structured",
+    "uncited",
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +123,49 @@ class DAGVariable:
     contradiction between the two (e.g. `role="confounder"` on a variable
     the classifier also calls `post_treatment`) is a structural error caught
     at validation time rather than a silent adjustment-set leak.
+
+    `evidence_level` (see `EVIDENCE_LEVELS`) records the tier of whichever
+    citation `pmid` points to at the time it was accepted (populated by
+    `causal.agents.user_question._parse_dag_response`, not by this class) so
+    `causal.agents.dag_identification.confidence_grade` can grade the edge
+    without re-deriving it from citations that may no longer be in scope.
+
+    `domain` (see `DAG_VARIABLE_DOMAINS`) is optional and independent of the
+    above: a variable can be fully classified for DAG/identification purposes
+    (`role`, `temporal_classification`) before anyone has assessed which OMOP
+    domain it maps to. `"" ` means "not yet assessed", not "no domain" --
+    `causal.agents.data_science.DataScienceAgent` only attempts a concept
+    lookup for a covariate once this is set.
+
+    `concept_ids`/`mapping_status` close that loop: once a human has reviewed
+    the candidates a concept lookup returned, `mapping_status` (free-form,
+    like `concept_sets[name].status` -- checked only via an `"approved"`
+    sentinel, never a closed enum) records the outcome and `concept_ids` the
+    chosen concept(s). `mapping_status == "approved"` with empty
+    `concept_ids` is rejected as incoherent -- a mapping review that found no
+    standard concept should use a different status (e.g.
+    `"no_standard_concept"`), not "approved" pointing at nothing.
+
+    `aggregation` (see `DAG_VARIABLE_AGGREGATIONS`) is a third, independent
+    review step: knowing the concept_id(s) answers "which rows", not "how to
+    combine repeated occurrences into one column" (e.g. max over 24h? last
+    value? presence?). It defaults to `"definition_pending"` -- not itself a
+    reviewable value -- and, once set, must be compatible with `domain` (see
+    `COVARIATE_AGGREGATIONS_BY_DOMAIN`): event domains (condition/drug/
+    procedure) only support presence/count, value domains (measurement/
+    observation) only support value aggregations. This is what lets
+    `causal.data_builder.analytic.AnalyticCohortBuilder` actually extract a
+    covariate instead of only recording that it was reviewed.
+
+    `window_start_hours`/`window_end_hours` are a fourth, independent
+    override: by default `causal.agents.data_science.DataScienceAgent.
+    _covariate` derives the ascertainment window purely from
+    `temporal_classification`, with no way for a reviewer to correct it for
+    a covariate that genuinely needs a different one. `None` (the default
+    for both) means "use the auto-derived window"; setting one requires
+    setting both (they are a pair, not two independent facts) and requires
+    `window_start_hours <= window_end_hours <= 0` -- a baseline covariate
+    cannot be defined by data occurring after the index event.
     """
 
     label: str
@@ -93,6 +176,13 @@ class DAGVariable:
     observed: bool = True
     certainty: str = "established"
     kg_evidence_id: str = ""
+    evidence_level: str = "unclassified"
+    domain: str = ""
+    concept_ids: tuple[int, ...] = ()
+    mapping_status: str = "unmapped"
+    aggregation: str = "definition_pending"
+    window_start_hours: int | None = None
+    window_end_hours: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -100,7 +190,11 @@ class DAGVariable:
 
 @dataclass(frozen=True)
 class CovariateRelation:
-    """One causal edge between two already-declared covariates (not touching exposure/outcome)."""
+    """One causal edge between two already-declared covariates (not touching exposure/outcome).
+
+    `evidence_level` mirrors `DAGVariable.evidence_level` — see that
+    docstring.
+    """
 
     source: str
     target: str
@@ -108,6 +202,7 @@ class CovariateRelation:
     pmid: str = ""
     certainty: str = "established"
     kg_evidence_id: str = ""
+    evidence_level: str = "unclassified"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -280,6 +375,13 @@ class HypothesisAgent:
             observed = item.get("observed", True)
             certainty = item.get("certainty", "established")
             kg_evidence_id = item.get("kg_evidence_id", "")
+            evidence_level = item.get("evidence_level", "unclassified")
+            domain = item.get("domain", "")
+            concept_ids = item.get("concept_ids", ())
+            mapping_status = item.get("mapping_status", "unmapped")
+            aggregation = item.get("aggregation", "definition_pending")
+            window_start_hours = item.get("window_start_hours")
+            window_end_hours = item.get("window_end_hours")
             if not isinstance(label, str) or not label.strip():
                 raise ValueError("candidate_dag entry requires a non-empty label")
             if role not in DAG_VARIABLE_ROLES:
@@ -307,6 +409,52 @@ class HypothesisAgent:
                 raise ValueError(f"candidate_dag certainty must be one of {EDGE_CERTAINTY}")
             if not isinstance(kg_evidence_id, str):
                 raise ValueError("candidate_dag kg_evidence_id must be a string")
+            if evidence_level not in EVIDENCE_LEVELS:
+                raise ValueError(f"candidate_dag evidence_level must be one of {EVIDENCE_LEVELS}")
+            if not isinstance(domain, str):
+                raise ValueError("candidate_dag domain must be a string")
+            if domain and domain not in DAG_VARIABLE_DOMAINS:
+                raise ValueError(f"candidate_dag domain must be one of {DAG_VARIABLE_DOMAINS}")
+            if not isinstance(concept_ids, (list, tuple)):
+                raise ValueError(f"candidate_dag entry '{label}' concept_ids must be a list")
+            try:
+                concept_ids = tuple(int(concept_id) for concept_id in concept_ids)
+            except (TypeError, ValueError):
+                raise ValueError(f"candidate_dag entry '{label}' concept_ids must be a list of integers")
+            if not isinstance(mapping_status, str):
+                raise ValueError("candidate_dag mapping_status must be a string")
+            if mapping_status == "approved" and not concept_ids:
+                raise ValueError(
+                    f"candidate_dag entry '{label}' cannot have mapping_status='approved' "
+                    "with no concept_ids"
+                )
+            if not isinstance(aggregation, str):
+                raise ValueError("candidate_dag aggregation must be a string")
+            if aggregation != "definition_pending" and aggregation not in DAG_VARIABLE_AGGREGATIONS:
+                raise ValueError(
+                    f"candidate_dag aggregation must be 'definition_pending' or one of "
+                    f"{DAG_VARIABLE_AGGREGATIONS}"
+                )
+            if aggregation != "definition_pending" and domain:
+                allowed_aggregations = COVARIATE_AGGREGATIONS_BY_DOMAIN.get(domain, ())
+                if aggregation not in allowed_aggregations:
+                    raise ValueError(
+                        f"candidate_dag entry '{label}' has domain '{domain}', which requires "
+                        f"aggregation to be one of {allowed_aggregations}, not '{aggregation}'"
+                    )
+            if (window_start_hours is None) != (window_end_hours is None):
+                raise ValueError(
+                    f"candidate_dag entry '{label}' must set both window_start_hours and "
+                    "window_end_hours, or neither"
+                )
+            if window_start_hours is not None:
+                if not isinstance(window_start_hours, int) or not isinstance(window_end_hours, int):
+                    raise ValueError("candidate_dag window_start_hours/window_end_hours must be integers")
+                if not window_start_hours <= window_end_hours <= 0:
+                    raise ValueError(
+                        f"candidate_dag entry '{label}' window must satisfy "
+                        "window_start_hours <= window_end_hours <= 0"
+                    )
             label = label.strip()
             if label in seen_labels:
                 raise ValueError(f"candidate_dag defines '{label}' more than once")
@@ -314,7 +462,8 @@ class HypothesisAgent:
             variables.append(
                 DAGVariable(
                     label, role, rationale.strip(), temporal_classification, pmid.strip(), observed, certainty,
-                    kg_evidence_id.strip(),
+                    kg_evidence_id.strip(), evidence_level, domain.strip(), concept_ids, mapping_status,
+                    aggregation.strip(), window_start_hours, window_end_hours,
                 )
             )
         return tuple(variables)
@@ -338,6 +487,7 @@ class HypothesisAgent:
             pmid = item.get("pmid", "")
             certainty = item.get("certainty", "established")
             kg_evidence_id = item.get("kg_evidence_id", "")
+            evidence_level = item.get("evidence_level", "unclassified")
             if not isinstance(source, str) or not source.strip():
                 raise ValueError("covariate_relations entry requires a non-empty source")
             if not isinstance(target, str) or not target.strip():
@@ -350,6 +500,8 @@ class HypothesisAgent:
                 raise ValueError(f"covariate_relations certainty must be one of {EDGE_CERTAINTY}")
             if not isinstance(kg_evidence_id, str):
                 raise ValueError("covariate_relations kg_evidence_id must be a string")
+            if evidence_level not in EVIDENCE_LEVELS:
+                raise ValueError(f"covariate_relations evidence_level must be one of {EVIDENCE_LEVELS}")
             source, target = source.strip(), target.strip()
             if source == target:
                 raise ValueError("covariate_relations entry cannot relate a variable to itself")
@@ -359,7 +511,8 @@ class HypothesisAgent:
                 raise ValueError(f"covariate_relations target '{target}' is not a declared candidate_dag label")
             relations.append(
                 CovariateRelation(
-                    source, target, rationale.strip(), pmid.strip(), certainty, kg_evidence_id.strip()
+                    source, target, rationale.strip(), pmid.strip(), certainty, kg_evidence_id.strip(),
+                    evidence_level,
                 )
             )
         return tuple(relations)

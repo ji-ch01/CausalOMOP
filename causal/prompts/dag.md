@@ -76,6 +76,21 @@ through these questions in order, using only what the cited abstract states:
      acquired organism cultured during the admission), reclassify the role
      to `mediator`, `collider`, or `selection` instead of forcing the
      `pre_treatment`/`at_treatment` label to fit.
+10. What kind of clinical fact is this variable, i.e. which OMOP domain would
+    it be recorded under? Answer only when the abstract makes this reasonably
+    clear; a wrong guess here blocks a later concept-mapping step rather than
+    silently succeeding, so leaving it blank is preferred over guessing.
+    - `condition` — a diagnosis, disorder, or clinical finding (e.g. sepsis,
+      chronic kidney disease).
+    - `drug` — a medication or other administered substance.
+    - `procedure` — an intervention or service performed (e.g. mechanical
+      ventilation, dialysis, surgery).
+    - `measurement` — a lab test, vital sign, or score with a numeric or
+      coded result (e.g. lactate, SOFA score, creatinine).
+    - `observation` — a clinical fact that is none of the above (e.g. a
+      family history, a social-history finding).
+    - Leave `domain` as an empty string if the abstract does not make the
+      variable's clinical nature clear enough to pick one of the above.
 
 ## Variables you cannot confidently classify
 
@@ -127,7 +142,8 @@ Required JSON shape:
       "pmid": "must be exactly one of the ids listed below, after the source tag",
       "rationale": "one sentence, grounded in the cited abstract, stating which question(s) above it answers",
       "observed": true,
-      "certainty": "established | plausible | contested | unknown_direction"
+      "certainty": "established | plausible | contested | unknown_direction",
+      "domain": "condition | drug | procedure | measurement | observation | \"\" if unclear"
     }
   ],
   "covariate_relations": [
@@ -173,6 +189,10 @@ Rules:
   supports marking the variable as unmeasured/latent.
 - Omit `certainty` (defaults to "established") unless one of the other three
   values applies; see "How to set `certainty`" above.
+- `domain` is a provisional guess, not a final concept-mapping decision — a
+  human still reviews and can correct it before any OMOP concept is
+  searched. Omit it or use `""` rather than guessing when the abstract does
+  not make the variable's clinical nature clear.
 - Every `candidate_dag` entry requires `temporal_classification`; it is
   validated against `role` and the two must be consistent (see question 9
   above). There is no default — omitting it is rejected, not silently

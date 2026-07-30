@@ -66,6 +66,201 @@ class HypothesisAgentTests(unittest.TestCase):
         self.assertEqual(result.candidate_dag[0].pmid, "12345678")
         self.assertTrue(result.candidate_dag[0].observed)
 
+    def test_domain_defaults_to_empty_string_when_omitted(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertEqual(result.candidate_dag[0].domain, "")
+
+    def test_accepts_a_valid_domain(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "domain": "measurement",
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertEqual(result.candidate_dag[0].domain, "measurement")
+
+    def test_rejects_an_unknown_domain(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "domain": "not_a_domain",
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
+    def test_concept_mapping_defaults_to_unmapped_with_no_ids(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertEqual(result.candidate_dag[0].mapping_status, "unmapped")
+        self.assertEqual(result.candidate_dag[0].concept_ids, ())
+
+    def test_accepts_an_approved_concept_mapping(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "domain": "measurement", "concept_ids": [4301868], "mapping_status": "approved",
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertEqual(result.candidate_dag[0].concept_ids, (4301868,))
+        self.assertEqual(result.candidate_dag[0].mapping_status, "approved")
+
+    def test_rejects_approved_mapping_with_no_concept_ids(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "mapping_status": "approved",
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
+    def test_aggregation_defaults_to_definition_pending(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertEqual(result.candidate_dag[0].aggregation, "definition_pending")
+
+    def test_accepts_an_aggregation_compatible_with_its_domain(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "domain": "measurement", "concept_ids": [4301868], "mapping_status": "approved",
+                "aggregation": "last_value_before_index",
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertEqual(result.candidate_dag[0].aggregation, "last_value_before_index")
+
+    def test_rejects_an_unknown_aggregation(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "domain": "measurement", "aggregation": "not_a_real_aggregation",
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
+    def test_rejects_an_aggregation_incompatible_with_its_domain(self):
+        """A condition covariate has no numeric value -- a value aggregation
+        like max_in_window cannot be reviewed onto it."""
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "diabetes", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "domain": "condition", "aggregation": "max_in_window",
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
+    def test_window_defaults_to_none(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertIsNone(result.candidate_dag[0].window_start_hours)
+        self.assertIsNone(result.candidate_dag[0].window_end_hours)
+
+    def test_accepts_a_valid_window_override(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "window_start_hours": -6, "window_end_hours": 0,
+            }
+        ]
+        result = HypothesisAgent().run(value)
+        self.assertEqual(result.candidate_dag[0].window_start_hours, -6)
+        self.assertEqual(result.candidate_dag[0].window_end_hours, 0)
+
+    def test_rejects_a_window_with_only_one_bound_set(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "window_start_hours": -6,
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
+    def test_rejects_a_window_extending_past_the_index_event(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "window_start_hours": -6, "window_end_hours": 6,
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
+    def test_rejects_a_window_with_start_after_end(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "window_start_hours": 0, "window_end_hours": -6,
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
+    def test_rejects_non_integer_concept_ids(self):
+        value = protocol()
+        value["candidate_dag"] = [
+            {
+                "label": "SOFA score", "role": "confounder", "pmid": "",
+                "temporal_classification": "pre_treatment", "rationale": "x",
+                "concept_ids": ["not_an_int"],
+            }
+        ]
+        with self.assertRaises(ValueError):
+            HypothesisAgent().run(value)
+
     def test_accepts_unobserved_flag(self):
         value = protocol()
         value["candidate_dag"] = [
