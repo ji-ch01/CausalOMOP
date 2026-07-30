@@ -167,5 +167,274 @@ class DataScienceAgentTests(unittest.TestCase):
             DataScienceAgent().run(hypothesis, protocol)
 
 
+class DataScienceAgentCovariateTests(unittest.TestCase):
+    """Covariates are sourced from `candidate_dag` role classifications (see
+    `causal.agents.data_science._covariate` and the module-level role
+    partition), not the raw `candidate_confounders` list. These tests cover
+    that behavior directly, independent of the phenotype/concept_set
+    handling already covered above.
+    """
+
+    @staticmethod
+    def _hypothesis(**overrides):
+        base = {
+            "schema_version": "1.0", "study_id": "study", "time_zero": "index",
+            "grace_period_hours": 24, "follow_up_days": 28, "primary_estimand": "ATE",
+        }
+        base.update(overrides)
+        return base
+
+    @staticmethod
+    def _protocol(**overrides):
+        base = {"data_source": "project.dataset", "concept_sets": {}}
+        base.update(overrides)
+        return base
+
+    def test_pre_treatment_confounder_gets_a_wide_low_risk_window(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "chronic_kidney_disease", "role": "confounder", "temporal_classification": "pre_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "chronic_kidney_disease")
+        self.assertEqual(covariate.causal_role, "confounder")
+        self.assertEqual(covariate.window_start_hours, -876000)
+        self.assertEqual(covariate.leakage_risk, "low")
+
+    def test_reviewer_window_override_takes_precedence_over_temporal_classification(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "lactate", "role": "confounder", "temporal_classification": "pre_treatment",
+                "window_start_hours": -6, "window_end_hours": 0,
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "lactate")
+        # Without the override, pre_treatment would get the wide -876000h window.
+        self.assertEqual(covariate.window_start_hours, -6)
+        self.assertEqual(covariate.window_end_hours, 0)
+
+    def test_at_treatment_confounder_gets_a_narrow_review_required_window(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "septic_shock_severity", "role": "confounder", "temporal_classification": "at_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "septic_shock_severity")
+        self.assertEqual(covariate.window_start_hours, -24)
+        self.assertEqual(covariate.leakage_risk, "review_required")
+
+    def test_effect_modifier_becomes_a_covariate_without_an_adjustment_role(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "baseline_severity", "role": "effect_modifier", "temporal_classification": "pre_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "baseline_severity")
+        self.assertEqual(covariate.causal_role, "effect_modifier")
+        self.assertEqual(covariate.adjustment_role, "")
+
+    def test_mediator_and_collider_are_excluded_not_planned_as_covariates(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "hospital_acquired_infection", "role": "mediator", "temporal_classification": "post_treatment"},
+            {"label": "icu_readmission", "role": "collider", "temporal_classification": "post_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        self.assertNotIn("hospital_acquired_infection", [c.name for c in result.covariates])
+        self.assertNotIn("icu_readmission", [c.name for c in result.covariates])
+        excluded_text = " ".join(result.excluded_from_adjustment)
+        self.assertIn("hospital_acquired_infection", excluded_text)
+        self.assertIn("icu_readmission", excluded_text)
+
+    def test_rejected_covariate_is_excluded_with_reviewer_attribution(self):
+        hypothesis = self._hypothesis(rejected_covariates=[
+            {"label": "lactate", "reviewer": "Dr. Smith", "comment": "not a plausible confounder"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        self.assertNotIn("lactate", [c.name for c in result.covariates])
+        excluded_text = " ".join(result.excluded_from_adjustment)
+        self.assertIn("lactate", excluded_text)
+        self.assertIn("Dr. Smith", excluded_text)
+
+    def test_unclassified_covariate_blocks_final_execution_instead_of_silently_planning(self):
+        hypothesis = self._hypothesis(candidate_confounders=["SOFA"])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        self.assertNotIn("SOFA", [c.name for c in result.covariates])
+        self.assertIn("covariate:SOFA:unclassified_by_dag", result.unresolved_issues)
+        self.assertFalse(result.final_execution_allowed)
+
+    def test_unobserved_confounder_is_flagged_rather_than_definition_pending(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "unmeasured_frailty", "role": "confounder",
+                "temporal_classification": "pre_treatment", "observed": False,
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "unmeasured_frailty")
+        self.assertEqual(covariate.status, "unobserved")
+
+    def test_adjustment_summary_tags_core_alternative_and_unused_confounders(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "age", "role": "confounder", "temporal_classification": "pre_treatment"},
+            {"label": "weight", "role": "confounder", "temporal_classification": "pre_treatment"},
+            {"label": "smoking_status", "role": "confounder", "temporal_classification": "pre_treatment"},
+            {"label": "baseline_severity", "role": "effect_modifier", "temporal_classification": "pre_treatment"},
+        ])
+        adjustment = {
+            "set_count": 2, "set_size": 2,
+            "core_variable_labels": ["age"],
+            "alternative_variable_labels": ["weight"],
+            "unused_confounder_labels": ["smoking_status"],
+        }
+        result = DataScienceAgent().run(hypothesis, self._protocol(), adjustment=adjustment)
+        by_name = {c.name: c for c in result.covariates}
+        self.assertEqual(by_name["age"].adjustment_role, "core")
+        self.assertEqual(by_name["weight"].adjustment_role, "alternative")
+        self.assertEqual(by_name["smoking_status"].adjustment_role, "unused")
+        # Only confounder-role nodes get an adjustment_role from AdjustmentSetSummary.
+        self.assertEqual(by_name["baseline_severity"].adjustment_role, "")
+
+    def test_demographic_stays_ready_regardless_of_temporal_classification(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "age", "role": "confounder", "temporal_classification": "at_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "age")
+        self.assertEqual(covariate.status, "ready")
+        self.assertEqual(covariate.leakage_risk, "low")
+        self.assertEqual(covariate.window_start_hours, -876000)
+
+    class _FakeLookup:
+        """Records which method was called with which term/domain, and
+        returns one concept row tagged with the domain that was searched --
+        enough to prove `DataScienceAgent._lookup_candidates` dispatched to
+        the right `ConceptLookup` method without needing a real OMCP server.
+        """
+
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def _response(self, domain_id: str):
+            class Response:
+                text = (
+                    "concept_id,concept_name,concept_code,vocabulary_id,domain_id\n"
+                    f"1,Found,x,VOCAB,{domain_id}\n"
+                )
+            return Response()
+
+        def lookup_drug(self, term):
+            self.calls.append(("lookup_drug", term))
+            return self._response("Drug")
+
+        def lookup_condition(self, term):
+            self.calls.append(("lookup_condition", term))
+            return self._response("Condition")
+
+        def lookup_concept(self, term, domain):
+            self.calls.append((f"lookup_concept:{domain}", term))
+            return self._response(domain.capitalize())
+
+    def test_measurement_domain_covariate_uses_the_generalized_lookup(self):
+        lookup = self._FakeLookup()
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol(), concept_lookup=lookup)
+        covariate = next(c for c in result.covariates if c.name == "sofa_score")
+        self.assertEqual([c.concept_id for c in covariate.concept_candidates], [1])
+        self.assertIn(("lookup_concept:measurement", "sofa score"), lookup.calls)
+
+    def test_condition_domain_covariate_still_uses_the_existing_lookup_condition(self):
+        lookup = self._FakeLookup()
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "chronic_kidney_disease", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "condition",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol(), concept_lookup=lookup)
+        covariate = next(c for c in result.covariates if c.name == "chronic_kidney_disease")
+        self.assertEqual([c.concept_id for c in covariate.concept_candidates], [1])
+        self.assertIn(("lookup_condition", "chronic kidney disease"), lookup.calls)
+        self.assertFalse(any(call[0].startswith("lookup_concept") for call in lookup.calls))
+
+    def test_approved_concept_mapping_surfaces_on_the_covariate_plan(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+                "concept_ids": [4301868], "mapping_status": "approved",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "sofa_score")
+        self.assertEqual(covariate.concept_ids, (4301868,))
+        self.assertEqual(covariate.mapping_status, "approved")
+
+    def test_domain_surfaces_on_the_covariate_plan(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "sofa_score")
+        self.assertEqual(covariate.domain, "measurement")
+
+    def test_approved_mapping_alone_is_not_enough_to_reach_ready(self):
+        """Knowing the concept_id answers "which rows", not "how to combine
+        them" -- an approved mapping with no aggregation review must still
+        block extraction (see the wiring in
+        `causal.orchestrator.workflow.build_cohort_plan`)."""
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+                "concept_ids": [4301868], "mapping_status": "approved",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "sofa_score")
+        self.assertEqual(covariate.status, "definition_pending")
+        self.assertEqual(covariate.aggregation, "definition_pending")
+
+    def test_reviewed_aggregation_without_approved_mapping_is_not_ready(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+                "aggregation": "last_value_before_index",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "sofa_score")
+        self.assertEqual(covariate.status, "definition_pending")
+
+    def test_approved_mapping_and_reviewed_aggregation_reach_ready(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+                "concept_ids": [4301868], "mapping_status": "approved",
+                "aggregation": "last_value_before_index",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "sofa_score")
+        self.assertEqual(covariate.status, "ready")
+
+    def test_covariate_without_a_domain_is_left_unmapped(self):
+        lookup = self._FakeLookup()
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "weight", "role": "confounder", "temporal_classification": "pre_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol(), concept_lookup=lookup)
+        covariate = next(c for c in result.covariates if c.name == "weight")
+        self.assertEqual(covariate.concept_candidates, ())
+        self.assertEqual(lookup.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

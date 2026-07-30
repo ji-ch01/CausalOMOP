@@ -14,6 +14,7 @@ from causal.queries import EXPOSURE_CONTRASTS
 class ConceptLookup(Protocol):
     def lookup_drug(self, term: str) -> Any: ...
     def lookup_condition(self, term: str) -> Any: ...
+    def lookup_concept(self, term: str, domain: str) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -54,12 +55,18 @@ class PhenotypePlan:
 @dataclass(frozen=True)
 class CovariatePlan:
     name: str
+    causal_role: str
+    adjustment_role: str
     temporal_role: str
     window_start_hours: int
     window_end_hours: int
     aggregation: str
     leakage_risk: str
     status: str = "definition_pending"
+    concept_candidates: tuple[ConceptCandidate, ...] = ()
+    concept_ids: tuple[int, ...] = ()
+    mapping_status: str = "unmapped"
+    domain: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,7 @@ class AnalysisPlanArtifact:
     estimands: tuple[str, ...]
     phenotypes: tuple[PhenotypePlan, ...]
     covariates: tuple[CovariatePlan, ...]
+    excluded_from_adjustment: tuple[str, ...]
     required_tables: tuple[str, ...]
     feasibility_checks: tuple[str, ...]
     diagnostics: tuple[str, ...]
@@ -91,6 +99,24 @@ _REQUIRED_PHENOTYPE_ROLES = (
     "population", "treatment", "comparator", "treatment_and_comparator", "time_zero", "outcome",
 )
 
+# Every DAG_VARIABLE_ROLE (causal.agents.hypothesis.DAG_VARIABLE_ROLES) falls
+# into exactly one of these two sets -- a candidate_dag entry always becomes
+# either a CovariatePlan or an audited `excluded_from_adjustment` entry, never
+# silently neither. Adjustment-eligible roles are baseline factors a backdoor
+# adjustment set (or a CATE model, for effect_modifier) can legitimately use;
+# excluded roles are post-treatment/instrument roles where conditioning would
+# bias the estimate rather than help it (see causal.roadmap.CausalDAG.
+# assess_adjustment_set's own forbidden-role check, which this mirrors at the
+# OMOP-planning layer). Public (not module-private) because
+# `causal.mapping.registry` reuses this exact partition to block a
+# mediator/collider/selection/instrument from ever being converted into a
+# baseline-adjustment `CovariateSpec` -- one shared definition of "which DAG
+# roles may never be adjusted for", not a second copy of the same rule.
+ADJUSTMENT_ELIGIBLE_ROLES = {"confounder", "effect_modifier", "outcome_cause_only", "treatment_cause_only"}
+EXCLUDED_FROM_ADJUSTMENT_ROLES = {"mediator", "collider", "selection", "instrument"}
+
+_DEMOGRAPHIC_COVARIATES = {"age", "sex", "race"}
+
 
 class DataScienceAgent:
     """Turn a normalized hypothesis into a reviewable, non-executing plan.
@@ -100,6 +126,15 @@ class DataScienceAgent:
     instead of the agent hardcoding clinical names. This is what lets the same
     agent plan a sepsis/albumin study and an unrelated one without touching
     Python code -- only `concept_sets` changes.
+
+    Covariates are derived the same way, from `hypothesis["candidate_dag"]`
+    (the role- and temporal-classified DAG variables the Hypothesis Agent /
+    DAG-identification stage already produced) instead of the raw, unreviewed
+    `candidate_confounders` list -- see `_covariate` and the module-level role
+    partition above. This is what makes a rejected covariate, an unclassified
+    covariate, and a mediator/collider/selection/instrument behave
+    differently here instead of all becoming an indistinguishable generic
+    "definition_pending" plan entry.
     """
 
     def run(
@@ -107,6 +142,7 @@ class DataScienceAgent:
         hypothesis: dict[str, Any],
         protocol: dict[str, Any],
         concept_lookup: ConceptLookup | None = None,
+        adjustment: dict[str, Any] | None = None,
     ) -> AnalysisPlanArtifact:
         if hypothesis.get("schema_version") != "1.0":
             raise ValueError("Unsupported hypothesis schema_version")
@@ -143,9 +179,25 @@ class DataScienceAgent:
         if concept_lookup is not None:
             phenotypes = self._attach_concept_candidates(phenotypes, concept_lookup)
 
-        covariates = tuple(self._covariate(name) for name in hypothesis.get("candidate_confounders", ()))
-        unresolved = tuple(hypothesis.get("unresolved_issues", ())) + tuple(
-            f"phenotype:{item.name}:{item.status}" for item in phenotypes if item.approval_required and item.status != "approved"
+        dag_variables = tuple(
+            variable for variable in hypothesis.get("candidate_dag", ()) if isinstance(variable, dict)
+        )
+        covariates = tuple(
+            self._covariate(variable, adjustment)
+            for variable in dag_variables
+            if variable.get("role") in ADJUSTMENT_ELIGIBLE_ROLES
+        )
+        if concept_lookup is not None:
+            covariates = self._attach_covariate_concept_candidates(covariates, dag_variables, concept_lookup)
+        excluded_from_adjustment = self._excluded_from_adjustment(dag_variables, hypothesis)
+        unclassified_covariates = self._unclassified_covariates(hypothesis, dag_variables)
+        unresolved = (
+            tuple(hypothesis.get("unresolved_issues", ()))
+            + tuple(
+                f"phenotype:{item.name}:{item.status}"
+                for item in phenotypes if item.approval_required and item.status != "approved"
+            )
+            + tuple(f"covariate:{label}:unclassified_by_dag" for label in unclassified_covariates)
         )
         required_tables = tuple(sorted({table for phenotype in phenotypes for table in phenotype.omop_tables} | {
             "person", "measurement", "procedure_occurrence", "drug_exposure", "condition_occurrence"
@@ -182,6 +234,7 @@ class DataScienceAgent:
             estimands=(self._required_text(hypothesis, "primary_estimand"), *tuple(hypothesis.get("secondary_estimands", ()))),
             phenotypes=phenotypes,
             covariates=covariates,
+            excluded_from_adjustment=excluded_from_adjustment,
             required_tables=required_tables,
             feasibility_checks=(
                 "eligible population and unique persons",
@@ -226,19 +279,60 @@ class DataScienceAgent:
     ) -> tuple[PhenotypePlan, ...]:
         enriched = []
         for phenotype in phenotypes:
-            if phenotype.domain not in {"condition", "drug"} or phenotype.status == "approved":
+            if phenotype.domain not in _PHENOTYPE_DOMAIN_TABLES or phenotype.status == "approved":
                 enriched.append(phenotype)
                 continue
             term = phenotype.lookup_term or phenotype.name.replace("_", " ")
-            response = (
-                lookup.lookup_condition(term) if phenotype.domain == "condition"
-                else lookup.lookup_drug(term)
-            )
             enriched.append(replace(
                 phenotype,
-                concept_candidates=cls._parse_concept_candidates(response.text, phenotype.domain),
+                concept_candidates=cls._lookup_candidates(term, phenotype.domain, lookup),
             ))
         return tuple(enriched)
+
+    @classmethod
+    def _attach_covariate_concept_candidates(
+        cls,
+        covariates: tuple[CovariatePlan, ...],
+        dag_variables: tuple[dict[str, Any], ...],
+        lookup: ConceptLookup,
+    ) -> tuple[CovariatePlan, ...]:
+        """Attach reviewable `concept_candidates` to covariates whose
+        `candidate_dag` entry declares a `domain` -- the same review-only
+        contract phenotypes get via `_attach_concept_candidates`. A covariate
+        whose DAG entry has no domain yet (`DAGVariable.domain`'s default,
+        meaning "not yet assessed") is left untouched rather than guessed.
+        """
+        domain_by_label = {variable["label"]: variable.get("domain", "") for variable in dag_variables}
+        enriched = []
+        for covariate in covariates:
+            domain = domain_by_label.get(covariate.name, "")
+            if not domain:
+                enriched.append(covariate)
+                continue
+            term = covariate.name.replace("_", " ")
+            enriched.append(replace(
+                covariate,
+                concept_candidates=cls._lookup_candidates(term, domain, lookup),
+            ))
+        return tuple(enriched)
+
+    @classmethod
+    def _lookup_candidates(cls, term: str, domain: str, lookup: ConceptLookup) -> tuple["ConceptCandidate", ...]:
+        """Dispatch a concept-candidate search to the right `ConceptLookup`
+        method for `domain`. `condition`/`drug` reuse the two long-standing,
+        OMCP-backed methods (`Lookup_Condition`/`Lookup_Drug`, a plain search
+        over the OMOP `concept` table already loaded in the CDM); the other
+        three domains a phenotype or covariate can declare go through the
+        newer, generalized `lookup_concept`. Shared by phenotypes and
+        covariates so this dispatch rule is defined exactly once.
+        """
+        if domain == "condition":
+            response = lookup.lookup_condition(term)
+        elif domain == "drug":
+            response = lookup.lookup_drug(term)
+        else:
+            response = lookup.lookup_concept(term, domain)
+        return cls._parse_concept_candidates(response.text, domain)
 
     @staticmethod
     def _parse_concept_candidates(text: str, expected_domain: str) -> tuple[ConceptCandidate, ...]:
@@ -280,10 +374,23 @@ class DataScienceAgent:
         role = definition.get("role")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"concept_sets['{name}'] requires a role")
+        role = role.strip()
         domain = definition.get("domain")
-        if domain not in _PHENOTYPE_DOMAIN_TABLES:
+        if domain == "death":
+            # Mirrors `causal.orchestrator.workflow._load_concept_specs`'s
+            # own `domain='death'` handling on the query-generation side of
+            # this same `concept_sets` entry: all-cause mortality lives in
+            # the standard OMOP `death` table, not a concept domain, and is
+            # only a valid choice for the outcome role.
+            if role != "outcome":
+                raise ValueError(f"concept_sets['{name}']: domain 'death' is only valid for role='outcome'")
+            omop_tables = ("death",)
+        elif domain in _PHENOTYPE_DOMAIN_TABLES:
+            omop_tables = _PHENOTYPE_DOMAIN_TABLES[domain]
+        else:
             raise ValueError(
-                f"concept_sets['{name}'] requires domain to be one of {tuple(_PHENOTYPE_DOMAIN_TABLES)}"
+                f"concept_sets['{name}'] requires domain to be one of "
+                f"{tuple(_PHENOTYPE_DOMAIN_TABLES) + ('death',)}"
             )
         source_value_rule = definition.get("source_value_rule")
         if source_value_rule is not None and not isinstance(source_value_rule, str):
@@ -295,24 +402,134 @@ class DataScienceAgent:
         status = str(definition.get("status", "missing"))
         mode = "source_value_provisional" if status != "approved" and source_value_rule else "standard"
         return PhenotypePlan(
-            name=name, role=role.strip(), status=status, mode=mode, domain=domain,
-            omop_tables=_PHENOTYPE_DOMAIN_TABLES[domain], concept_ids=ids,
+            name=name, role=role, status=status, mode=mode, domain=domain,
+            omop_tables=omop_tables, concept_ids=ids,
             source_value_rule=source_value_rule if mode == "source_value_provisional" else None,
             lookup_term=lookup_term,
         )
 
     @staticmethod
-    def _covariate(name: str) -> CovariatePlan:
-        normalized = str(name).strip()
-        demographic = normalized.lower() in {"age", "sex", "race"}
+    def _covariate(variable: dict[str, Any], adjustment: dict[str, Any] | None) -> CovariatePlan:
+        """Build one reviewable covariate from a role-classified `candidate_dag` entry.
+
+        `role`/`temporal_classification` are asserted by the Hypothesis Agent's
+        DAG stage (see `causal.agents.hypothesis.DAGVariable`), never guessed
+        here -- same "clinical judgment is explicit and checked" contract as
+        `_phenotype_from_concept_set`. A demographic (age/sex/race) keeps its
+        long-standing special case (always a `person`-table field, safely
+        `"ready"` and low-risk regardless of its DAG timing); every other
+        variable's window/leakage-risk now come from `temporal_classification`
+        instead of a name-keyword guess: `pre_treatment` variables can be
+        measured any time before treatment (wide window, low leakage risk,
+        like a demographic), `at_treatment` variables are only defined at the
+        treatment-decision instant itself (narrow window, review required --
+        the classic immortal-time/leakage zone). `adjustment` (see
+        `causal.agents.dag_identification.AdjustmentSetSummary.to_dict()`) is
+        optional and only annotates `confounder`-role variables with whether
+        they are core/alternative/unused for the DAG's minimum backdoor
+        adjustment set; it never changes whether a variable becomes a
+        covariate at all, since even a redundant confounder can still be
+        worth mapping (see `AdjustmentSetSummary`'s own docstring on why
+        "unused" is not the same as "wrong").
+        """
+        label = str(variable["label"]).strip()
+        role = str(variable["role"])
+        observed = bool(variable.get("observed", True))
+        demographic = label.lower() in _DEMOGRAPHIC_COVARIATES
+        low_risk_window = demographic or variable.get("temporal_classification") == "pre_treatment"
+        adjustment_role = ""
+        if role == "confounder" and adjustment:
+            if label in adjustment.get("core_variable_labels", ()):
+                adjustment_role = "core"
+            elif label in adjustment.get("alternative_variable_labels", ()):
+                adjustment_role = "alternative"
+            elif label in adjustment.get("unused_confounder_labels", ()):
+                adjustment_role = "unused"
+        domain = str(variable.get("domain", ""))
+        mapping_status = str(variable.get("mapping_status", "unmapped"))
+        aggregation = (
+            "value_at_index" if demographic else str(variable.get("aggregation", "definition_pending"))
+        )
+        # A non-demographic covariate is only extraction-ready once its OMOP
+        # concept(s) are approved *and* a human has reviewed how to combine
+        # repeated occurrences (`causal.agents.hypothesis.DAGVariable.
+        # aggregation`) -- knowing "which rows" is not the same as knowing
+        # "how to combine them". `domain` must also be a known extraction
+        # domain, since `causal.data_builder.analytic.AnalyticCohortBuilder`
+        # needs one to generate SQL at all.
+        extraction_ready = (
+            mapping_status == "approved"
+            and domain in _PHENOTYPE_DOMAIN_TABLES
+            and aggregation not in ("", "definition_pending")
+        )
+        status = "unobserved" if not observed else (
+            "ready" if (demographic or extraction_ready) else "definition_pending"
+        )
+        # A reviewer-set window (`causal.agents.hypothesis.DAGVariable.
+        # window_start_hours`/`window_end_hours`, see `review_covariate_window`)
+        # overrides the auto-derived one; `None` (the default) means no
+        # override was ever recorded.
+        window_start_hours = variable.get("window_start_hours")
+        window_end_hours = variable.get("window_end_hours")
+        if window_start_hours is None or window_end_hours is None:
+            window_start_hours = -876000 if low_risk_window else -24
+            window_end_hours = 0
         return CovariatePlan(
-            name=normalized,
+            name=label,
+            causal_role=role,
+            adjustment_role=adjustment_role,
             temporal_role="baseline",
-            window_start_hours=-24 if not demographic else -876000,
-            window_end_hours=0,
-            aggregation="value_at_index" if demographic else "definition_pending",
-            leakage_risk="low" if demographic else "review_required",
-            status="ready" if demographic else "definition_pending",
+            window_start_hours=int(window_start_hours),
+            window_end_hours=int(window_end_hours),
+            aggregation=aggregation,
+            leakage_risk="low" if low_risk_window else "review_required",
+            status=status,
+            domain=domain,
+            concept_ids=tuple(int(value) for value in variable.get("concept_ids", ())),
+            mapping_status=mapping_status,
+        )
+
+    @staticmethod
+    def _excluded_from_adjustment(
+        dag_variables: tuple[dict[str, Any], ...], hypothesis: dict[str, Any]
+    ) -> tuple[str, ...]:
+        """Audit trail for every `candidate_dag` variable/first-pass covariate
+        that does not become a `CovariatePlan`, so exclusion is always
+        recorded, never silent (same convention as `dag_tournament.
+        MergeConflict`).
+        """
+        role_excluded = tuple(
+            f"{variable['label']}: role={variable['role']} (excluded from covariate adjustment; "
+            f"conditioning on a {variable['role']} can bias the causal estimate)"
+            for variable in dag_variables
+            if variable.get("role") in EXCLUDED_FROM_ADJUSTMENT_ROLES
+        )
+        rejected_excluded = tuple(
+            f"{rejection['label']}: rejected by {rejection.get('reviewer', 'unknown reviewer')}"
+            + (f" ({rejection['comment']})" if rejection.get("comment") else "")
+            for rejection in hypothesis.get("rejected_covariates", ())
+            if isinstance(rejection, dict)
+        )
+        return role_excluded + rejected_excluded
+
+    @staticmethod
+    def _unclassified_covariates(
+        hypothesis: dict[str, Any], dag_variables: tuple[dict[str, Any], ...]
+    ) -> tuple[str, ...]:
+        """First-pass covariates with no `candidate_dag` role and no recorded
+        rejection: neither approved into the plan nor audited as excluded,
+        so they block `final_execution_allowed` via `unresolved_issues`
+        instead of silently defaulting to a generic covariate plan.
+        """
+        classified_labels = {variable.get("label") for variable in dag_variables}
+        rejected_labels = {
+            rejection.get("label")
+            for rejection in hypothesis.get("rejected_covariates", ())
+            if isinstance(rejection, dict)
+        }
+        return tuple(
+            label for label in hypothesis.get("candidate_confounders", ())
+            if label not in classified_labels and label not in rejected_labels
         )
 
     @staticmethod
