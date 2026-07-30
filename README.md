@@ -93,6 +93,15 @@ informatics literature rather than invented from scratch:
   [github.com/mims-harvard/OptimusKG](https://github.com/mims-harvard/OptimusKG)).
   Knowledge-graph evidence source used to corroborate DAG edges alongside
   PubMed/OpenAlex (`causal/knowledge_graph/`).
+- **GRADE (confidence grading of DAG edges)** — Guyatt, G.H., Oxman, A.D.,
+  Vist, G.E., et al. (2008). GRADE: an emerging consensus on rating quality
+  of evidence and strength of recommendations. *BMJ*, 336(7650), 924–926.
+  [doi:10.1136/bmj.39489.470347.AD](https://doi.org/10.1136/bmj.39489.470347.AD).
+  Adapted (evidence tier, contested/unknown-direction certainty,
+  cross-source corroboration) into `confidence_grade`/`ConfidenceSummary` in
+  [`causal/agents/dag_identification.py`](causal/agents/dag_identification.py),
+  a quality signal distinct from the coverage-only evidence-source metric it
+  sits alongside.
 - **Worked validation case** — the albumin-plus-crystalloids-vs-crystalloids,
   ICU sepsis, 28-day-mortality question and its MIMIC-IV OMOP grounding
   follow *Step-by-step causal analysis of EHRs to ground decision-making*,
@@ -123,7 +132,7 @@ informatics literature rather than invented from scratch:
 | DAG critique and bounded-revision agent | Implemented: an independent LLM pass reviews each drafted DAG against structural and clinical checks before it is accepted |
 | SQL governance (`QueryValidationAgent`) | Implemented: every generated query (feasibility, cohort, governed causal tool) is checked for unbound parameters, disallowed tables, and `person_id` leakage before execution |
 | Generalized feasibility/cohort SQL (`ConceptSetSpec`-driven) | Implemented: replaces the earlier hardcoded albumin/sepsis query with builders that work for any protocol-declared population/treatment/comparator/outcome |
-| General DAG-to-OMOP variable mapping | Not yet implemented |
+| OMOP variable registry (`causal.mapping.registry`) | Implemented as a first version: a versioned `OMOPVariableDefinition`/`OMOPVariableRegistry` turns every `concept_sets` phenotype and `candidate_dag` covariate into one typed, validated contract (candidate vs. approved concepts, observed vs. unobserved, mapping approved vs. data available vs. SQL-executable), converted to the existing BigQuery builders via `ExtractionPlan`. `workflow registry-build` persists `registry.json`; `causal.mapping.audit` adds aggregate-only mapping diagnostics (row/person counts, zero-concept rate, unmapped source values, unit/vocabulary hygiene, descendant-expansion coverage). See [docs/causal_roadmap.md](docs/causal_roadmap.md) migration step 4. |
 | Statistical estimand, estimation and sensitivity analysis | Not yet implemented |
 
 The existing filesystem workflow remains available for technical testing, but
@@ -164,6 +173,7 @@ CausalOMOP/
     orchestrator/                 # persistent governed workflow prototype
     data_builder/                 # analytic-cohort contracts and SQL builders
     queries/                      # concept-set-driven feasibility/cohort SQL builders
+    mapping/                      # OMOP variable registry (model, validation, adapters, audits)
     prompts/                      # hypothesis, DAG-critique and literature-DAG prompt templates
 
   notebooks/                      # exploratory analyses
@@ -481,13 +491,52 @@ but must be integrated behind the causal-roadmap gates. This integration adds:
 - separate human review of the question/target trial, DAG and identification;
 - evidence-grounded construction of the general DAG;
 - a DAG-node-to-OMOP variable registry with concepts, tables, fields, windows,
-  aggregation and missingness rules;
+  aggregation and missingness rules (implemented as a first version in
+  `causal/mapping/registry.py` -- see below);
 - controlled SQL/OMOP extraction only after identification;
 - leakage-safe cohort and covariate extraction;
 - CATE-oriented causal estimation with TMLE/SuperLearner and g-computation;
 - diagnostics for positivity, overlap, balance, model fit and missingness;
 - negative controls and quantitative sensitivity analyses where appropriate;
 - an auditable causal report.
+
+### OMOP Variable Registry
+
+`causal/mapping/registry.py` is the versioned source of truth this project
+uses to tie one DAG node (a `candidate_dag` covariate, or a `concept_sets`
+phenotype -- population/treatment/comparator/outcome) to its OMOP
+operationalization and, from there, to deterministic SQL:
+
+```text
+OMOPVariableDefinition -> ExtractionPlan -> ConceptSetSpec/CovariateSpec -> existing BigQuery builders
+```
+
+`OMOPVariableDefinition` distinguishes, as separate fields, what earlier
+prototype fields conflated: a *candidate* concept a lookup tool proposed
+(`candidate_concept_ids`) from an *approved* one (`root_concept_ids`);
+`mapping_status == "approved"` from `available_in_data` (an audit result, not
+a review decision) from `is_sql_executable(...)` (a pure, re-derived
+capability check -- never a stored/stale flag). `variable_from_concept_set`/
+`variable_from_candidate_dag_entry`/`variable_from_covariate_plan` are
+backward-compatible adapters: an existing `protocol.json`/`analysis_plan.json`
+needs no schema change to be read into a registry. `causal.mapping.audit`
+adds aggregate-only diagnostics (row/person counts per concept, approved
+concepts absent from the data, `concept_id = 0` rate, top unmapped source
+values, non-standard/invalid concepts, observed units, and coverage before
+versus after `concept_ancestor` expansion) -- never a patient-level row.
+
+Nothing in this module ever sets `mapping_status = "approved"` on its own;
+FastOMOP/OMCP concept-lookup tools may only ever populate
+`candidate_concept_ids`, never `root_concept_ids` -- a human reviewer decides
+that, through the existing `causal.orchestrator.workflow` gates.
+
+`workflow registry-build <run_id>` writes `registry.json` from
+`protocol.json` alone (it does not require the Data Science Agent to have
+run, since a registry entry must remain valid before, and regardless of,
+OMOP data availability). See [docs/causal_roadmap.md](docs/causal_roadmap.md)
+migration step 4 and [docs/fastomop_integration.md](docs/fastomop_integration.md)
+for the division of responsibility between FastOMOP, OMCP, CausalOMOP and
+FOEM.
 
 See [docs/causal_roadmap.md](docs/causal_roadmap.md) for the normative
 pipeline and integration boundary. The earlier design discussions remain in
@@ -526,8 +575,16 @@ See [notebooks/README.md](notebooks/README.md).
    identification review.
 3. Replace the restricted prototype `candidate_dag` with the general DAG
    contract while retaining PMID and expert-judgment provenance.
-4. Implement the OMOP variable registry from approved DAG nodes instead of
-   hard-coded phenotype names.
+4. ~~Implement the OMOP variable registry from approved DAG nodes instead of
+   hard-coded phenotype names.~~ Done as a first version: `causal.mapping.registry`
+   (`OMOPVariableDefinition`/`OMOPVariableRegistry`, `ExtractionPlan`) plus
+   `causal.mapping.audit`. Remaining follow-ups: `causal.orchestrator.workflow.
+   _load_concept_specs` (population/treatment/comparator/outcome) still reads
+   `protocol.json` directly rather than through the registry (only the
+   covariate loader was rewired this round); there is no reviewer-facing action
+   yet to set `include_descendants`/`excluded_concept_ids` (only
+   `protocol.json` hand-editing); Streamlit does not yet render `registry.json`
+   or run the new audit queries.
 5. Audit whether MIMIC-IV OMOP supports the required baseline variables,
    treatment strategies, outcome, follow-up and positivity assumptions.
 6. Define the observed-data statistical estimand and analysis plan.
