@@ -7,7 +7,19 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from causal.config import BigQueryDatasets
-from causal.queries.feasibility import EXPOSURE_CONTRASTS, ConceptSetSpec, analytic_cohort_sql
+from causal.queries.feasibility import (
+    COVARIATE_AGGREGATIONS_BY_DOMAIN,
+    EXPOSURE_CONTRASTS,
+    ConceptSetSpec,
+    CovariateSpec,
+    analytic_cohort_sql,
+)
+
+_VALUE_AGGREGATIONS = frozenset(
+    aggregation
+    for domain in ("measurement", "observation")
+    for aggregation in COVARIATE_AGGREGATIONS_BY_DOMAIN[domain]
+)
 
 
 @dataclass(frozen=True)
@@ -64,8 +76,16 @@ class AnalyticCohortBuilder:
         min_age_years: int | None = 18,
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
+        covariates: tuple[CovariateSpec, ...] = (),
         execution_allowed: bool,
     ) -> tuple[str, CohortBuildManifest]:
+        """`covariates` are reviewed, human-approved baseline covariates (see
+        `CovariateSpec`) -- typically only the ones an analysis plan marks
+        `status="ready"` (`mapping_status="approved"` and an aggregation
+        already reviewed; see `causal.orchestrator.workflow.build_cohort_plan`).
+        Demographics (age/gender/race) are unaffected -- they always come
+        from the fixed columns below, never from this parameter.
+        """
         if not study_id.strip():
             raise ValueError("study_id is required")
         if exposure_contrast not in EXPOSURE_CONTRASTS:
@@ -81,6 +101,16 @@ class AnalyticCohortBuilder:
             min_age_years=min_age_years,
             care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
+            covariates=covariates,
+        )
+        covariate_columns = tuple(
+            AnalyticColumn(
+                covariate.column_name,
+                "baseline_covariate",
+                "FLOAT64" if covariate.aggregation in _VALUE_AGGREGATIONS else "INT64",
+                f"{covariate.window_start_hours}h_to_{covariate.window_end_hours}h_relative_to_index",
+            )
+            for covariate in covariates
         )
         manifest = CohortBuildManifest(
             schema_version="1.0",
@@ -91,10 +121,9 @@ class AnalyticCohortBuilder:
             delivery_to_llm_allowed=False,
             execution_allowed=execution_allowed,
             exposure_contrast=exposure_contrast,
-            columns=self.COLUMNS,
+            columns=self.COLUMNS + covariate_columns,
             unresolved_issues=(
                 "censoring and observation-window completeness are not implemented",
-                "non-demographic baseline covariates are not implemented",
                 "effect modifiers are not implemented in this cohort query",
             ),
         )

@@ -10,6 +10,7 @@ OMCP transport, which does not bind BigQuery parameters.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from causal.config import BigQueryDatasets
@@ -41,22 +42,85 @@ OUTCOME_DOMAINS = tuple(DOMAIN_TABLES) + ("death",)
 #     both (ambiguous/contaminated exposure) or neither are excluded.
 EXPOSURE_CONTRASTS = ("add_on", "mutually_exclusive")
 
+# Which aggregation rules make sense for a covariate's OMOP domain. Event
+# domains (condition/drug/procedure) carry no numeric value -- only
+# presence/count are meaningful. Value domains (measurement/observation)
+# aggregate `value_as_number`. Mirrors the "vocab dict next to DOMAIN_TABLES"
+# pattern already used for EXPOSURE_CONTRASTS; this is the single source of
+# truth both for SQL generation here and for reviewer-facing validation in
+# `causal.orchestrator.workflow.review_covariate_aggregation`.
+COVARIATE_AGGREGATIONS_BY_DOMAIN: dict[str, tuple[str, ...]] = {
+    "condition": ("presence_in_window", "count_in_window"),
+    "drug": ("presence_in_window", "count_in_window"),
+    "procedure": ("presence_in_window", "count_in_window"),
+    "measurement": ("last_value_before_index", "max_in_window", "min_in_window", "mean_in_window"),
+    "observation": ("last_value_before_index", "max_in_window", "min_in_window", "mean_in_window"),
+}
+
+# Public (not module-private): the single source of truth for "which
+# aggregations are event-presence aggregations", reused by
+# `causal.mapping.registry` to derive the one clinically-correct missingness
+# rule per aggregation (`zero_when_absent` here, `null_when_missing` for
+# everything else) instead of re-deriving/duplicating this partition.
+PRESENCE_AGGREGATIONS = ("presence_in_window", "count_in_window")
+_PRESENCE_AGGREGATIONS = PRESENCE_AGGREGATIONS
+
 
 @dataclass(frozen=True)
 class ConceptSetSpec:
     """One resolved, human-approved OMOP concept set: which clinical domain
     it lives in, plus the standard concept_ids that define it. `domain` must
-    be one of `DOMAIN_TABLES` (or "death", outcome only, no concept_ids)."""
+    be one of `DOMAIN_TABLES` (or "death", outcome only, no concept_ids).
+
+    `include_descendants` (default `True`, preserving this module's
+    long-standing behavior) controls whether the concept set expands to its
+    `concept_ancestor` descendants or stays exactly the given root ids --
+    some registry-reviewed variables (see `causal.mapping.registry`) are
+    deliberately narrow (e.g. one specific lab test, not its whole concept
+    class) and must not silently pull in every descendant.
+
+    `excluded_concept_ids` (default `()`) removes specific concepts from the
+    resolved set *after* expansion -- e.g. a root concept's descendant that a
+    reviewer has determined does not belong in this variable's definition.
+    Exclusion always wins over inclusion by descendants: a concept listed
+    here is removed even if `include_descendants` would otherwise pull it in.
+    """
 
     domain: str
     concept_ids: tuple[int, ...] = ()
+    include_descendants: bool = True
+    excluded_concept_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class CovariateSpec:
+    """One reviewed, human-approved baseline covariate ready for extraction:
+    an OMOP domain + concept_ids (see `ConceptSetSpec`) plus the ascertainment
+    window (hours relative to `index_datetime`; negative = before) and
+    aggregation rule (see `COVARIATE_AGGREGATIONS_BY_DOMAIN`) a reviewer chose
+    for it. `column_name` must already be a safe, unique SQL identifier --
+    callers (see `causal.orchestrator.workflow.build_cohort_plan`) are
+    responsible for turning a human-entered covariate label into one; this
+    module only validates it, it does not slugify.
+
+    `include_descendants`/`excluded_concept_ids` mirror `ConceptSetSpec`'s
+    fields of the same name -- see that docstring."""
+
+    column_name: str
+    domain: str
+    concept_ids: tuple[int, ...]
+    window_start_hours: int
+    window_end_hours: int
+    aggregation: str
+    include_descendants: bool = True
+    excluded_concept_ids: tuple[int, ...] = ()
 
 
 def _string_literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _concept_ids_literal(spec: ConceptSetSpec, field: str) -> str:
+def concept_ids_literal(spec: ConceptSetSpec, field: str) -> str:
     if spec.domain not in DOMAIN_TABLES:
         raise ValueError(f"{field} domain must be one of {tuple(DOMAIN_TABLES)}")
     if not spec.concept_ids:
@@ -64,15 +128,136 @@ def _concept_ids_literal(spec: ConceptSetSpec, field: str) -> str:
     return ", ".join(str(int(concept_id)) for concept_id in spec.concept_ids)
 
 
-def _expanded_concepts_cte(alias: str, spec: ConceptSetSpec, field: str, datasets: BigQueryDatasets) -> str:
-    """Expand a concept set to itself plus every `concept_ancestor` descendant."""
-    ids = _concept_ids_literal(spec, field)
-    return f"""{alias} AS (
-      SELECT descendant_concept_id AS concept_id
+_concept_ids_literal = concept_ids_literal
+
+
+def expanded_concepts_cte(alias: str, spec: ConceptSetSpec, field: str, datasets: BigQueryDatasets) -> str:
+    """Resolve a concept set to the concept_ids its SQL should actually match:
+    itself plus every `concept_ancestor` descendant by default, or just the
+    given root ids when `spec.include_descendants` is False, minus any
+    `spec.excluded_concept_ids` either way (exclusion always wins over
+    inclusion by descendants -- see `ConceptSetSpec`). Public (not
+    module-private) so `causal.mapping.audit` can build the same resolved
+    concept-id CTE for aggregate diagnostics without duplicating this logic.
+    """
+    ids = concept_ids_literal(spec, field)
+    if spec.include_descendants:
+        base = f"""SELECT descendant_concept_id AS concept_id
       FROM {datasets.table('omop', 'concept_ancestor')}
       WHERE ancestor_concept_id IN ({ids})
-      UNION DISTINCT SELECT concept_id FROM UNNEST([{ids}]) AS concept_id
+      UNION DISTINCT SELECT concept_id FROM UNNEST([{ids}]) AS concept_id"""
+    else:
+        base = f"SELECT concept_id FROM UNNEST([{ids}]) AS concept_id"
+    if not spec.excluded_concept_ids:
+        return f"""{alias} AS (
+      {base}
     )"""
+    excluded = ", ".join(str(int(concept_id)) for concept_id in spec.excluded_concept_ids)
+    return f"""{alias} AS (
+      SELECT concept_id FROM ({base})
+      WHERE concept_id NOT IN ({excluded})
+    )"""
+
+
+_expanded_concepts_cte = expanded_concepts_cte
+
+
+# The fixed, always-present columns `analytic_cohort_sql` emits -- a
+# covariate's generated column name may not collide with any of these (see
+# `_covariate_ctes_columns_and_joins`).
+_FIXED_ANALYTIC_COLUMNS = (
+    "person_id", "A", "Y", "index_datetime", "follow_up_days", "censored",
+    "age", "gender_concept_id", "race_concept_id",
+)
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+_SQL_AGGREGATE_FUNCTIONS = {"max_in_window": "MAX", "min_in_window": "MIN", "mean_in_window": "AVG"}
+
+
+def _covariate_ctes_columns_and_joins(
+    datasets: BigQueryDatasets, covariates: tuple[CovariateSpec, ...]
+) -> tuple[list[str], list[str], list[str]]:
+    """Build one CTE-pair, one final-SELECT column, and one LEFT JOIN per
+    reviewed covariate. Presence/count aggregations (event domains) COALESCE
+    to 0 -- absence of a coded event is a real "not present" fact. Value
+    aggregations (measurement/observation) stay NULL when nothing qualifies
+    in the window -- true missingness must never be imputed to 0 here (e.g.
+    a missing SOFA score is not clinically a score of 0)."""
+    seen_columns = set(_FIXED_ANALYTIC_COLUMNS)
+    ctes: list[str] = []
+    columns: list[str] = []
+    joins: list[str] = []
+    for covariate in covariates:
+        name = covariate.column_name
+        if not _IDENTIFIER_RE.match(name):
+            raise ValueError(f"covariate column_name '{name}' is not a safe SQL identifier")
+        if name in seen_columns:
+            raise ValueError(f"covariate column_name '{name}' collides with another column")
+        seen_columns.add(name)
+        if covariate.domain not in DOMAIN_TABLES:
+            raise ValueError(f"covariate '{name}' domain must be one of {tuple(DOMAIN_TABLES)}")
+        allowed = COVARIATE_AGGREGATIONS_BY_DOMAIN[covariate.domain]
+        if covariate.aggregation not in allowed:
+            raise ValueError(
+                f"covariate '{name}' aggregation must be one of {allowed} for domain '{covariate.domain}'"
+            )
+        table, concept_col, dt_col = DOMAIN_TABLES[covariate.domain]
+        concepts_alias = f"{name}_concepts"
+        concept_spec = ConceptSetSpec(
+            domain=covariate.domain,
+            concept_ids=covariate.concept_ids,
+            include_descendants=covariate.include_descendants,
+            excluded_concept_ids=covariate.excluded_concept_ids,
+        )
+        ctes.append(_expanded_concepts_cte(concepts_alias, concept_spec, name, datasets))
+
+        window_filter = (
+            f"t.{dt_col} >= DATETIME_ADD(e.index_datetime, INTERVAL {int(covariate.window_start_hours)} HOUR)\n"
+            f"       AND t.{dt_col} <= DATETIME_ADD(e.index_datetime, INTERVAL {int(covariate.window_end_hours)} HOUR)"
+        )
+
+        if covariate.aggregation in _PRESENCE_AGGREGATIONS:
+            agg_alias = f"{name}_events"
+            ctes.append(f"""{agg_alias} AS (
+      SELECT e.person_id, COUNT(*) AS event_count
+      FROM eligible e
+      JOIN {datasets.table('omop', table)} t ON t.person_id = e.person_id
+       AND {window_filter}
+      JOIN {concepts_alias} c ON t.{concept_col} = c.concept_id
+      GROUP BY e.person_id
+    )""")
+            if covariate.aggregation == "presence_in_window":
+                columns.append(f"CASE WHEN {agg_alias}.event_count > 0 THEN 1 ELSE 0 END AS {name}")
+            else:
+                columns.append(f"COALESCE({agg_alias}.event_count, 0) AS {name}")
+        else:
+            measurements_alias = f"{name}_measurements"
+            agg_alias = f"{name}_agg"
+            ctes.append(f"""{measurements_alias} AS (
+      SELECT e.person_id, t.{dt_col} AS event_dt, t.value_as_number AS event_value
+      FROM eligible e
+      JOIN {datasets.table('omop', table)} t ON t.person_id = e.person_id
+       AND {window_filter}
+      JOIN {concepts_alias} c ON t.{concept_col} = c.concept_id
+      WHERE t.value_as_number IS NOT NULL
+    )""")
+            if covariate.aggregation == "last_value_before_index":
+                ctes.append(f"""{agg_alias} AS (
+      SELECT person_id, event_value AS agg_value
+      FROM {measurements_alias}
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY event_dt DESC) = 1
+    )""")
+            else:
+                sql_fn = _SQL_AGGREGATE_FUNCTIONS[covariate.aggregation]
+                ctes.append(f"""{agg_alias} AS (
+      SELECT person_id, {sql_fn}(event_value) AS agg_value
+      FROM {measurements_alias}
+      GROUP BY person_id
+    )""")
+            columns.append(f"{agg_alias}.agg_value AS {name}")
+        joins.append(f"LEFT JOIN {agg_alias} USING (person_id)")
+    return ctes, columns, joins
 
 
 def _cohort_ctes(
@@ -270,6 +455,7 @@ def analytic_cohort_sql(
     min_age_years: int | None = 18,
     care_site_names: tuple[str, ...] = (),
     exposure_contrast: str = "add_on",
+    covariates: tuple[CovariateSpec, ...] = (),
 ) -> str:
     """Person-level analytic cohort (A/Y columns) for the same target trial.
 
@@ -277,6 +463,13 @@ def analytic_cohort_sql(
     filter and the meaning of `A`; it does not change how `treatment`/
     `comparator` exposure is ascertained, only who is kept and how the two
     flags are collapsed into one binary arm indicator.
+
+    `covariates` (see `CovariateSpec`) are reviewed, human-approved baseline
+    covariates -- each gets one additional column, LEFT JOINed onto the
+    cohort by `person_id` so a person with no qualifying event still appears
+    (see `_covariate_ctes_columns_and_joins` for aggregation/missingness
+    semantics). Demographics (age/gender/race) are unaffected -- they keep
+    using the fixed columns below, never this path.
     """
     if exposure_contrast not in EXPOSURE_CONTRASTS:
         raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
@@ -295,8 +488,14 @@ def analytic_cohort_sql(
         "WHERE a.has_comparator" if exposure_contrast == "add_on"
         else "WHERE a.has_treatment != a.has_comparator"
     )
+    covariate_ctes, covariate_columns, covariate_joins = _covariate_ctes_columns_and_joins(
+        datasets, covariates
+    )
+    all_ctes = ctes + "".join(f",\n    {cte}" for cte in covariate_ctes)
+    extra_columns = "".join(f",\n      {column}" for column in covariate_columns)
+    extra_joins = "".join(f"\n    {join}" for join in covariate_joins)
     return f"""
-    WITH {ctes}
+    WITH {all_ctes}
     SELECT
       a.person_id,
       CASE WHEN a.has_treatment THEN 1 ELSE 0 END AS A,
@@ -306,9 +505,9 @@ def analytic_cohort_sql(
       CAST(NULL AS INT64) AS censored,
       EXTRACT(YEAR FROM DATE(e.index_datetime)) - p.year_of_birth AS age,
       p.gender_concept_id,
-      p.race_concept_id
+      p.race_concept_id{extra_columns}
     FROM analytic a
     JOIN eligible e USING (person_id)
-    JOIN {datasets.table('omop', 'person')} p USING (person_id)
+    JOIN {datasets.table('omop', 'person')} p USING (person_id){extra_joins}
     {where_clause}
     """
