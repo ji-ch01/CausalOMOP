@@ -198,6 +198,110 @@ def evidence_summary(hypothesis: HypothesisArtifact) -> EvidenceSourceSummary:
     )
 
 
+#: How much a reviewer should trust one edge/node's assigned role,
+#: independent of *where* its citation(s) came from (that's
+#: `EvidenceSourceSummary`'s job). Grounded in GRADE (Guyatt GH, Oxman AD,
+#: Vist GE, et al. "GRADE: an emerging consensus on rating quality of
+#: evidence and strength of recommendations." BMJ. 2008;336(7650):924-926.
+#: doi:10.1136/bmj.39489.470347.AD), which rates evidence certainty
+#: high/moderate/low/very-low from study design and consistency -- adapted
+#: here to the signals this pipeline already records (evidence tier,
+#: contested/unknown-direction certainty, cross-source corroboration)
+#: rather than a full domain-by-domain GRADE assessment (risk of bias,
+#: indirectness, imprecision, publication bias are not evaluated).
+CONFIDENCE_GRADES = ("very_low", "low", "moderate", "high")
+
+#: Base grade from the citation's evidence tier, matching the hierarchy
+#: already documented in `causal/prompts/dag.md` (systematic_review > rct >
+#: observational > unclassified). `kg_structured` (an OptimusKG relation,
+#: not a graded clinical study) sits at the same starting point as `rct`;
+#: `uncited` (no citation at all) is excluded here and always floors at
+#: `very_low` in `confidence_grade` regardless of this table.
+_BASE_GRADE_BY_EVIDENCE_LEVEL: dict[str, str] = {
+    "systematic_review": "high",
+    "rct": "moderate",
+    "observational": "low",
+    "unclassified": "low",
+    "kg_structured": "moderate",
+}
+
+
+def confidence_grade(pmid: str, kg_evidence_id: str, evidence_level: str, certainty: str) -> str:
+    """Grade one edge/node's evidence quality (see `CONFIDENCE_GRADES` above).
+
+    Purely a function of already-recorded fields -- no new evidence is
+    fetched or re-checked here. An uncited, expert-asserted role
+    (`pmid == ""`) always floors at `"very_low"` regardless of whatever
+    `evidence_level` a caller passed, since there is no citation to grade.
+
+    - `certainty in {"contested", "unknown_direction"}` downgrades one
+      level: the literature itself disagrees about the relationship or its
+      direction, so even a well-tiered citation should not be trusted at
+      face value.
+    - A non-empty `kg_evidence_id` (an independent, corroborating
+      knowledge-graph confirmation of an already literature-cited item --
+      see `causal.agents.hypothesis.DAGVariable.kg_evidence_id`) upgrades
+      one level: two unrelated sources agreeing is exactly the kind of
+      thing that raises confidence under GRADE.
+    - Both adjustments clamp to `CONFIDENCE_GRADES`'s floor/ceiling; they
+      are independent and can both apply to the same item.
+    """
+    base = "very_low" if not pmid else _BASE_GRADE_BY_EVIDENCE_LEVEL.get(evidence_level, "low")
+    index = CONFIDENCE_GRADES.index(base)
+    if certainty in {"contested", "unknown_direction"}:
+        index = max(0, index - 1)
+    if kg_evidence_id:
+        index = min(len(CONFIDENCE_GRADES) - 1, index + 1)
+    return CONFIDENCE_GRADES[index]
+
+
+@dataclass(frozen=True)
+class ConfidenceSummary:
+    """Distribution of `confidence_grade` across every accepted `candidate_dag`
+    variable and `covariate_relations` edge.
+
+    Complements `EvidenceSourceSummary`: that one answers "where did this
+    item's evidence come from" (coverage), this one answers "how much
+    should a reviewer trust it" (quality) -- see `confidence_grade`.
+    """
+
+    total_items: int
+    high: int
+    moderate: int
+    low: int
+    very_low: int
+
+    @property
+    def high_or_moderate_fraction(self) -> float:
+        return (self.high + self.moderate) / self.total_items if self.total_items else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_items": self.total_items,
+            "high": self.high,
+            "moderate": self.moderate,
+            "low": self.low,
+            "very_low": self.very_low,
+            "high_or_moderate_fraction": self.high_or_moderate_fraction,
+        }
+
+
+def confidence_summary(hypothesis: HypothesisArtifact) -> ConfidenceSummary:
+    """Grade every accepted `candidate_dag` variable and `covariate_relations` edge (see `confidence_grade`)."""
+    counts = {grade: 0 for grade in CONFIDENCE_GRADES}
+    items = list(hypothesis.candidate_dag) + list(hypothesis.covariate_relations)
+    for item in items:
+        grade = confidence_grade(item.pmid, item.kg_evidence_id, item.evidence_level, item.certainty)
+        counts[grade] += 1
+    return ConfidenceSummary(
+        total_items=len(items),
+        high=counts["high"],
+        moderate=counts["moderate"],
+        low=counts["low"],
+        very_low=counts["very_low"],
+    )
+
+
 @dataclass(frozen=True)
 class AdjustmentSetSummary:
     """Cross-set structure of `DAGIdentificationResult.minimum_adjustment_sets`.
@@ -284,6 +388,7 @@ class DAGReviewResult:
     clinical: ClinicalValidationResult
     evidence: EvidenceSourceSummary
     adjustment: AdjustmentSetSummary
+    confidence: ConfidenceSummary
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -291,6 +396,7 @@ class DAGReviewResult:
             "clinical": self.clinical.to_dict(),
             "evidence": self.evidence.to_dict(),
             "adjustment": self.adjustment.to_dict(),
+            "confidence": self.confidence.to_dict(),
         }
 
 
@@ -494,6 +600,7 @@ def review_dag(hypothesis: HypothesisArtifact, max_candidates: int = 24) -> DAGR
         clinical=assess_clinical_completeness(hypothesis),
         evidence=evidence_summary(hypothesis),
         adjustment=adjustment_set_summary(identification),
+        confidence=confidence_summary(hypothesis),
     )
 
 

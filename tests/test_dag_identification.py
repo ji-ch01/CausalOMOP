@@ -6,6 +6,8 @@ from causal.agents.dag_identification import (
     assess_clinical_completeness,
     assess_identification,
     build_causal_dag,
+    confidence_grade,
+    confidence_summary,
     evidence_summary,
     review_dag,
 )
@@ -45,15 +47,26 @@ def protocol(
     }
 
 
-def confounder(label, pmid="111", temporal_classification="pre_treatment", kg_evidence_id=""):
-    return {
+def confounder(
+    label,
+    pmid="111",
+    temporal_classification="pre_treatment",
+    kg_evidence_id="",
+    certainty="established",
+    evidence_level=None,
+):
+    entry = {
         "label": label,
         "role": "confounder",
         "pmid": pmid,
         "temporal_classification": temporal_classification,
         "rationale": f"{label} influences both treatment choice and the outcome.",
         "kg_evidence_id": kg_evidence_id,
+        "certainty": certainty,
     }
+    if evidence_level is not None:
+        entry["evidence_level"] = evidence_level
+    return entry
 
 
 class DAGIdentificationTests(unittest.TestCase):
@@ -553,6 +566,93 @@ class EvidenceSummaryTests(unittest.TestCase):
         self.assertEqual(summary.corroborated_fraction, 0.0)
 
 
+class ConfidenceGradeTests(unittest.TestCase):
+    """`confidence_grade` is a pure function of (pmid, kg_evidence_id,
+    evidence_level, certainty) -- see its docstring for the GRADE-inspired
+    rule table."""
+
+    def test_uncited_floors_at_very_low_regardless_of_evidence_level(self):
+        self.assertEqual(
+            confidence_grade(pmid="", kg_evidence_id="", evidence_level="systematic_review", certainty="established"),
+            "very_low",
+        )
+
+    def test_base_grade_follows_the_documented_evidence_tier(self):
+        self.assertEqual(
+            confidence_grade("111", "", "systematic_review", "established"), "high"
+        )
+        self.assertEqual(confidence_grade("111", "", "rct", "established"), "moderate")
+        self.assertEqual(confidence_grade("111", "", "observational", "established"), "low")
+        self.assertEqual(confidence_grade("111", "", "unclassified", "established"), "low")
+        self.assertEqual(
+            confidence_grade("optimuskg:a|b|c", "", "kg_structured", "established"), "moderate"
+        )
+
+    def test_contested_or_unknown_direction_downgrades_one_level(self):
+        self.assertEqual(
+            confidence_grade("111", "", "systematic_review", "contested"), "moderate"
+        )
+        self.assertEqual(
+            confidence_grade("111", "", "observational", "unknown_direction"), "very_low"
+        )
+
+    def test_contested_cannot_downgrade_below_the_floor(self):
+        self.assertEqual(confidence_grade("", "", "unclassified", "contested"), "very_low")
+
+    def test_kg_corroboration_upgrades_one_level(self):
+        self.assertEqual(
+            confidence_grade("111", "optimuskg:x|y|z", "observational", "established"), "moderate"
+        )
+
+    def test_corroboration_cannot_upgrade_above_the_ceiling(self):
+        self.assertEqual(
+            confidence_grade("111", "optimuskg:x|y|z", "systematic_review", "established"), "high"
+        )
+
+    def test_downgrade_and_upgrade_can_both_apply(self):
+        # observational (low) -> contested downgrades to very_low -> corroboration upgrades back to low.
+        self.assertEqual(
+            confidence_grade("111", "optimuskg:x|y|z", "observational", "contested"), "low"
+        )
+
+
+class ConfidenceSummaryTests(unittest.TestCase):
+    def test_classifies_each_grade_bucket(self):
+        hypothesis = HypothesisAgent().run(protocol(candidate_dag=[
+            confounder("high conf", pmid="111", evidence_level="systematic_review"),
+            confounder("moderate conf", pmid="111", evidence_level="rct"),
+            confounder("low conf", pmid="111", evidence_level="observational"),
+            confounder("very low conf", pmid=""),
+        ]))
+        summary = confidence_summary(hypothesis)
+        self.assertEqual(summary.total_items, 4)
+        self.assertEqual(summary.high, 1)
+        self.assertEqual(summary.moderate, 1)
+        self.assertEqual(summary.low, 1)
+        self.assertEqual(summary.very_low, 1)
+        self.assertAlmostEqual(summary.high_or_moderate_fraction, 0.5)
+
+    def test_covariate_relations_count_toward_the_same_summary(self):
+        hypothesis = HypothesisAgent().run(protocol(
+            candidate_dag=[confounder("a"), confounder("b")],
+            covariate_relations=[
+                {
+                    "source": "a", "target": "b", "pmid": "111",
+                    "rationale": "a precedes b.", "evidence_level": "rct",
+                }
+            ],
+        ))
+        summary = confidence_summary(hypothesis)
+        self.assertEqual(summary.total_items, 3)
+        self.assertEqual(summary.moderate, 1)
+
+    def test_empty_dag_reports_zero_fraction_not_a_division_error(self):
+        hypothesis = HypothesisAgent().run(protocol())
+        summary = confidence_summary(hypothesis)
+        self.assertEqual(summary.total_items, 0)
+        self.assertEqual(summary.high_or_moderate_fraction, 0.0)
+
+
 def _node(node_id, role, timing="baseline", observed=True):
     return CausalNode(node_id, node_id.replace("_", " ").title(), role, timing, observed)
 
@@ -667,8 +767,10 @@ class ReviewDagIncludesMetricsTests(unittest.TestCase):
         self.assertEqual(review.evidence.literature_only, 1)
         self.assertEqual(review.adjustment.set_count, 1)
         self.assertEqual(review.adjustment.core_variable_labels, ("SOFA score",))
+        self.assertEqual(review.confidence.total_items, 1)
         self.assertIn("evidence", review.to_dict())
         self.assertIn("adjustment", review.to_dict())
+        self.assertIn("confidence", review.to_dict())
 
 
 if __name__ == "__main__":
