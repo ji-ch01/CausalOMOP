@@ -41,6 +41,24 @@ class ExecutionAgentTests(unittest.TestCase):
         self.assertTrue(result.causal_estimation_allowed)
         self.assertEqual(result.status, "ready_for_causal_execution")
 
+    def test_a_covariate_not_yet_ready_blocks_estimation_even_with_gates_approved(self):
+        """A non-demographic covariate stuck at `status="definition_pending"`
+        (mapping approved but aggregation not yet reviewed, or vice versa --
+        see `causal.agents.data_science.DataScienceAgent._covariate`) must
+        still block `causal_estimation_allowed`, even once the top-level
+        `clinical_mapping` gate is approved -- the top-level gate alone is
+        not proof every individual covariate is actually ready."""
+        study_plan = plan(exploratory_allowed=True)
+        study_plan["covariates"] = [{"name": "sofa_score", "status": "definition_pending"}]
+        result = ExecutionAgent().run(
+            study_plan,
+            mode="exploratory",
+            clinical_mapping_status="approved",
+            analysis_plan_status="approved",
+        )
+        self.assertFalse(result.causal_estimation_allowed)
+        self.assertIn("covariate_not_ready:sofa_score", result.blockers)
+
 
 if __name__ == "__main__":
     unittest.main()
