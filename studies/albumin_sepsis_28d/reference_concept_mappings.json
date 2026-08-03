@@ -1,0 +1,38 @@
+{
+  "source": {
+    "description": "Reference set for causal.mapping.metrics.evaluate_lookup_accuracy: for each clinical term this study searches OMOP concepts for, the concept_id an OMCP Lookup_Condition/Lookup_Drug/Lookup_Concept search is expected to surface. Seeded from the manual concept review already documented in concept_audit.md, not from protocol.json's mapping_status/status -- those record whether a human reviewer has formally approved a mapping into the workflow (see causal.mapping.registry.OMOPVariableDefinition.root_concept_ids), which is a separate notion from whether the search step can find the right candidate at all. A case here can be a valid recall/MRR target before a reviewer has clicked 'approve'.",
+    "study": "studies/albumin_sepsis_28d",
+    "created_on": "2026-08-03",
+    "derived_from": "studies/albumin_sepsis_28d/concept_audit.md (2026-07-15 audit) and protocol.json's concept_sets (term/domain actually searched by causal.agents.data_science.DataScienceAgent._lookup_candidates)",
+    "notes": [
+      "sepsis/septic_shock: concept_audit.md verified these concept_ids exist as standard SNOMED condition concepts with real row/person counts in the audited dataset -- a manual clinical review, but not (yet) an 'approved' mapping in protocol.json (status='candidate_pending_human_approval' there). Good recall/MRR targets regardless.",
+      "albumin/crystalloids ('sodium chloride', the term protocol.json's lookup_term actually searches): concept_audit.md found every audited source value maps to drug_concept_id=0 (albumin) or is dominated by non-resuscitation products (flushes, irrigation -- crystalloids), i.e. no standard OMOP concept currently identifies the exposure. expected_concept_id is null for both -- a documented upstream ETL/vocabulary gap, not something a better search algorithm can fix. See evaluate_lookup_accuracy's known_gap_case_count."
+    ]
+  },
+  "cases": [
+    {
+      "term": "sepsis",
+      "domain": "condition",
+      "expected_concept_id": 132797,
+      "note": "concept_audit.md: 6,283 rows / 4,838 persons in condition_occurrence; candidate seed for the population phenotype."
+    },
+    {
+      "term": "septic shock",
+      "domain": "condition",
+      "expected_concept_id": 196236,
+      "note": "concept_audit.md: 2,992 rows / 2,719 persons in condition_occurrence; candidate effect-modifier seed."
+    },
+    {
+      "term": "albumin",
+      "domain": "drug",
+      "expected_concept_id": null,
+      "note": "concept_audit.md: all audited albumin source values map to drug_concept_id=0 (no matching concept) -- known ETL gap, excluded from recall/MRR."
+    },
+    {
+      "term": "sodium chloride",
+      "domain": "drug",
+      "expected_concept_id": null,
+      "note": "concept_audit.md: the crystalloids exposure (Lactated Ringer's, resuscitation NaCl) is unmapped/dominated by non-resuscitation products; 'sodium chloride' alone cannot standard-map the intended exposure -- known ETL/definition gap, excluded from recall/MRR."
+    }
+  ]
+}
