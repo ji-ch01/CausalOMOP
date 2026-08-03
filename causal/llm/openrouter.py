@@ -24,8 +24,11 @@ class OpenRouterGPTConfig:
     # free-form "analysis" preamble before emitting the requested JSON,
     # especially for the DAG stage where ~15+ retrieved abstracts are in
     # context; 2500 was observed truncating mid-reasoning and silently
-    # falling back to an empty candidate_dag.
-    max_completion_tokens: int = 6000
+    # falling back to an empty candidate_dag. 6000 was itself observed
+    # (2026-08-03) truncating even the much shorter target_trial_draft
+    # stage into a near-empty, unparseable response -- raised again with no
+    # evidence yet that this is the ceiling either.
+    max_completion_tokens: int = 12000
 
     @classmethod
     def from_env(cls, model: str | None = None) -> "OpenRouterGPTConfig":
