@@ -89,11 +89,11 @@ path, untouched; `tournament_size>1` (hard-capped at
 `dag_tournament.MAX_TOURNAMENT_SIZE = 5`) drafts that many independent
 candidates (each through its own bounded critique loop, §2.2), then:
 
-1. **Ranks** them by the exact lexicographic key §9 specified
-   (`identified_by_backdoor_adjustment`, `approved_for_dag_gate`,
-   `confidence.high_or_moderate_fraction`), reusing `build_pre_check`
-   (§2.2/§2.3's own machinery) per candidate rather than recomputing
-   anything.
+1. **Ranks** them by the lexicographic key §9 specified
+   (`identified_by_backdoor_adjustment`, `approved_for_dag_gate`; see §0e —
+   originally a 3-tuple with a GRADE-based confidence tiebreak, since
+   removed), reusing `build_pre_check` (§2.2/§2.3's own machinery) per
+   candidate rather than recomputing anything.
 2. **Dedups** near-duplicates via `structural_hamming_distance`, keeping the
    best-ranked member of each duplicate cluster. One deviation from the
    original design worth flagging: the SHD papers cited in §9 define a
@@ -123,20 +123,226 @@ Each candidate's own `llm_outputs` stage tags are suffixed
 (`literature_dag_draft_candidate2`, `literature_dag_critique_candidate2_round1`,
 ...) so the audit trail stays unambiguous across the whole population, not
 just the final merge. `protocol["dag_tournament"]` (candidate/survivor/
-dropped-duplicate counts, a per-survivor summary, and the conflict list) is
-new, structured, machine-readable audit output alongside the existing
-free-text `design_constraints` note; surfaced in `workflow dag-export`'s
-stderr and the Streamlit "Hypothesis & DAG" tab, mirroring how §7/§7c's
-metrics are already surfaced. See `tests/test_dag_tournament.py` (SHD,
-ranking, dedup, and all four conflict types in isolation) and
-`test_user_question_hypothesis.py`'s `TournamentModeTests` (end-to-end
-through `UserQuestionHypothesisService.generate`) for exact semantics.
+dropped-duplicate counts, a per-survivor summary, the conflict list, and —
+since §0f — pairwise SHD/SID between every ranked candidate plus each
+survivor's SID to the final merge) is new, structured, machine-readable
+audit output alongside the existing free-text `design_constraints` note;
+surfaced in `workflow dag-export`'s stderr and the Streamlit "Hypothesis &
+DAG" tab, mirroring how §7's metrics are already surfaced. See
+`tests/test_dag_metrics.py` (SHD, SID, and the paper's own Example 1
+reproduced as a numeric check) and `tests/test_dag_tournament.py` (ranking,
+dedup, all four conflict types, pairwise distances, and merge fidelity, all
+in isolation) and `test_user_question_hypothesis.py`'s `TournamentModeTests`
+(end-to-end through `UserQuestionHypothesisService.generate`) for exact
+semantics.
 
 **Not done in this pass**: `causal.orchestrator.workflow.WorkflowManager`
 has no tournament-specific method — `tournament_size` flows through
 `UserQuestionHypothesisService.generate` exactly like `max_critique_rounds`
 already does, so no workflow-layer change was needed. Phase 4 (cross-run
 reviewer memory plus a `WorkflowManager` auto-run mode) remains unstarted.
+
+## 0e. Update — 2026-07-31: GRADE confidence grading removed
+
+`confidence_grade`/`ConfidenceSummary` (§7c, Phase 1 of the roadmap above)
+were removed by project decision: GRADE rates the certainty of evidence
+backing a specific clinical claim, and grading a whole DAG edge/node with it
+treated a methodology built for judging one study's evidence base as if it
+were a metric for judging graph structure — not a fit the project wants to
+carry forward. `causal.agents.dag_identification.confidence_grade`/
+`ConfidenceSummary`/`confidence_summary` and `DAGReviewResult.confidence` are
+gone; `evidence_level`/`certainty`/`kg_evidence_id` on `DAGVariable`/
+`CovariateRelation` are untouched and still feed `EvidenceSourceSummary`
+(§7, a *coverage* metric, never a *quality* grade) and are still shown
+per-item (raw, ungraded) in the CLI/Streamlit evidence table. The tournament
+mode's `rank_key` (§9, §0d) drops the confidence tiebreak and is now a
+2-tuple (`identified_by_backdoor_adjustment`, `approved_for_dag_gate`);
+candidates tied on both keep drafting order (stable sort) instead of
+breaking the tie on a confidence fraction. §7c below is kept for the
+historical record of what existed and why; treat it as removed, not
+current.
+
+## 0f. Update — 2026-08-03: SID actually implemented, SHD/SID surfaced as audit metrics
+
+Before this pass, §9's SID citation (Peters & Buhlmann 2015, Proposition 7)
+justified *why* the edge-union merge is sound but nothing in the codebase
+ever computed an SID value — a real gap between what the design claimed and
+what ran. This closes it, and extracts both distance metrics out of the
+tournament module into their own:
+
+- **`causal.agents.dag_metrics`** (new module): `structural_hamming_distance`
+  (moved, unchanged) and `structural_intervention_distance` (new). SID is
+  implemented from the paper's own graphical, distribution-free
+  characterization (Definition 4 via Proposition 6, which in turn rests on
+  Lemma 5's adjustment-set criterion) — not an approximation of it: for
+  every ordered label pair `(i, j)`, `i`'s parent set in the estimate is
+  checked against Lemma 5's adjustment-validity condition in the true
+  graph, via direct enumeration of the (small, clinically-reviewable)
+  graph's simple paths and the standard d-separation collider/non-collider
+  blocking rule. `tests/test_dag_metrics.py` reproduces the paper's own
+  Example 1 (Figure 2) verbatim, including both published numeric results
+  (`SID(G, H1) = 0`, `SID(G, H2) = 8`) — the strongest available check that
+  this matches the paper rather than an invented reading of it. Both
+  metrics share the same known limitation (graphs compared at the node-
+  *label* level, so a label present in only one graph is treated as
+  isolated in the other — see §6/§9's OptimusKG/SHD precedent for the same
+  class of limitation), and SID has one more of its own worth naming: an
+  edge asserted between two labels that are simply unrelated (neither a
+  descendant of the other) in the true graph is not penalized unless it
+  also breaks a valid-adjustment-set check elsewhere — a property of SID
+  itself (Peters & Buhlmann's own point: SID only counts errors that change
+  a computed intervention distribution, unlike SHD), not an artifact of
+  this implementation.
+- **`compute_pairwise_distances`** (`causal.agents.dag_tournament`, new):
+  SHD and *both* directions of SID (SID is not symmetric) for every pair of
+  ranked, pre-dedup candidates — not just the dedup pass/fail outcome dedup
+  itself already computed. Motivation is the paper's own point in the
+  passage above: two candidates can disagree on the same number of edges
+  (equal SHD) yet have wildly different SID, i.e. wildly different
+  consequences for the causal conclusions drawn from each — a distinction
+  SHD alone cannot surface, which the previous "N dropped as SHD-duplicates"
+  summary hid entirely.
+- **`compute_merge_fidelity`** (`causal.agents.dag_tournament`, new): SID
+  from each survivor's own DAG to the final merged DAG. Proposition 7
+  implies this should be exactly 0 (the merge is an edge union, so every
+  survivor's edges are a literal subset of the merged DAG's — by
+  construction, not by assumption) *unless* a role/direction/structural
+  `MergeConflict` excluded some of that survivor's own variables or
+  relations from the merge, in which case a positive value quantifies how
+  much of that candidate's own causal-inference conclusions were not
+  carried into the merge — a live check on the merge's own soundness,
+  surfaced for the human already reviewing the conflict list, rather than a
+  bare assertion that Proposition 7 "must" hold.
+
+Both are threaded into `protocol["dag_tournament"]["pairwise_distances"]`/
+`["merge_fidelity"]` (`causal.agents.user_question`) and rendered in the
+Streamlit "Hypothesis & DAG" tab under a "Pairwise SHD/SID and merge
+fidelity" expander (`causal.ui.streamlit_app`). `TournamentCandidate`'s own
+`summary_dict` had a `high_or_moderate_fraction` key from the now-removed
+GRADE tiebreak (§0e); that key is gone from it, unrelated to this pass.
+
+**Reference-DAG comparison, started same day**: `studies/albumin_sepsis_28d/
+reference_dag.json` transcribes the published study's own expert DAG (S6
+Fig, built by the paper's authors with a clinician via DAGitty) into the
+same `candidate_dag`/`covariate_relations` shape the rest of the pipeline
+uses, with per-node provenance and explicit transcription-confidence notes
+(`source.transcription_notes`) for the handful of edges that could not be
+read from the figure with full confidence. `tests/test_reference_dag_
+albumin_sepsis.py` guards the artifact against silently breaking. Comparing
+this reference against a CausalOMOP-*generated* DAG for the same study (the
+"how close is automated drafting to expert judgment" number) is not done
+yet — no `candidate_dag` has been drafted for this study through the
+pipeline itself.
+
+**Scalability limitation surfaced by this transcription, not fixed**: the
+reference DAG has 20 *observed* baseline confounders, and — because 3 more
+confounders are transcribed as unobserved (matching the paper's own gray
+"not available in the data" nodes) — no valid backdoor adjustment set
+exists among those 20 at *any* size. `causal.agents.dag_critique.
+build_pre_check` (via `assess_identification`'s default `max_candidates=24`)
+calls `CausalDAG.minimum_adjustment_sets`, whose exhaustive `combinations`
+search cannot short-circuit in this "no valid set exists" case: it must
+enumerate all `2**20` (~1e6) subsets before concluding failure, which does
+not finish in practical time. `structural_intervention_distance`/
+`structural_hamming_distance` never needed that search in the first place —
+they only need the graph structure — so `tests/test_reference_dag_
+albumin_sepsis.py` builds the `CausalDAG` via `build_causal_dag` directly
+(skipping `assess_identification` entirely) instead of `build_pre_check`.
+This is a real, pre-existing scalability gap in `minimum_adjustment_sets`
+for realistically-sized *published* DAGs (15–25 variables, well beyond a
+typical LLM-drafted candidate's handful) — noted here, not fixed, since
+nothing asked for it in this pass and it is unrelated to the SID/SHD work
+itself.
+
+## 0g. Update — 2026-08-03: a grounding caveat, surfaced everywhere a DAG verdict is
+
+Prompted by the question this audit's own headline caveat (§6, first bullet)
+begs: for an arbitrary user question — not the one study
+(`albumin_sepsis_28d`) that happens to have a hand-transcribed published
+reference DAG (§0f) — there is no way to *guarantee* a generated DAG is
+literature-grounded or clinically correct. Two options were considered:
+(a) automatically search literature/KG evidence for a published reference
+DAG on every question and run the same SHD/SID comparison §0f did by hand,
+or (b) make the *absence* of that guarantee explicit wherever a DAG's
+verdict is shown, so `identified_by_backdoor_adjustment` /
+`approved_for_dag_gate` are never mistaken for "clinically validated". (a)
+was set aside — most clinical questions have no published DAG to find, so
+it would add an LLM/search cost for a rarely-successful lookup — in favor
+of (b), by project decision.
+
+`causal.agents.dag_identification.grounding_caveat(evidence:
+EvidenceSourceSummary) -> str` is a fixed disclaimer, not a new computed
+verdict: it states plainly that no published or expert reference DAG was
+checked against this graph, that "identified" / "approved for DAG gate"
+mean only "no known blocking issue was found", and restates §7's citation
+coverage (`cited_fraction`/`corroborated_fraction`) as the closest thing to
+a grounding signal this pipeline has — explicitly a *coverage* metric, not
+a *correctness* one. Bundled into `DAGReviewResult.caveat` (`review_dag`),
+so every existing caller of `review_dag` gets it automatically: rendered as
+a persistent `st.warning` at the top of the Streamlit "Hypothesis & DAG"
+tab's DAG section, and as a `// caveat: ...` line in `workflow dag-export`'s
+stderr output, alongside the identification/evidence/adjustment lines §7
+already prints there. No governance change and no new LLM call — purely
+additive, read-only text derived from a metric the pipeline already
+computes. See `tests/test_dag_identification.py`'s `GroundingCaveatTests`.
+
+**Not a fix for §6's first bullet** — the DAGs this pipeline drafts are
+exactly as clinically complete as before this change; only the *legibility*
+of that limitation changed, from "documented in this audit" to "shown next
+to every verdict a reviewer sees."
+
+## 0h. Update — 2026-08-03: the same benchmarking gap, closed for concept mapping (adjacent to this audit, not DAG generation itself)
+
+§0f closed "SID is cited but never computed" for DAG structure. The
+clinical-term → OMOP concept-lookup step (`causal.agents.data_science.
+DataScienceAgent._lookup_candidates`, backed by OMCP's `Lookup_Condition`/
+`Lookup_Drug`/`Lookup_Concept`) had the exact same shape of gap: no
+precision/recall benchmark existed anywhere in the repo for whether that
+search actually surfaces the concept a reviewer would approve. This is not
+a DAG-generation change — noted here only because it follows the same
+"measure with an established, citable metric before/after changing the
+underlying method" discipline as §0f, and because OMCP's search itself was
+improved in the same pass (see below).
+
+- **`causal.mapping.metrics`** (new module): `recall_at_k` and
+  `reciprocal_rank`/mean reciprocal rank (MRR) — standard information-
+  retrieval metrics (Manning, Raghavan & Schuetze 2008; Voorhees 1999),
+  not an invented heuristic. `evaluate_lookup_accuracy` aggregates both
+  over a list of `LookupCase`s, excluding cases with no achievable standard
+  concept today (a documented upstream ETL/vocabulary gap) from the score
+  rather than letting them silently look like search failures.
+- **`studies/albumin_sepsis_28d/reference_concept_mappings.json`** (new):
+  seeded from the manual concept review already written down in
+  `concept_audit.md` — sepsis/septic_shock as real recall/MRR targets,
+  albumin/crystalloids as documented known-gap cases (`expected_concept_id:
+  null`). Same caveat as `reference_dag.json` (§0f): this encodes a
+  documented clinical/data judgment, not a `protocol.json` workflow
+  approval — see the file's own `source.description`.
+- **OMCP search itself** (`omcp/src/omcp/concept_lookup.py`): every
+  name-search query now also computes `name_edit_distance` (Levenshtein
+  distance from the search term to a candidate's own name) and orders by
+  it instead of plain shortest-name-first, and automatically retries with a
+  length-scaled fuzzy (edit-distance) match — following the same
+  length-scaled tolerance Elasticsearch/Lucene document for "AUTO"
+  fuzziness (Schulz & Mihov 2002) — when the first page of an exact/
+  substring search returns nothing. `causal.agents.data_science.
+  ConceptCandidate` and the Streamlit review UI both surface the resulting
+  `match_score` to the reviewer.
+- **`causal.agents.data_science._attach_covariate_concept_candidates`**: a
+  covariate whose DAG entry has no OMOP `domain` yet was already,
+  deliberately, left unmapped rather than guessed ("clinical judgment is
+  explicit and checked") — but that used to leave it silently stuck at
+  `definition_pending` with nothing telling a reviewer why. It now also
+  appears in `unresolved_issues` as `covariate:{label}:missing_domain`, the
+  same pattern `covariate:{label}:unclassified_by_dag` already used.
+
+**Not done**: running `evaluate_lookup_accuracy` against a live OMCP/
+BigQuery connection is a manual step (no credentials in CI) —
+`tests/test_concept_mapping_metrics.py` only checks the metric functions
+themselves (hand-built cases) and the reference file's shape, the same
+split §0f's `tests/test_dag_metrics.py`/`tests/test_reference_dag_
+albumin_sepsis.py` use. No actual before/after recall@k/MRR numbers exist
+yet for this pipeline's own OMOP dataset.
 
 ## 1. What "DAG generation" means in this codebase
 
@@ -276,9 +482,9 @@ amplify bias from unmeasured confounding.
 
 | File | Lines | Focus |
 |---|---|---|
-| `tests/test_dag_identification.py` | 777 | backdoor identification, clinical completeness, role→edge mapping, evidence/adjustment-set/confidence-grade metrics |
+| `tests/test_dag_identification.py` | 686 | backdoor identification, clinical completeness, role→edge mapping, evidence/adjustment-set metrics |
 | `tests/test_dag_critique.py` | 180 | prompt building, critique parsing, revision merging |
-| `tests/test_user_question_hypothesis.py` | 1353 | drafting prompt, evidence gating, KG reinforcement, covariate-targeted KG lookup, evidence-level tagging, bounded critique-loop rounds, tournament-mode end-to-end generation, end-to-end generation |
+| `tests/test_user_question_hypothesis.py` | 1395 | drafting prompt, evidence gating, KG reinforcement, covariate-targeted KG lookup, evidence-level tagging, bounded critique-loop rounds, tournament-mode end-to-end generation, end-to-end generation |
 | `tests/test_dag_tournament.py` | 221 | SHD, lexicographic ranking, SHD-based dedup, and all four merge-conflict types (`role`/`direction`/`cycle`/`structural`) in isolation |
 | `tests/test_workflow.py` | 357 | gate blocking behavior, covariate review, run lifecycle |
 | `tests/test_cli_dag_export.py` | 90 | `workflow dag-export` end to end through the real `causal.cli.main()` entry point |
@@ -310,7 +516,10 @@ amplify bias from unmeasured confounding.
   DAG must still go through the human covariate-review flow
   (`WorkflowManager.review_covariate`) and clinical judgment before it is
   anything more than a first-pass draft — this is the current bottleneck, not
-  a solved part of the pipeline.
+  a solved part of the pipeline. Since §0g, this limitation is at least
+  surfaced explicitly next to every identification/clinical verdict
+  (`DAGReviewResult.caveat`) rather than living only in this document — the
+  limitation itself is unchanged, only its visibility to a reviewer is.
 - **OptimusKG schema is still unconfirmed against the installed dataset.**
   The client's own docstring flags that Biolink-style column names
   (`name`/`category`/`subject`/`predicate`/`object`) were not fully verified
@@ -383,51 +592,26 @@ Both are surfaced in the Streamlit "Hypothesis & DAG" tab and in
 `ReviewDagIncludesMetricsTests`) for the exact semantics, including the
 synthetic-DAG fixture that exercises core/alternative/unused in one graph.
 
-## 7c. Confidence grading (added — Phase 1 of the 4-part extension roadmap)
+## 7c. Confidence grading (added — Phase 1 of the 4-part extension roadmap; **removed 2026-07-31, see §0e**)
 
-`EvidenceSourceSummary` (§7) answers "where did this item's citation come
-from" — a *coverage* question. It deliberately does not answer "how much
-should a reviewer trust it" — a *quality* question, since a `literature_only`
-item cited by a single, contested, unclassified-publication-type abstract is
-not as trustworthy as one cited by an uncontested systematic review.
+**Removed.** This section originally documented
 `causal.agents.dag_identification.confidence_grade`/`ConfidenceSummary`
 (`confidence_summary`, bundled into `review_dag` as `DAGReviewResult.
-confidence`) close that gap with a GRADE-inspired grading (Guyatt GH, Oxman
-AD, Vist GE, et al. "GRADE: an emerging consensus on rating quality of
-evidence and strength of recommendations." *BMJ*. 2008;336(7650):924–926.
-[doi:10.1136/bmj.39489.470347.AD](https://doi.org/10.1136/bmj.39489.470347.AD)):
-
-- **Base grade** comes from the citation's evidence tier — the same
-  `systematic_review` / `rct` / `observational` / `unclassified` hierarchy
-  `causal/prompts/dag.md` already documents to the drafting LLM, now
-  additionally recorded per-item as `evidence_level` on `DAGVariable`/
-  `CovariateRelation` (populated by `causal.agents.user_question.
-  _parse_dag_response` via a new `_evidence_level_map`, since the retrieved
-  `LiteratureArticle`/`KGEdge` objects that carry it are no longer in scope
-  once an item is accepted). A knowledge-graph-only citation grades
-  `"kg_structured"` (a structured fact, not a graded publication) and an
-  uncited, expert-asserted role (`pmid == ""`) always floors at `very_low`.
-- **`certainty in {"contested", "unknown_direction"}` downgrades one level**
-  — the literature itself disagrees about the relationship or its
-  direction, independent of how strong an individual cited study is.
-- **A non-empty `kg_evidence_id`** (independent knowledge-graph
-  corroboration of an already literature-cited item, see §2.1) **upgrades
-  one level** — two unrelated sources agreeing is exactly the signal GRADE
-  treats as raising confidence.
-- Both adjustments clamp to the four-level scale (`very_low` / `low` /
-  `moderate` / `high`) and can both apply to the same item.
-
-This is a simplified, single-function adaptation of GRADE's full
-domain-by-domain assessment (risk of bias, indirectness, imprecision, and
-publication bias are not separately evaluated here) — it reuses only the
-signals this pipeline already records, not a new evidence-appraisal
-pipeline. Like §7's metrics, it is read-only and never feeds back into
-`assess_identification`/`assess_clinical_completeness` or gate approval.
-Surfaced next to the evidence/adjustment-set metrics in the Streamlit
-"Hypothesis & DAG" tab and `workflow dag-export`'s stderr output. See
-`tests/test_dag_identification.py` (`ConfidenceGradeTests`,
-`ConfidenceSummaryTests`) and `tests/test_user_question_hypothesis.py`
-(`EvidenceLevelTests`) for exact semantics.
+confidence`): a GRADE-inspired grading (Guyatt GH, Oxman AD, Vist GE, et al.
+"GRADE: an emerging consensus on rating quality of evidence and strength of
+recommendations." *BMJ*. 2008;336(7650):924–926.
+[doi:10.1136/bmj.39489.470347.AD](https://doi.org/10.1136/bmj.39489.470347.AD))
+of `EvidenceSourceSummary` (§7) items — base grade from evidence tier,
+downgraded one level for contested/unknown-direction certainty, upgraded
+one level for independent KG corroboration, clamped to a four-level
+`very_low`/`low`/`moderate`/`high` scale. It was removed by project
+decision that GRADE — a framework for rating the certainty of evidence
+behind one clinical claim — is not an appropriate metric for grading DAG
+structure (nodes/edges), even in this simplified single-function form. See
+§0e for what replaced it (nothing — the tournament's `rank_key`, §9, simply
+dropped the confidence tiebreak) and what still uses the underlying
+`evidence_level`/`certainty`/`kg_evidence_id` fields (§7's
+`EvidenceSourceSummary`, unaffected).
 
 ## 8. `causal-learn` (causal discovery) — evaluated, not integrated
 
@@ -509,7 +693,8 @@ named metric from the causal-discovery literature or a direct consequence
 of a proven property in it:
 
 - **Structural Hamming Distance (SHD)** for the dedup pass, in place of
-  Jaccard similarity. SHD counts, over the union of both graphs' node
+  Jaccard similarity (now in `causal.agents.dag_metrics`, alongside SID —
+  see §0f). SHD counts, over the union of both graphs' node
   labels, every pair whose edge type (no edge / `a->b` / `b->a`) differs
   between two candidates (Acid, S. & de Campos, L.M. (2003). Searching for
   Bayesian network structures in the space of restricted acyclic partially
@@ -524,11 +709,12 @@ of a proven property in it:
   genuinely different variables, the same class of limitation already
   flagged for OptimusKG's substring matching in §6.
 - **A lexicographic ranking**, in place of a weighted score: sort candidates
-  by `(identified_by_backdoor_adjustment, approved_for_dag_gate,
-  confidence.high_or_moderate_fraction)` descending. Identification (Pearl
-  1995 backdoor criterion, README References) and clinical completeness
-  strictly outrank the §7c GRADE-based confidence fraction, which only
-  breaks ties — no new weights or magic numbers.
+  by `(identified_by_backdoor_adjustment, approved_for_dag_gate)`
+  descending — no new weights or magic numbers. Originally a 3-tuple with a
+  §7c GRADE-based confidence fraction as a tiebreak; removed along with §7c
+  (§0e). Candidates tied on both remaining keys keep their original
+  (drafting) order (`rank_candidates` is a stable sort) rather than being
+  broken by a third key.
 - **A deterministic edge-union merge**, in place of an LLM "Evolution
   agent," justified by Peters, J. & Bühlmann, P. (2015). Structural
   Intervention Distance (SID) for Evaluating Causal Graphs. *Neural
@@ -545,7 +731,11 @@ of a proven property in it:
   drop. This removes an LLM call from the pipeline entirely (cheaper, fully
   auditable, grounded in a proven graph property instead of LLM judgment on
   which candidates to trust) and only reuses the deterministic acyclicity
-  check `causal.roadmap.CausalDAG` already has.
+  check `causal.roadmap.CausalDAG` already has. At the time this bullet was
+  originally written, SID itself was cited but never computed — closed in
+  §0f, which also uses SID to check Proposition 7 against the *actual*
+  merge output (`compute_merge_fidelity`) rather than only asserting it
+  algebraically here.
 - One more critique round (§2.2) still runs on the merged result — a
   structural union cannot judge clinical plausibility on its own, so this
   is the one LLM call the merge step keeps.
