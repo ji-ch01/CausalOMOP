@@ -1,0 +1,46 @@
+{
+  "source": {
+    "description": "Expert DAG from the published MIMIC-IV target-trial emulation this study replicates, built by the paper's own authors with a clinician using DAGitty (dagitty.net), per the paper's methods section.",
+    "doi": "10.1371/journal.pdig.0000721",
+    "figure": "S6 Fig, \"Directed Acyclic Graph\" (Fig 1 in the supplement: \"Causal graph for the Albumin vs crystalloids emulated trial\")",
+    "code_repository": "https://github.com/soda-inria/causal_ehr_mimic",
+    "transcribed_on": "2026-08-03",
+    "transcribed_by": "manual transcription of the S6 Fig PDF supplied by the user",
+    "transcription_notes": [
+      "Every node in the figure sends an edge to both the treatment and the outcome (a dense confounder fan; the figure caption states only the most important edges are drawn from an expert point of view) -- encoded here as role='confounder' for every node, except the two relations noted below.",
+      "Gray nodes in the figure (Socio-economical factor, Comorbidity, lifestyle) are captioned 'not controlled for since they are not available in the data' -- encoded here as observed=false confounders, not omitted, so identification checks see them as a real (unobservable) backdoor path rather than as absent from the model.",
+      "Two edges (Comorbidity -> SOFA, Comorbidity -> SAPSII) are visually distinct short arrows breaking from the dominant long-arrow fan pattern and are transcribed with moderate, not full, confidence -- not independently re-verified against a higher-resolution render of the PDF.",
+      "AKI stage and Dialysis (RRT) are encoded as plain confounders like every other node. The figure may draw a more specific relationship between the two (e.g. AKI severity preceding RRT initiation), but this could not be read with confidence from the available render and was deliberately not invented -- verify directly against the source PDF before relying on this pair specifically.",
+      "Node labels are taken verbatim from the figure and do not necessarily match this study's own protocol.json wording (e.g. figure 'Albumin + crystalloids' vs protocol.json's longer target_trial.treatment string) -- structural_hamming_distance/structural_intervention_distance compare graphs at the node-label level (see causal.agents.dag_metrics), so any future generated candidate_dag must use labels that at least approximately match these for a comparison to be meaningful."
+    ]
+  },
+  "variables": [
+    {"label": "Age at admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig, DOI 10.1371/journal.pdig.0000721): common cause of the albumin/crystalloids treatment decision and 28-day mortality.", "pmid": "", "observed": true},
+    {"label": "Gender", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Race", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Weight", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision (fluid dosing) and mortality.", "pmid": "", "observed": true},
+    {"label": "Emergency at admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Mean Blood Pressure", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of fluid/albumin treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Heart rate", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Lactate", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision (illness severity) and mortality.", "pmid": "", "observed": true},
+    {"label": "Insurance, Medicare", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality (access-to-care proxy).", "pmid": "", "observed": true},
+    {"label": "Antibiotics", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "SOFA", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): illness-severity score, common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "SAPSII", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): illness-severity score, common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Temperature", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Respiratory rate", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Ventilation", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Vasopressors", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "SpO2", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Urine output", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "AKI stage", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Dialysis (RRT)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Socio-economical factor", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality; drawn gray -- not controlled for since not available in the data.", "pmid": "", "observed": false},
+    {"label": "Comorbidity", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality; drawn gray -- not controlled for since not available in the data.", "pmid": "", "observed": false},
+    {"label": "lifestyle", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality; drawn gray -- not controlled for since not available in the data.", "pmid": "", "observed": false}
+  ],
+  "relations": [
+    {"source": "Comorbidity", "target": "SOFA", "rationale": "Expert DAG (S6 Fig): comorbidity burden contributes to the SOFA severity score (transcribed with moderate confidence, see source.transcription_notes).", "pmid": ""},
+    {"source": "Comorbidity", "target": "SAPSII", "rationale": "Expert DAG (S6 Fig): comorbidity burden contributes to the SAPSII severity score (transcribed with moderate confidence, see source.transcription_notes).", "pmid": ""}
+  ]
+}
