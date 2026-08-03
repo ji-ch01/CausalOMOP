@@ -165,6 +165,36 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         self.assertEqual(raw_artifact["outputs"][0]["raw_text"], json.dumps(valid_response()))
         self.assertTrue(raw_artifact["contains_raw_llm_text"])
 
+    def test_concept_sets_seed_lookup_term_from_literature_search(self):
+        response = valid_response()
+        response["target_trial"]["population"] = (
+            "Adult (>=18 years) ICU patients with a diagnosis of sepsis at ICU admission"
+        )
+        response["literature_search"]["population_terms"] = ["sepsis"]
+        result = self.service.generate(
+            QUESTION, lambda prompt: json.dumps(response), data_source="project.dataset"
+        )
+        concept_sets = result.protocol["concept_sets"]
+        # `label` keeps the full eligibility-criteria prose; `lookup_term` is
+        # the short vocabulary search term a reviewer's OMOP concept search
+        # should default to instead.
+        self.assertEqual(
+            concept_sets["population"]["label"],
+            "Adult (>=18 years) ICU patients with a diagnosis of sepsis at ICU admission",
+        )
+        self.assertEqual(concept_sets["population"]["lookup_term"], "sepsis")
+        self.assertEqual(concept_sets["treatment"]["lookup_term"], "treatment A")
+        self.assertEqual(concept_sets["comparator"]["lookup_term"], "treatment B")
+        self.assertEqual(concept_sets["outcome"]["lookup_term"], "mortality")
+
+    def test_concept_sets_lookup_term_blank_when_comparator_terms_empty(self):
+        response = valid_response()
+        response["literature_search"]["comparator_terms"] = []
+        result = self.service.generate(
+            QUESTION, lambda prompt: json.dumps(response), data_source="project.dataset"
+        )
+        self.assertEqual(result.protocol["concept_sets"]["comparator"]["lookup_term"], "")
+
     def test_rejects_changed_question(self):
         response = valid_response()
         response["source_question"] = "A different question"

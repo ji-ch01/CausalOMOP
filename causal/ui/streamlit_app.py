@@ -641,13 +641,35 @@ def _omcp_lookup(client: OMCPClient, domain: str, term: str) -> Any:
     return client.lookup_concept(term, domain)
 
 
+def _concept_option_label(candidate: dict[str, Any]) -> str:
+    """Multiselect option label for one search result: name plus, when
+    available, its edit-distance match score -- so a reviewer can tell a
+    near-exact match from a loose fuzzy fallback without opening the
+    candidate table separately."""
+    score = candidate.get("match_score")
+    suffix = f" (edit distance {score:g})" if score is not None else ""
+    return f"{candidate['concept_id']} — {candidate['concept_name']}{suffix}"
+
+
+def _sorted_by_match_score(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Closest OMCP match first (`match_score` is an edit distance, lower is
+    closer); candidates missing a score (older OMCP responses) sort last
+    rather than first, so an unscored row never looks like the best match."""
+    return sorted(
+        candidates,
+        key=lambda c: c.get("match_score") if c.get("match_score") is not None else float("inf"),
+    )
+
+
 def _parse_concept_rows(text: str, expected_domain: str) -> list[dict[str, Any]]:
     """Parse an OMCP `Lookup_*`/`Get_Concepts_By_Id` CSV response into
     reviewable rows, dropping anything that doesn't parse as a concept_id or
     whose `domain_id` doesn't match `expected_domain` -- the same
     defense-in-depth filter `DataScienceAgent._parse_concept_candidates`
     applies, since the server already filters by domain and this is a
-    belt-and-suspenders check, not the primary guarantee."""
+    belt-and-suspenders check, not the primary guarantee. `match_score`
+    (OMCP's `name_edit_distance` -- lower is a closer match) is `None` when
+    the response predates that column, e.g. `Get_Concepts_By_Id`."""
     rows = []
     for row in csv.DictReader(io.StringIO(text)):
         try:
@@ -657,11 +679,16 @@ def _parse_concept_rows(text: str, expected_domain: str) -> list[dict[str, Any]]
         domain_id = str(row.get("domain_id", "")).strip()
         if domain_id.lower() != expected_domain:
             continue
+        try:
+            match_score = float(row["name_edit_distance"])
+        except (KeyError, TypeError, ValueError):
+            match_score = None
         rows.append({
             "concept_id": concept_id,
             "concept_name": str(row.get("concept_name", "")).strip(),
             "vocabulary_id": str(row.get("vocabulary_id", "")).strip(),
             "domain_id": domain_id,
+            "match_score": match_score,
         })
     return rows
 
@@ -751,22 +778,22 @@ def _render_concept_set_mapping_forms(manager: WorkflowManager, run_id: str, con
                 name_by_id: dict[int, str] = {}
                 option_ids: list[int] = []
             else:
-                candidates = _render_omcp_concept_search(
+                candidates = _sorted_by_match_score(_render_omcp_concept_search(
                     state_key=f"concept_set_candidates_{name}_{domain_choice}",
                     domain=domain_choice,
                     default_term=(
                         definition.get("lookup_term") or definition.get("label") or name.replace("_", " ")
                     ),
-                )
-                name_by_id = {c["concept_id"]: c["concept_name"] for c in candidates}
-                option_ids = list(dict.fromkeys(existing_ids + list(name_by_id)))
+                ))
+                name_by_id = {c["concept_id"]: _concept_option_label(c) for c in candidates}
+                option_ids = list(dict.fromkeys([c["concept_id"] for c in candidates] + existing_ids))
             with st.form(key=f"concept_set_map_form_{name}"):
                 if domain_choice == "death":
                     chosen_ids: list[int] = []
                 else:
                     chosen_ids = st.multiselect(
                         "Approve concept_id(s)", options=option_ids, default=existing_ids,
-                        format_func=lambda cid: f"{cid} — {name_by_id.get(cid, '(previously approved, not in current search)')}",
+                        format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
                         key=f"concept_set_map_ids_{name}",
                     )
                 status_choice = st.selectbox(
@@ -917,8 +944,9 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
                                 "concept_name": c.get("concept_name"),
                                 "vocabulary_id": c.get("vocabulary_id"),
                                 "domain_id": c.get("domain_id"),
+                                "match_score": c.get("match_score"),
                             }
-                            for c in candidates
+                            for c in _sorted_by_match_score(candidates)
                         ],
                         width="stretch",
                     )
@@ -1034,19 +1062,22 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
                                 "concept_name": candidate.get("concept_name"),
                                 "vocabulary_id": candidate.get("vocabulary_id"),
                                 "domain_id": candidate.get("domain_id"),
+                                "match_score": candidate.get("match_score"),
                             }
-                            for candidate in candidates
+                            for candidate in _sorted_by_match_score(candidates)
                         ],
                         width="stretch",
                     )
+                    ranked_candidates = _sorted_by_match_score(candidates)
                     name_by_id = {
-                        candidate.get("concept_id"): candidate.get("concept_name") for candidate in candidates
+                        candidate.get("concept_id"): _concept_option_label(candidate)
+                        for candidate in ranked_candidates
                     }
                     with st.form(key=f"covariate_map_form_{c.get('name')}"):
                         chosen_ids = st.multiselect(
                             "Approve concept_id(s) for this covariate",
-                            options=list(name_by_id),
-                            format_func=lambda cid: f"{cid} — {name_by_id.get(cid, '')}",
+                            options=[candidate.get("concept_id") for candidate in ranked_candidates],
+                            format_func=lambda cid: name_by_id.get(cid, str(cid)),
                             key=f"covariate_map_ids_{c.get('name')}",
                         )
                         mapping_status_choice = st.selectbox(

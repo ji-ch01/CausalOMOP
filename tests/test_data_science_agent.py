@@ -435,6 +435,31 @@ class DataScienceAgentCovariateTests(unittest.TestCase):
         self.assertEqual(covariate.concept_candidates, ())
         self.assertEqual(lookup.calls, [])
 
+    def test_covariate_without_a_domain_is_flagged_as_an_unresolved_issue(self):
+        """A domain-less covariate is deliberately never guessed (see
+        `test_covariate_without_a_domain_is_left_unmapped`), but that used to
+        leave it silently stuck at `definition_pending` with nothing telling
+        a reviewer it needs a domain assigned -- it must now show up in
+        `unresolved_issues`, the same way an unclassified covariate already
+        does."""
+        lookup = self._FakeLookup()
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "weight", "role": "confounder", "temporal_classification": "pre_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol(), concept_lookup=lookup)
+        self.assertIn("covariate:weight:missing_domain", result.unresolved_issues)
+
+    def test_covariate_with_a_domain_is_not_flagged_as_missing_domain(self):
+        lookup = self._FakeLookup()
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol(), concept_lookup=lookup)
+        self.assertNotIn("covariate:sofa_score:missing_domain", result.unresolved_issues)
+
 
 if __name__ == "__main__":
     unittest.main()

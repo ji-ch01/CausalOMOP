@@ -17,12 +17,24 @@ class ConceptLookup(Protocol):
     def lookup_concept(self, term: str, domain: str) -> Any: ...
 
 
+def _parse_optional_float(value: Any) -> float | None:
+    """Best-effort float parse for an optional CSV column (e.g. OMCP's
+    `name_edit_distance` ranking column) -- `None`/empty/non-numeric all
+    mean "not available", not an error, since older OMCP servers won't
+    return this column at all."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class ConceptCandidate:
     concept_id: int
     concept_name: str
     vocabulary_id: str
     domain_id: str
+    match_score: float | None = None
 
 
 # domain -> OMOP tables a phenotype in that domain is built from. Mirrors
@@ -187,8 +199,11 @@ class DataScienceAgent:
             for variable in dag_variables
             if variable.get("role") in ADJUSTMENT_ELIGIBLE_ROLES
         )
+        covariates_missing_domain: tuple[str, ...] = ()
         if concept_lookup is not None:
-            covariates = self._attach_covariate_concept_candidates(covariates, dag_variables, concept_lookup)
+            covariates, covariates_missing_domain = self._attach_covariate_concept_candidates(
+                covariates, dag_variables, concept_lookup
+            )
         excluded_from_adjustment = self._excluded_from_adjustment(dag_variables, hypothesis)
         unclassified_covariates = self._unclassified_covariates(hypothesis, dag_variables)
         unresolved = (
@@ -198,6 +213,7 @@ class DataScienceAgent:
                 for item in phenotypes if item.approval_required and item.status != "approved"
             )
             + tuple(f"covariate:{label}:unclassified_by_dag" for label in unclassified_covariates)
+            + tuple(f"covariate:{label}:missing_domain" for label in covariates_missing_domain)
         )
         required_tables = tuple(sorted({table for phenotype in phenotypes for table in phenotype.omop_tables} | {
             "person", "measurement", "procedure_occurrence", "drug_exposure", "condition_occurrence"
@@ -295,26 +311,32 @@ class DataScienceAgent:
         covariates: tuple[CovariatePlan, ...],
         dag_variables: tuple[dict[str, Any], ...],
         lookup: ConceptLookup,
-    ) -> tuple[CovariatePlan, ...]:
+    ) -> tuple[tuple[CovariatePlan, ...], tuple[str, ...]]:
         """Attach reviewable `concept_candidates` to covariates whose
         `candidate_dag` entry declares a `domain` -- the same review-only
         contract phenotypes get via `_attach_concept_candidates`. A covariate
         whose DAG entry has no domain yet (`DAGVariable.domain`'s default,
-        meaning "not yet assessed") is left untouched rather than guessed.
+        meaning "not yet assessed") is left untouched rather than guessed --
+        but its name is returned alongside the enriched covariates so `run()`
+        can surface it in `unresolved_issues` (`covariate:{label}:missing_domain`)
+        instead of the covariate silently sitting at `definition_pending`
+        forever with nothing telling a reviewer it needs a domain assigned.
         """
         domain_by_label = {variable["label"]: variable.get("domain", "") for variable in dag_variables}
         enriched = []
+        missing_domain = []
         for covariate in covariates:
             domain = domain_by_label.get(covariate.name, "")
             if not domain:
                 enriched.append(covariate)
+                missing_domain.append(covariate.name)
                 continue
             term = covariate.name.replace("_", " ")
             enriched.append(replace(
                 covariate,
                 concept_candidates=cls._lookup_candidates(term, domain, lookup),
             ))
-        return tuple(enriched)
+        return tuple(enriched), tuple(missing_domain)
 
     @classmethod
     def _lookup_candidates(cls, term: str, domain: str, lookup: ConceptLookup) -> tuple["ConceptCandidate", ...]:
@@ -350,6 +372,7 @@ class DataScienceAgent:
                 concept_name=str(row.get("concept_name", "")).strip(),
                 vocabulary_id=str(row.get("vocabulary_id", "")).strip(),
                 domain_id=domain_id,
+                match_score=_parse_optional_float(row.get("name_edit_distance")),
             ))
         return tuple(candidates)
 

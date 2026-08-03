@@ -1002,13 +1002,33 @@ class UserQuestionHypothesisService:
         clinical-mapping judgment call a human still has to make, so it is
         left blank and `DataScienceAgent` refuses to plan around it until
         concept-mapping review fills it in.
+
+        `lookup_term` is seeded from `literature_search`'s first
+        `{role}_terms` entry (already validated as a short clinical noun
+        phrase, e.g. "sepsis" -- see `_validate_literature_search` and
+        `causal/prompts/hypothesis.md`), not from `label`: `target_trial`'s
+        population/treatment/comparator/outcome fields are free-text
+        eligibility-criteria prose (e.g. "Adult (>=18 years) ICU patients
+        with a diagnosis of sepsis at ICU admission"), which is a poor OMOP
+        vocabulary search string and, without this override, is exactly what
+        both the concept-mapping UI's default search box
+        (`causal.ui.streamlit_app._render_concept_set_mapping_forms`) and
+        `DataScienceAgent`'s own automatic candidate search
+        (`_attach_concept_candidates`, whose un-overridden fallback is even
+        worse -- literally the role name, e.g. "population") would search
+        OMOP with. Left "" (falling back to `label`, then the role name) when
+        `literature_search` has no term for a role, which only happens for
+        `comparator_terms` -- the one field `_validate_literature_search`
+        allows to be empty.
         """
         target = protocol.get("target_trial", {})
+        literature_search = protocol.get("literature_search") or {}
         return {
             role: {
                 "status": "pending_omop_mapping",
                 "concept_ids": [],
                 "label": target.get(role, ""),
+                "lookup_term": next(iter(literature_search.get(f"{role}_terms") or ()), ""),
                 "role": role,
                 "domain": "",
             }
