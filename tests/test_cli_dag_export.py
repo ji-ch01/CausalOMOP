@@ -84,6 +84,7 @@ class DagExportCliTests(unittest.TestCase):
         self.assertIn("core=['SOFA score']", stderr_text)
         self.assertIn("evidence: literature_only=1", stderr_text)
         self.assertIn("cited_fraction=1.00", stderr_text)
+        self.assertIn("// caveat: No published or expert reference DAG was checked", stderr_text)
 
 
 if __name__ == "__main__":

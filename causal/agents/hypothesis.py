@@ -82,8 +82,7 @@ ROLE_ALLOWED_TEMPORAL_CLASSES: dict[str, tuple[str, ...]] = {
 # systematic_review/rct/observational/unclassified). "kg_structured" marks a
 # knowledge-graph-only citation (no literature evidence hierarchy applies to
 # a structured KG fact); "uncited" marks an expert-asserted role with no
-# citation at all (`pmid == ""`). Feeds `causal.agents.dag_identification.
-# confidence_grade`, which is otherwise independent of this module.
+# citation at all (`pmid == ""`).
 EVIDENCE_LEVELS = (
     "systematic_review",
     "rct",
@@ -126,9 +125,9 @@ class DAGVariable:
 
     `evidence_level` (see `EVIDENCE_LEVELS`) records the tier of whichever
     citation `pmid` points to at the time it was accepted (populated by
-    `causal.agents.user_question._parse_dag_response`, not by this class) so
-    `causal.agents.dag_identification.confidence_grade` can grade the edge
-    without re-deriving it from citations that may no longer be in scope.
+    `causal.agents.user_question._parse_dag_response`, not by this class),
+    surfaced on the review/UI evidence table without re-deriving it from
+    citations that may no longer be in scope.
 
     `domain` (see `DAG_VARIABLE_DOMAINS`) is optional and independent of the
     above: a variable can be fully classified for DAG/identification purposes

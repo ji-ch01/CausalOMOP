@@ -696,6 +696,8 @@ class UserQuestionHypothesisService:
             "dropped_duplicate_count": result.dropped_duplicate_count,
             "candidates": [candidate.summary_dict() for candidate in result.survivors],
             "conflicts": [conflict.to_dict() for conflict in result.conflicts],
+            "pairwise_distances": [entry.to_dict() for entry in result.pairwise_distances],
+            "merge_fidelity": [entry.to_dict() for entry in result.merge_fidelity],
         }
 
         return variables, relations, total_rejected, unresolved, note

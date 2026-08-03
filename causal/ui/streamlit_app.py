@@ -38,7 +38,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from causal.agents.dag_identification import confidence_grade, review_dag
+from causal.agents.dag_identification import review_dag
 from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.hypothesis import (
     DAG_VARIABLE_DOMAINS,
@@ -388,8 +388,8 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
     clinical = review.clinical
     evidence = review.evidence
     adjustment = review.adjustment
-    confidence = review.confidence
 
+    st.warning(review.caveat)
     st.caption(f"Active comparator represented on the DAG: **{artifact.comparator or '—'}**")
 
     metric_cols = st.columns(3)
@@ -431,18 +431,6 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "sources (literature and knowledge graph)."
         )
 
-    if confidence.total_items:
-        confidence_metric_cols = st.columns(4)
-        confidence_metric_cols[0].metric("Confidence: high", confidence.high)
-        confidence_metric_cols[1].metric("Confidence: moderate", confidence.moderate)
-        confidence_metric_cols[2].metric("Confidence: low", confidence.low)
-        confidence_metric_cols[3].metric("Confidence: very low", confidence.very_low)
-        st.caption(
-            f"{confidence.high_or_moderate_fraction:.0%} of DAG items ({confidence.total_items} total) are "
-            "graded high or moderate confidence (GRADE-inspired: evidence tier, contested/unknown-direction "
-            "certainty, and cross-source corroboration — see docs/dag_generation_audit.md)."
-        )
-
     if identification.technical_notes:
         st.info(
             "Graph-theoretic notes (identification only — not a clinical judgment):\n"
@@ -466,9 +454,6 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "Evidence id": variable.pmid or "—",
             "Evidence level": variable.evidence_level.replace("_", " "),
             "KG-corroborated": "✓" if variable.kg_evidence_id else "",
-            "Confidence": confidence_grade(
-                variable.pmid, variable.kg_evidence_id, variable.evidence_level, variable.certainty
-            ).replace("_", " "),
         }
         for variable in artifact.candidate_dag
     ] + [
@@ -478,9 +463,6 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "Evidence id": relation.pmid or "—",
             "Evidence level": relation.evidence_level.replace("_", " "),
             "KG-corroborated": "✓" if relation.kg_evidence_id else "",
-            "Confidence": confidence_grade(
-                relation.pmid, relation.kg_evidence_id, relation.evidence_level, relation.certainty
-            ).replace("_", " "),
         }
         for relation in artifact.covariate_relations
     ]
@@ -490,8 +472,7 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "Evidence id is a PubMed/OpenAlex citation or a knowledge-graph relation id. "
             "Evidence level is the citation's tier (systematic review > RCT > observational). "
             "KG-corroborated marks items where the knowledge graph independently confirmed "
-            "a literature-cited relation. Confidence is the GRADE-inspired grade shown "
-            "aggregated above."
+            "a literature-cited relation."
         )
         st.dataframe(evidence_rows, width="stretch")
 
@@ -519,6 +500,49 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                 "Merge conflicts require human review (never silently resolved):\n"
                 + "\n".join(f"- [{conflict['kind']}] {conflict['description']}" for conflict in conflicts)
             )
+
+        pairwise_distances = tournament.get("pairwise_distances") or []
+        merge_fidelity = tournament.get("merge_fidelity") or []
+        if pairwise_distances or merge_fidelity:
+            with st.expander("Pairwise SHD/SID and merge fidelity"):
+                if pairwise_distances:
+                    st.caption(
+                        "SHD counts edge-type disagreements between two candidates; it cannot "
+                        "tell whether any of them would change a computed causal effect. SID "
+                        "(Peters & Bühlmann, 2015) answers that directly and is not symmetric, "
+                        "so both directions are shown -- two candidates can share the same SHD "
+                        "yet have very different SID (see docs/dag_generation_audit.md §9)."
+                    )
+                    st.dataframe(
+                        [
+                            {
+                                "Candidate A": entry["candidate_a"],
+                                "Candidate B": entry["candidate_b"],
+                                "SHD": entry["shd"],
+                                "SID(A given B)": entry["sid_a_given_b"],
+                                "SID(B given A)": entry["sid_b_given_a"],
+                            }
+                            for entry in pairwise_distances
+                        ],
+                        width="stretch",
+                    )
+                if merge_fidelity:
+                    st.caption(
+                        "SID from each surviving candidate's own DAG to the final merged DAG. "
+                        "Proposition 7 (Peters & Bühlmann, 2015) implies this should be 0 -- a "
+                        "merged DAG is a superset of every survivor's edges by construction -- "
+                        "unless a merge conflict above excluded some of that survivor's own "
+                        "variables or relations, in which case a positive value quantifies how "
+                        "much of that candidate's causal-inference conclusions were not "
+                        "preserved by the merge."
+                    )
+                    st.dataframe(
+                        [
+                            {"Candidate": entry["candidate_index"], "SID to merged DAG": entry["sid_to_merged"]}
+                            for entry in merge_fidelity
+                        ],
+                        width="stretch",
+                    )
 
     if artifact.unresolved_covariates:
         st.divider()

@@ -7,7 +7,6 @@ from causal.agents.dag_tournament import (
     dedup_candidates,
     rank_candidates,
     run_tournament,
-    structural_hamming_distance,
 )
 
 
@@ -55,35 +54,6 @@ def _candidate(index: int, variables: list[dict], relations: list[dict] | None =
         index=index, variables=tuple(variables), relations=tuple(relations or []),
         unresolved=(), review=review, note="",
     )
-
-
-class StructuralHammingDistanceTests(unittest.TestCase):
-    def test_identical_graphs_have_zero_distance(self):
-        a = _candidate(0, [_variable("age")])
-        b = _candidate(1, [_variable("age")])
-        self.assertEqual(
-            structural_hamming_distance(a.review.identification.dag, b.review.identification.dag), 0
-        )
-
-    def test_disagreeing_role_changes_distance(self):
-        a = _candidate(0, [_variable("age", role="confounder")])
-        b = _candidate(1, [_variable("age", role="effect_modifier")])
-        # confounder wires age->exposure and age->outcome; effect_modifier
-        # wires only age->outcome -- exactly one pair (age, exposure)
-        # differs (edge vs. none).
-        self.assertEqual(
-            structural_hamming_distance(a.review.identification.dag, b.review.identification.dag), 1
-        )
-
-    def test_extra_variable_in_one_graph_counts_its_pairs_as_mismatches(self):
-        a = _candidate(0, [_variable("age")])
-        b = _candidate(1, [_variable("age"), _variable("severity")])
-        # "severity" contributes two edges (severity->exposure,
-        # severity->outcome) absent from graph a, and the (age, severity)
-        # pair is "none" in both -- so exactly 2 pairs differ.
-        self.assertEqual(
-            structural_hamming_distance(a.review.identification.dag, b.review.identification.dag), 2
-        )
 
 
 class RankCandidatesTests(unittest.TestCase):
@@ -209,6 +179,71 @@ class RunTournamentTests(unittest.TestCase):
         self.assertEqual(result.merged_variables, ())
         self.assertEqual(result.merged_relations, ())
         self.assertEqual(result.conflicts, ())
+
+
+class PairwiseDistancesTests(unittest.TestCase):
+    """`TournamentResult.pairwise_distances` (see `dag_tournament.py`'s
+    `PairwiseDistance`): SHD/SID surfaced as audit output for every pair of
+    ranked candidates, not just the dedup pass/fail decision."""
+
+    def test_one_entry_per_pair_indexed_by_drafting_order(self):
+        candidates_raw = (
+            ([_variable("age")], [], [], ""),
+            ([_variable("severity")], [], [], ""),
+            ([_variable("age")], [], [], ""),
+        )
+        result = run_tournament(_protocol(), candidates_raw)
+        pairs = {(entry.candidate_a, entry.candidate_b) for entry in result.pairwise_distances}
+        self.assertEqual(pairs, {(0, 1), (0, 2), (1, 2)})
+
+    def test_identical_candidates_have_zero_shd_and_zero_sid_both_directions(self):
+        candidates_raw = (
+            ([_variable("age")], [], [], ""),
+            ([_variable("age")], [], [], ""),
+        )
+        result = run_tournament(_protocol(), candidates_raw)
+        entry = result.pairwise_distances[0]
+        self.assertEqual(entry.shd, 0)
+        self.assertEqual(entry.sid_a_given_b, 0)
+        self.assertEqual(entry.sid_b_given_a, 0)
+
+    def test_disjoint_candidates_have_positive_shd_and_sid(self):
+        candidates_raw = (
+            ([_variable("age")], [], [], ""),
+            ([_variable("severity")], [], [], ""),
+        )
+        result = run_tournament(_protocol(), candidates_raw)
+        entry = result.pairwise_distances[0]
+        self.assertGreater(entry.shd, 0)
+        self.assertGreater(entry.sid_a_given_b, 0)
+        self.assertGreater(entry.sid_b_given_a, 0)
+
+
+class MergeFidelityTests(unittest.TestCase):
+    """`TournamentResult.merge_fidelity` (see `dag_tournament.py`'s
+    `MergeFidelity`): a live check of Peters & Buhlmann (2015) Proposition 7
+    on the actual merge output, not an assumption that it holds."""
+
+    def test_zero_for_every_survivor_when_the_merge_has_no_conflicts(self):
+        candidates_raw = (
+            ([_variable("age")], [], [], ""),
+            ([_variable("severity")], [], [], ""),
+        )
+        result = run_tournament(_protocol(), candidates_raw)
+        self.assertEqual(len(result.merge_fidelity), 2)
+        self.assertTrue(all(entry.sid_to_merged == 0 for entry in result.merge_fidelity))
+
+    def test_nonzero_when_a_role_conflict_excludes_a_survivors_own_variable(self):
+        candidates_raw = (
+            ([_variable("age", role="confounder")], [], [], ""),
+            ([_variable("age", role="effect_modifier")], [], [], ""),
+        )
+        result = run_tournament(_protocol(), candidates_raw)
+        self.assertEqual(result.merged_variables, ())
+        self.assertEqual(len(result.merge_fidelity), 2)
+        # Neither survivor's own "age" relationship made it into the (now
+        # covariate-less) merge -- Proposition 7 no longer gives SID=0.
+        self.assertTrue(all(entry.sid_to_merged > 0 for entry in result.merge_fidelity))
 
 
 class MaxTournamentSizeTests(unittest.TestCase):

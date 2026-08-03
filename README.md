@@ -93,15 +93,6 @@ informatics literature rather than invented from scratch:
   [github.com/mims-harvard/OptimusKG](https://github.com/mims-harvard/OptimusKG)).
   Knowledge-graph evidence source used to corroborate DAG edges alongside
   PubMed/OpenAlex (`causal/knowledge_graph/`).
-- **GRADE (confidence grading of DAG edges)** — Guyatt, G.H., Oxman, A.D.,
-  Vist, G.E., et al. (2008). GRADE: an emerging consensus on rating quality
-  of evidence and strength of recommendations. *BMJ*, 336(7650), 924–926.
-  [doi:10.1136/bmj.39489.470347.AD](https://doi.org/10.1136/bmj.39489.470347.AD).
-  Adapted (evidence tier, contested/unknown-direction certainty,
-  cross-source corroboration) into `confidence_grade`/`ConfidenceSummary` in
-  [`causal/agents/dag_identification.py`](causal/agents/dag_identification.py),
-  a quality signal distinct from the coverage-only evidence-source metric it
-  sits alongside.
 - **Worked validation case** — the albumin-plus-crystalloids-vs-crystalloids,
   ICU sepsis, 28-day-mortality question and its MIMIC-IV OMOP grounding
   follow *Step-by-step causal analysis of EHRs to ground decision-making*,

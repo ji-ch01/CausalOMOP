@@ -1262,8 +1262,8 @@ class KGReinforcementTests(unittest.TestCase):
 class EvidenceLevelTests(unittest.TestCase):
     """`_evidence_level_map` and `_parse_dag_response` together populate
     `evidence_level` on every accepted variable/relation (see
-    `causal.agents.hypothesis.EVIDENCE_LEVELS`), the input
-    `causal.agents.dag_identification.confidence_grade` grades on.
+    `causal.agents.hypothesis.EVIDENCE_LEVELS`), surfaced on the review/UI
+    evidence table.
     """
 
     def test_evidence_level_map_covers_literature_and_kg_citations(self):

@@ -429,13 +429,7 @@ def main() -> int:
                 f"cited_fraction={review.evidence.cited_fraction:.2f}",
                 file=sys.stderr,
             )
-            print(
-                f"// confidence (GRADE-inspired): high={review.confidence.high} "
-                f"moderate={review.confidence.moderate} low={review.confidence.low} "
-                f"very_low={review.confidence.very_low} "
-                f"high_or_moderate_fraction={review.confidence.high_or_moderate_fraction:.2f}",
-                file=sys.stderr,
-            )
+            print(f"// caveat: {review.caveat}", file=sys.stderr)
             for warning in result.technical_notes:
                 print(f"// warning: {warning}", file=sys.stderr)
             tournament = protocol.get("dag_tournament")
@@ -449,6 +443,19 @@ def main() -> int:
                 )
                 for conflict in tournament.get("conflicts", []):
                     print(f"// tournament conflict [{conflict['kind']}]: {conflict['description']}", file=sys.stderr)
+                for entry in tournament.get("pairwise_distances", []):
+                    print(
+                        f"// tournament pairwise: candidates=({entry['candidate_a']}, {entry['candidate_b']}) "
+                        f"shd={entry['shd']} sid_a_given_b={entry['sid_a_given_b']} "
+                        f"sid_b_given_a={entry['sid_b_given_a']}",
+                        file=sys.stderr,
+                    )
+                for entry in tournament.get("merge_fidelity", []):
+                    print(
+                        f"// tournament merge_fidelity: candidate={entry['candidate_index']} "
+                        f"sid_to_merged={entry['sid_to_merged']}",
+                        file=sys.stderr,
+                    )
             return 0
         else:
             state = manager.advance(args.run_id)

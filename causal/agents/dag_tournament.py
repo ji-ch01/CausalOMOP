@@ -20,6 +20,14 @@ using only deterministic, literature-grounded mechanisms:
   candidates (a label's role, an edge's direction, or a cycle introduced by
   the union) are recorded as `MergeConflict` entries for human review, never
   silently resolved by picking one side.
+- `compute_pairwise_distances` / `compute_merge_fidelity` -- both metrics
+  from `causal.agents.dag_metrics` surfaced as audit output, not just used
+  internally: SHD alone only counts edge disagreements between candidates,
+  blind to whether any of them would actually change a computed causal
+  effect; pairing it with SID answers that second question directly, and
+  `compute_merge_fidelity` uses Proposition 7 itself as a live check that
+  the merge actually preserved each survivor's own identification
+  conclusions (never assumed).
 
 No new LLM calls happen inside this module: `UserQuestionHypothesisService`
 owns every `llm(prompt)` call (each candidate's own draft/critique loop, and
@@ -36,6 +44,7 @@ from typing import Any
 
 from causal.agents.dag_critique import build_pre_check
 from causal.agents.dag_identification import DAGReviewResult, build_causal_dag
+from causal.agents.dag_metrics import structural_hamming_distance, structural_intervention_distance
 from causal.agents.hypothesis import HypothesisAgent
 from causal.roadmap import CausalDAG
 
@@ -80,7 +89,6 @@ class TournamentCandidate:
             "relation_count": len(self.relations),
             "identified_by_backdoor_adjustment": self.review.identification.identified_by_backdoor_adjustment,
             "approved_for_dag_gate": self.review.clinical.approved_for_dag_gate,
-            "high_or_moderate_fraction": self.review.confidence.high_or_moderate_fraction,
             "note": self.note,
         }
 
@@ -108,6 +116,103 @@ class MergeConflict:
 
 
 @dataclass(frozen=True)
+class PairwiseDistance:
+    """SHD and (both-direction) SID between two ranked, pre-dedup tournament
+    candidates -- computed for every pair, not only the ones dedup happens
+    to compare, so a reviewer can see the full population's spread rather
+    than only the dedup pass/fail outcomes.
+
+    Indexed by each candidate's own `TournamentCandidate.index` (drafting
+    order), not position in `ranked`, so labels stay meaningful regardless
+    of rank-sort or dedup order. SHD (Acid & de Campos 2003 / Tsamardinos et
+    al. 2006) is symmetric, so one value suffices; SID (Peters & Buhlmann
+    2015) is not (Definition 4; see `causal.agents.dag_metrics`'s module
+    docstring), so both directions are reported. The paper's own Example 1
+    (reproduced in `tests/test_dag_metrics.py`) is the reason both metrics
+    are worth surfacing together: two candidates can share the same SHD
+    (same number of disagreeing edges) yet have wildly different SID
+    (whether those disagreements would change a computed causal effect).
+    """
+
+    candidate_a: int
+    candidate_b: int
+    shd: int
+    sid_a_given_b: int
+    sid_b_given_a: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "candidate_a": self.candidate_a,
+            "candidate_b": self.candidate_b,
+            "shd": self.shd,
+            "sid_a_given_b": self.sid_a_given_b,
+            "sid_b_given_a": self.sid_b_given_a,
+        }
+
+
+@dataclass(frozen=True)
+class MergeFidelity:
+    """SID from one surviving candidate's own DAG to the final merged DAG.
+
+    Peters & Buhlmann (2015) Proposition 7: `SID(G, H) = 0 <=> G <= H` (G a
+    subgraph of H). Since `merge_candidates` builds the merged DAG as an
+    edge union of the survivors (SS9), each survivor's own edges are
+    expected to be a literal subset of the merged DAG's edges -- SID should
+    be exactly 0 -- *unless* a role/direction/structural `MergeConflict`
+    excluded some of that survivor's own variables or relations from the
+    merge. A non-zero value here is therefore a live, literature-grounded
+    check on the merge's own soundness, not a re-assertion of Proposition 7:
+    it quantifies how much of that survivor's causal-inference conclusions
+    the merge did *not* preserve, for the human already reviewing the
+    conflict list to weigh.
+    """
+
+    candidate_index: int
+    sid_to_merged: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {"candidate_index": self.candidate_index, "sid_to_merged": self.sid_to_merged}
+
+
+def compute_pairwise_distances(ranked: tuple[TournamentCandidate, ...]) -> tuple[PairwiseDistance, ...]:
+    """SHD and both-direction SID for every pair among `ranked` (see
+    `PairwiseDistance`)."""
+    distances = []
+    for a, b in combinations(ranked, 2):
+        dag_a, dag_b = a.review.identification.dag, b.review.identification.dag
+        distances.append(PairwiseDistance(
+            candidate_a=a.index,
+            candidate_b=b.index,
+            shd=structural_hamming_distance(dag_a, dag_b),
+            sid_a_given_b=structural_intervention_distance(dag_a, dag_b),
+            sid_b_given_a=structural_intervention_distance(dag_b, dag_a),
+        ))
+    return tuple(distances)
+
+
+def compute_merge_fidelity(
+    survivors: tuple[TournamentCandidate, ...], merged_dag: CausalDAG | None
+) -> tuple[MergeFidelity, ...]:
+    """SID from each survivor's own DAG to `merged_dag` (see `MergeFidelity`).
+
+    `merged_dag` is `None` when `build_pre_check` could not build a
+    `CausalDAG` from the merged variables/relations at all (e.g. an empty
+    merge) -- nothing to compare against, so this returns no entries rather
+    than raising, matching this module's "never blocks on a single bad
+    candidate" convention.
+    """
+    if merged_dag is None:
+        return ()
+    return tuple(
+        MergeFidelity(
+            candidate_index=survivor.index,
+            sid_to_merged=structural_intervention_distance(survivor.review.identification.dag, merged_dag),
+        )
+        for survivor in survivors
+    )
+
+
+@dataclass(frozen=True)
 class TournamentResult:
     survivors: tuple[TournamentCandidate, ...]
     dropped_duplicate_count: int
@@ -115,17 +220,19 @@ class TournamentResult:
     merged_relations: tuple[dict[str, Any], ...]
     merged_unresolved: tuple[dict[str, Any], ...]
     conflicts: tuple[MergeConflict, ...]
+    pairwise_distances: tuple[PairwiseDistance, ...]
+    merge_fidelity: tuple[MergeFidelity, ...]
 
 
-def rank_key(candidate: TournamentCandidate) -> tuple[bool, bool, float]:
-    """Lexicographic ranking (SS9): identification and clinical completeness
-    strictly outrank the GRADE-based confidence fraction, which only breaks
-    ties -- no weighted score, no magic numbers.
+def rank_key(candidate: TournamentCandidate) -> tuple[bool, bool]:
+    """Lexicographic ranking (SS9): identification, then clinical
+    completeness -- no weighted score, no magic numbers. Candidates tied on
+    both keep their original (drafting) order (`rank_candidates` is a
+    stable sort).
     """
     return (
         candidate.review.identification.identified_by_backdoor_adjustment,
         candidate.review.clinical.approved_for_dag_gate,
-        candidate.review.confidence.high_or_moderate_fraction,
     )
 
 
@@ -134,46 +241,6 @@ def rank_candidates(candidates: tuple[TournamentCandidate, ...]) -> tuple[Tourna
     every key keep their original (drafting) order.
     """
     return tuple(sorted(candidates, key=rank_key, reverse=True))
-
-
-def _edge_types(dag: CausalDAG) -> dict[frozenset[str], str]:
-    label_of = {node.node_id: node.label for node in dag.nodes}
-    types: dict[frozenset[str], str] = {}
-    for edge in dag.edges:
-        source_label, target_label = label_of[edge.source], label_of[edge.target]
-        types[frozenset((source_label, target_label))] = f"{source_label}->{target_label}"
-    return types
-
-
-def structural_hamming_distance(a: CausalDAG, b: CausalDAG) -> int:
-    """Structural Hamming Distance between two candidate DAGs, compared at
-    the node-*label* level.
-
-    Counts, over the union of both graphs' node labels, every unordered
-    pair of labels whose edge type (no edge / `a->b` / `b->a`) differs
-    between the two graphs (Acid, S. & de Campos, L.M. (2003). Searching
-    for Bayesian network structures in the space of restricted acyclic
-    partially directed graphs. Journal of Artificial Intelligence Research,
-    18, 445-490; Tsamardinos, I., Brown, L.E., & Aliferis, C.F. (2006). The
-    max-min hill-climbing Bayesian network structure learning algorithm.
-    Machine Learning, 65, 31-78 -- both cited from, and confirmed via,
-    Peters & Buhlmann 2015 SS1.1; see docs/dag_generation_audit.md SS9).
-
-    Known limitation (documented in SS9, shared with OptimusKG's substring
-    matching in SS6): SHD formally assumes both graphs share the same
-    variable set. A label present in only one graph is treated as "no edge"
-    for every pair involving it in the other -- so two candidates naming a
-    clinically-identical concept with different free-text labels (e.g.
-    "age" vs. "patient age") count as genuinely different variables here.
-    """
-    labels = sorted({node.label for node in a.nodes} | {node.label for node in b.nodes})
-    edges_a, edges_b = _edge_types(a), _edge_types(b)
-    distance = 0
-    for source, target in combinations(labels, 2):
-        pair = frozenset((source, target))
-        if edges_a.get(pair, "none") != edges_b.get(pair, "none"):
-            distance += 1
-    return distance
 
 
 def dedup_candidates(
@@ -402,8 +469,14 @@ def run_tournament(
         ))
 
     ranked = rank_candidates(tuple(candidates))
+    pairwise_distances = compute_pairwise_distances(ranked)
     survivors, dropped = dedup_candidates(ranked)
     merged_variables, merged_relations, merged_unresolved, conflicts = merge_candidates(protocol, survivors)
+
+    merged_review = build_pre_check(protocol, merged_variables, merged_relations)
+    merge_fidelity = compute_merge_fidelity(
+        survivors, merged_review.identification.dag if merged_review is not None else None
+    )
 
     return TournamentResult(
         survivors=survivors,
@@ -412,4 +485,6 @@ def run_tournament(
         merged_relations=tuple(merged_relations),
         merged_unresolved=tuple(merged_unresolved),
         conflicts=tuple(conflicts),
+        pairwise_distances=pairwise_distances,
+        merge_fidelity=merge_fidelity,
     )
