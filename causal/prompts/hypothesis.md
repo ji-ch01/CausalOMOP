@@ -27,7 +27,7 @@ Required JSON shape:
     "comparator_terms": ["0 to 3 short comparator terms"],
     "outcome_terms": ["1 to 3 short outcome terms"]
   },
-  "first_pass_covariates": [],
+  "first_pass_covariates": ["one short clinical label per plausible covariate"],
   "design_constraints": [],
   "assumptions_requiring_review": []
 }
@@ -39,10 +39,18 @@ Rules:
 - Use explicit time zero, exposure grace period, and follow-up.
 - If the question is underspecified, choose conservative draft values and list
   every assumption in assumptions_requiring_review.
+- first_pass_covariates is REQUIRED, not optional: using your own clinical knowledge
+  of this population/treatment/outcome, list every variable a domain expert would
+  plausibly want checked as a confounder, effect modifier, or other prognostic factor
+  (e.g. demographics, baseline severity/comorbidity, disease-specific risk factors) --
+  typically 6 to 15 labels for a well-specified clinical question. An empty list is
+  only acceptable if the question genuinely gives no clinical population to reason
+  about; it is never an acceptable answer for a real clinical population.
 - Covariates are an unclassified brainstorm list, not an approved adjustment set: none of
   them has a causal role yet. A later DAG stage assigns each one an explicit role
   (confounder, treatment-only cause, outcome-only cause, mediator, or collider) before
-  any of them can be used for adjustment.
+  any of them can be used for adjustment. Do not filter this list down for relevance or
+  evidence here -- listing a plausible candidate does not require citing it yet.
 - Literature search terms must be concise clinical noun phrases, not sentences,
   Boolean expressions, PubMed field tags, eligibility criteria, or assumptions.
 - Include common clinical synonyms when useful, with at most 3 terms per role.
