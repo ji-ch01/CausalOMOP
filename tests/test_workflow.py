@@ -6,6 +6,8 @@ import time
 import unittest
 from pathlib import Path
 
+from causal.config import BigQueryDatasets
+from causal.mcp_client import MCPToolResponse
 from causal.orchestrator import WorkflowManager
 from causal.orchestrator.workflow import (
     _LOCK_STALE_SECONDS,
@@ -1650,6 +1652,140 @@ class WorkflowVariableRegistryTests(unittest.TestCase):
         for variable in registry["variables"]:
             self.assertEqual(variable["mapping_status"], "approved")
             self.assertEqual(variable["candidate_concept_ids"], [])
+
+
+class _FakeCausalSelectClient:
+    """Duck-typed stand-in for `OMCPClient`: records every `causal_select`
+    call and answers with one generic aggregate CSV row, regardless of which
+    audit query was sent -- `run_mapping_audit_mcp` only needs each response
+    to parse as zero-or-more CSV rows, it never asserts a specific shape."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def causal_select(self, query: str, operation: str, causal_context: dict) -> MCPToolResponse:
+        self.calls.append((query, operation, causal_context))
+        return MCPToolResponse(text="concept_id,row_count\n123,10\n", metadata={"rows": 1})
+
+
+class WorkflowMappingAuditMcpTests(unittest.TestCase):
+    """`run_mapping_audit_mcp` is the wiring that makes `causal.mapping.audit`'s
+    SQL diagnostics actually runnable by a reviewer -- before it existed,
+    nothing outside `tests/test_mapping_audit.py` ever called those SQL
+    builders. Exercises the plumbing (registry lookup -> ExtractionPlan ->
+    governed OMCP execution -> written artifact) with a duck-typed fake OMCP
+    client, since `OMCPClient` itself requires a real `omcp` checkout."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol_path = root / "protocol.json"
+        self.protocol_path.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE"
+            },
+            "data_source": "project.dataset",
+            "first_pass_covariates": ["SOFA score"],
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "approved",
+                    "domain": "condition", "concept_ids": [132797],
+                },
+                "treatment": {
+                    "role": "treatment", "status": "approved",
+                    "domain": "drug", "concept_ids": [1],
+                },
+                "comparator": {
+                    "role": "comparator", "status": "approved",
+                    "domain": "drug", "concept_ids": [2],
+                },
+                "outcome": {
+                    "role": "outcome", "status": "approved",
+                    "domain": "condition", "concept_ids": [316866],
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol_path)
+        self.run_id = state.run_id
+        self.run_dir = root / "runs" / self.run_id
+        self.manager.run_hypothesis_agent(self.run_id)
+        self.manager.review_covariate(
+            self.run_id, "SOFA score", "accept", "Dr. Chen",
+            "Higher SOFA is associated with treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            domain="measurement",
+        )
+        self.manager.map_covariate_concepts(self.run_id, "SOFA score", [4301868], "Dr. Lee")
+        self.manager.review_covariate_aggregation(
+            self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
+        )
+        self.manager.build_variable_registry(self.run_id)
+        self.datasets = BigQueryDatasets()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_runs_every_applicable_check_and_writes_an_artifact(self):
+        """'sofa_score' is a measurement (VALUE_DOMAINS) covariate, so the
+        unit-observation check is included alongside the three checks every
+        variable gets."""
+        client = _FakeCausalSelectClient()
+        state = self.manager.run_mapping_audit_mcp(self.run_id, "sofa_score", client, self.datasets)
+        self.assertEqual(len(client.calls), 4)
+        self.assertTrue(all(operation == "aggregate_feasibility" for _, operation, _ in client.calls))
+        artifact_path = self.run_dir / "mapping_audit_sofa_score.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["variable_id"], "sofa_score")
+        self.assertEqual(artifact["status"], "aggregate_mapping_audit_only")
+        self.assertEqual(
+            set(artifact["checks"]),
+            {
+                "concept_row_and_person_counts",
+                "approved_concepts_missing_from_data",
+                "invalid_or_nonstandard_concepts",
+                "observed_units",
+            },
+        )
+        self.assertIn("mapping_audit_sofa_score.json", state.artifacts)
+        self.assertTrue(any(entry["event"] == "mapping_audit_completed" for entry in state.history))
+
+    def test_omits_observed_units_for_a_presence_only_domain_variable(self):
+        """'population' is a condition-domain phenotype (presence_in_window,
+        not a VALUE_DOMAINS aggregation) -- units are meaningless for it."""
+        client = _FakeCausalSelectClient()
+        self.manager.run_mapping_audit_mcp(self.run_id, "population", client, self.datasets)
+        artifact = json.loads(
+            (self.run_dir / "mapping_audit_population.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("observed_units", artifact["checks"])
+        self.assertEqual(len(client.calls), 3)
+
+    def test_requires_registry_json_to_already_exist(self):
+        other = self.manager.start(self.protocol_path)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_mapping_audit_mcp(
+                other.run_id, "population", _FakeCausalSelectClient(), self.datasets
+            )
+
+    def test_rejects_a_variable_id_not_in_the_registry(self):
+        with self.assertRaises(RuntimeError):
+            self.manager.run_mapping_audit_mcp(
+                self.run_id, "not_a_real_variable", _FakeCausalSelectClient(), self.datasets
+            )
+
+    def test_the_causal_context_identifies_the_run_and_variable(self):
+        client = _FakeCausalSelectClient()
+        self.manager.run_mapping_audit_mcp(self.run_id, "sofa_score", client, self.datasets)
+        _, _, context = client.calls[0]
+        self.assertEqual(context["run_id"], self.run_id)
+        self.assertEqual(context["variable_id"], "sofa_score")
 
 
 if __name__ == "__main__":

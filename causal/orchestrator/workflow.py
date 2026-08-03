@@ -23,7 +23,14 @@ from causal.agents.user_question import GeneratedHypothesis
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
 from causal.data_builder import AnalyticCohortBuilder
+from causal.mapping.audit import (
+    approved_concepts_missing_from_data_sql,
+    concept_row_and_person_counts_sql,
+    invalid_or_nonstandard_concepts_sql,
+    observed_units_sql,
+)
 from causal.mapping.registry import (
+    VALUE_DOMAINS,
     OMOPVariableRegistry,
     build_extraction_plan,
     extraction_plan_to_covariate_spec,
@@ -1500,6 +1507,104 @@ class WorkflowManager:
         if "followup_audit.json" not in state.artifacts:
             state.artifacts.append("followup_audit.json")
         state.record("followup_audit_completed", "aggregate audit via OMCP")
+        self.save(state)
+        return state
+
+    def run_mapping_audit_mcp(
+        self,
+        run_id: str,
+        variable_id: str,
+        client: OMCPClient,
+        datasets: BigQueryDatasets,
+    ) -> RunState:
+        """Run `causal.mapping.audit`'s aggregate-only SQL diagnostics for one
+        `registry.json` variable through `OMCPClient.causal_select`, the same
+        governed "Causal_Select_Query" path `run_cohort_profile_mcp`/
+        `run_followup_audit_mcp` already execute through (no separate local
+        `QueryValidationAgent` pre-check here either, matching those two --
+        its final-projection column check is a blunt word-boundary search
+        that cannot tell `COUNT(DISTINCT t.person_id)` apart from a bare
+        `person_id` projection, and `concept_row_and_person_counts_sql`
+        legitimately does the former).
+
+        Before this method, nothing outside `tests/test_mapping_audit.py`
+        ever called `causal.mapping.audit`'s SQL builders -- a reviewer had
+        no way to actually run a mapping audit without writing ad-hoc code.
+        This does not change what that module is: still diagnostic only, by
+        design. `registry.json` is always rebuilt fresh from `protocol.json`
+        (see `build_variable_registry`), so writing a finding back onto the
+        registry would just be silently discarded on the next rebuild -- a
+        reviewer reads the artifact this writes and acts on it through the
+        existing `covariate-map-concepts`/`concept-set-map` review commands,
+        exactly as before.
+
+        Requires only that `variable_id` resolves to a valid
+        `ExtractionPlan` (`build_extraction_plan`: approved, observed, a
+        concept-based domain, at least one root concept_id) -- deliberately
+        not the stricter `is_sql_executable` (which also demands a reviewed
+        window/aggregation): checking whether approved concepts actually
+        occur in the data is useful before that review is finished, not only
+        after.
+        """
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        registry_path = run_dir / "registry.json"
+        if not registry_path.is_file():
+            raise RuntimeError("Run `workflow registry-build` first")
+        registry = OMOPVariableRegistry.from_dict(
+            json.loads(registry_path.read_text(encoding="utf-8"))
+        )
+        definition = registry.get(variable_id)
+        if definition is None:
+            raise RuntimeError(f"'{variable_id}' is not in registry.json")
+        plan = build_extraction_plan(definition)
+
+        sql_by_check = {
+            "concept_row_and_person_counts": concept_row_and_person_counts_sql(datasets, plan),
+            "approved_concepts_missing_from_data": approved_concepts_missing_from_data_sql(datasets, plan),
+            "invalid_or_nonstandard_concepts": invalid_or_nonstandard_concepts_sql(datasets, plan),
+        }
+        if plan.domain in VALUE_DOMAINS:
+            sql_by_check["observed_units"] = observed_units_sql(datasets, plan)
+
+        context = {
+            "run_id": state.run_id,
+            "study_id": state.study_id,
+            "purpose": "mapping_audit",
+            "variable_id": variable_id,
+        }
+        results: dict[str, list[dict[str, Any]]] = {}
+        mcp_metadata: dict[str, Any] = {}
+        for check_name, sql in sql_by_check.items():
+            response = client.causal_select(sql, "aggregate_feasibility", context)
+            results[check_name] = list(csv.DictReader(io.StringIO(response.text)))
+            mcp_metadata[check_name] = response.metadata
+
+        artifact = {
+            "status": "aggregate_mapping_audit_only",
+            "execution_transport": "omcp",
+            "variable_id": variable_id,
+            "mapping_status": definition.mapping_status,
+            "checks": results,
+            "mcp_metadata": mcp_metadata,
+            "warnings": [
+                "Diagnostic only: this does not change mapping_status or available_in_data, "
+                "and does not block extraction.",
+                "A reviewer must act on any finding here through the existing "
+                "covariate-map-concepts/concept-set-map review commands.",
+            ],
+        }
+        artifact_path = run_dir / f"mapping_audit_{variable_id}.json"
+        temporary = artifact_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+        temporary.replace(artifact_path)
+        artifact_name = artifact_path.name
+        if artifact_name not in state.artifacts:
+            state.artifacts.append(artifact_name)
+        state.record(
+            "mapping_audit_completed",
+            f"variable_id={variable_id}; checks={sorted(results)}",
+        )
         self.save(state)
         return state
 

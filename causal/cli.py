@@ -239,6 +239,12 @@ def main() -> int:
         "followup-audit", help="audit aggregate 28-day follow-up observability through OMCP"
     )
     workflow_followup_audit.add_argument("run_id")
+    workflow_mapping_audit = workflow_sub.add_parser(
+        "mapping-audit",
+        help="audit one registry.json variable's OMOP mapping (coverage/validity) through OMCP",
+    )
+    workflow_mapping_audit.add_argument("run_id")
+    workflow_mapping_audit.add_argument("variable_id", help="registry.json variable_id, e.g. 'sofa_score'")
     workflow_dag_export = workflow_sub.add_parser(
         "dag-export",
         help="export the literature-grounded DAG as dagitty text (paste into dagitty.net)",
@@ -394,6 +400,13 @@ def main() -> int:
         elif args.workflow_command == "followup-audit":
             state = manager.run_followup_audit_mcp(
                 args.run_id,
+                OMCPClient(project=datasets.project, dataset=datasets.omop),
+                datasets,
+            )
+        elif args.workflow_command == "mapping-audit":
+            state = manager.run_mapping_audit_mcp(
+                args.run_id,
+                args.variable_id,
                 OMCPClient(project=datasets.project, dataset=datasets.omop),
                 datasets,
             )
