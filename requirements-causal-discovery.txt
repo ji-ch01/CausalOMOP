@@ -1,1 +1,1 @@
-causal-learn
+causal-learn>=0.1.4.8,<0.2
