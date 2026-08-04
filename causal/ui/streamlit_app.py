@@ -49,6 +49,7 @@ from causal.agents.hypothesis import (
     HypothesisArtifact,
     RejectedCovariate,
 )
+from causal.agents.question_gate import DEFAULT_GATE_PROMPT_PATH, build_gate_prompt, parse_gate_response
 from causal.agents.user_question import LLMRawOutput, UserQuestionHypothesisService
 from causal.config import BigQueryDatasets
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
@@ -706,7 +707,7 @@ def _render_omcp_concept_search(*, state_key: str, domain: str, default_term: st
     if st.button("Search OMCP", key=f"{state_key}_btn"):
         try:
             datasets = BigQueryDatasets.from_env()
-            client = OMCPClient(project=datasets.project, dataset=datasets.omop)
+            client = OMCPClient(datasets)
             with st.spinner(f"Searching OMCP for {term!r} (domain={domain})..."):
                 response = _omcp_lookup(client, domain, term)
             st.session_state[state_key] = _parse_concept_rows(response.text, domain)
@@ -886,7 +887,7 @@ def _render_regenerate_plan_section(manager: WorkflowManager, run_id: str) -> No
         lookup = None
         if refresh_candidates:
             datasets = BigQueryDatasets.from_env()
-            lookup = OMCPClient(project=datasets.project, dataset=datasets.omop)
+            lookup = OMCPClient(datasets)
         with st.spinner("Running the Data Science Agent..."):
             manager.run_data_science_agent(run_id, lookup)
         st.success("Analysis plan regenerated.")
@@ -1099,9 +1100,7 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
                                 concept_lookup = None
                                 if mapping_status_choice == "approved":
                                     datasets = BigQueryDatasets.from_env()
-                                    concept_lookup = OMCPClient(
-                                        project=datasets.project, dataset=datasets.omop
-                                    )
+                                    concept_lookup = OMCPClient(datasets)
                                 with st.spinner("Verifying concept domain via OMCP..."):
                                     manager.map_covariate_concepts(
                                         run_id, c.get("name"), chosen_ids, reviewer,
@@ -1254,6 +1253,10 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
             model_override = st.text_input(
                 "Model override (optional)", key="new_question_model"
             )
+            skip_question_gate = st.checkbox(
+                "Skip causal-question gate (assume the question is already causal)",
+                key="new_question_skip_gate",
+            )
             skip_literature = st.checkbox(
                 "Skip literature grounding (PubMed/OpenAlex)", key="new_question_skip_lit"
             )
@@ -1298,6 +1301,27 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
         try:
             resolved_llm = build_hypothesis_llm(model=model_override.strip() or None)
             status_log.write(f"Using provider `{resolved_llm.provider}:{resolved_llm.model}`.")
+            if not skip_question_gate:
+                gate_result = parse_gate_response(
+                    resolved_llm.call(build_gate_prompt(DEFAULT_GATE_PROMPT_PATH, question))
+                )
+                if gate_result.category == "descriptive":
+                    status_log.update(label="Not a causal question", state="error")
+                    st.warning(
+                        "This looks like a descriptive/retrieval question, not a causal one -- "
+                        "FastOMOP (agno_fastomop) handles this, not the causal target-trial pipeline.\n\n"
+                        f"Reasoning: {gate_result.reasoning}"
+                    )
+                    return
+                if gate_result.category == "needs_clarification":
+                    status_log.update(label="Needs clarification", state="error")
+                    st.warning(
+                        "This question needs to be sharpened before drafting a causal study.\n\n"
+                        f"Reasoning: {gate_result.reasoning}\n\n"
+                        f"Clarifying question: {gate_result.clarifying_question}"
+                    )
+                    return
+                status_log.write(f"Causal-question gate: {gate_result.category} -- {gate_result.reasoning}")
             literature = (
                 None
                 if skip_literature
@@ -1306,7 +1330,7 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
             generated = UserQuestionHypothesisService().generate(
                 question,
                 resolved_llm.call,
-                data_source=BigQueryDatasets.from_env().fq_dataset("omop"),
+                data_source=BigQueryDatasets.from_env().describe(),
                 literature=literature,
                 on_llm_output=_on_llm_output,
                 enable_critique=not skip_critique,

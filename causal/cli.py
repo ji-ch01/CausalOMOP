@@ -17,6 +17,7 @@ from causal.agents.hypothesis import (
     DAG_VARIABLE_ROLES,
     DAG_VARIABLE_TEMPORAL_CLASSES,
 )
+from causal.agents.question_gate import DEFAULT_GATE_PROMPT_PATH, build_gate_prompt, parse_gate_response
 from causal.agents.user_question import LLMRawOutput
 from causal.knowledge_graph import OptimusKGClient
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
@@ -63,6 +64,10 @@ def main() -> int:
     workflow_question.add_argument("question")
     workflow_question.add_argument("--model", default=None)
     workflow_question.add_argument("--mode", choices=("exploratory", "final"), default="exploratory")
+    workflow_question.add_argument(
+        "--skip-question-gate", action="store_true",
+        help="skip the upstream check that the question is causal, not descriptive",
+    )
     workflow_question.add_argument(
         "--skip-literature", action="store_true",
         help="skip PubMed/OpenAlex retrieval and the literature-grounded DAG draft",
@@ -263,6 +268,26 @@ def main() -> int:
             state = manager.start(args.protocol, args.mode)
         elif args.workflow_command == "start-question":
             resolved_llm = build_hypothesis_llm(model=args.model)
+            if not args.skip_question_gate:
+                gate_result = parse_gate_response(
+                    resolved_llm.call(build_gate_prompt(DEFAULT_GATE_PROMPT_PATH, args.question))
+                )
+                if gate_result.category == "descriptive":
+                    print(
+                        "This looks like a descriptive/retrieval question, not a causal one -- "
+                        "FastOMOP (agno_fastomop) handles this, not the causal target-trial pipeline.\n"
+                        f"Reasoning: {gate_result.reasoning}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if gate_result.category == "needs_clarification":
+                    print(
+                        "This question needs to be sharpened before drafting a causal study.\n"
+                        f"Reasoning: {gate_result.reasoning}\n"
+                        f"Clarifying question: {gate_result.clarifying_question}",
+                        file=sys.stderr,
+                    )
+                    return 2
             literature = (
                 None if args.skip_literature
                 else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
@@ -279,7 +304,7 @@ def main() -> int:
             generated = UserQuestionHypothesisService().generate(
                 args.question,
                 resolved_llm.call,
-                data_source=datasets.fq_dataset("omop"),
+                data_source=datasets.describe(),
                 literature=literature,
                 knowledge_graph=knowledge_graph,
                 on_llm_output=_print_raw_llm_output,
@@ -299,7 +324,7 @@ def main() -> int:
             state = manager.build_variable_registry(args.run_id)
         elif args.workflow_command == "concept-set-map":
             concept_lookup = (
-                OMCPClient(project=datasets.project, dataset=datasets.omop)
+                OMCPClient(datasets)
                 if args.with_mcp else None
             )
             state = manager.map_concept_set(
@@ -328,7 +353,7 @@ def main() -> int:
             )
         elif args.workflow_command == "covariate-map-concepts":
             concept_lookup = (
-                OMCPClient(project=datasets.project, dataset=datasets.omop)
+                OMCPClient(datasets)
                 if args.with_mcp else None
             )
             state = manager.map_covariate_concepts(
@@ -367,7 +392,7 @@ def main() -> int:
             )
         elif args.workflow_command == "plan":
             lookup = (
-                OMCPClient(project=datasets.project, dataset=datasets.omop)
+                OMCPClient(datasets)
                 if args.with_mcp else None
             )
             state = manager.run_data_science_agent(args.run_id, lookup)
@@ -379,7 +404,7 @@ def main() -> int:
             if args.transport == "mcp":
                 state = manager.run_feasibility_mcp(
                     args.run_id,
-                    OMCPClient(project=datasets.project, dataset=datasets.omop),
+                    OMCPClient(datasets),
                     datasets,
                 )
             else:
@@ -394,20 +419,20 @@ def main() -> int:
         elif args.workflow_command == "cohort-profile":
             state = manager.run_cohort_profile_mcp(
                 args.run_id,
-                OMCPClient(project=datasets.project, dataset=datasets.omop),
+                OMCPClient(datasets),
                 datasets,
             )
         elif args.workflow_command == "followup-audit":
             state = manager.run_followup_audit_mcp(
                 args.run_id,
-                OMCPClient(project=datasets.project, dataset=datasets.omop),
+                OMCPClient(datasets),
                 datasets,
             )
         elif args.workflow_command == "mapping-audit":
             state = manager.run_mapping_audit_mcp(
                 args.run_id,
                 args.variable_id,
-                OMCPClient(project=datasets.project, dataset=datasets.omop),
+                OMCPClient(datasets),
                 datasets,
             )
         elif args.workflow_command == "dag-export":
