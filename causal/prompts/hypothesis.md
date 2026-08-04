@@ -18,7 +18,7 @@ Required JSON shape:
     "grace_period_hours": 0,
     "outcome": "...",
     "follow_up_days": 1,
-    "primary_estimand": "ATE, ATT, or CATE",
+    "primary_estimand": "CATE",
     "secondary_estimands": []
   },
   "literature_search": {
@@ -35,6 +35,12 @@ Required JSON shape:
 Rules:
 
 - Preserve the original question in source_question.
+- primary_estimand is CATE (conditional average treatment effect) by default -- this is
+  the project's primary methodological target, not a free per-study choice. List ATE
+  and/or ATT in secondary_estimands when a population-average summary is useful for
+  comparison against a published study. Only set primary_estimand to ATE or ATT instead
+  of CATE if the user question explicitly asks for a single population-average effect
+  and rejects subgroup/heterogeneity analysis.
 - Never invent OMOP concept IDs or claim that a variable is available.
 - Use explicit time zero, exposure grace period, and follow-up.
 - If the question is underspecified, choose conservative draft values and list
