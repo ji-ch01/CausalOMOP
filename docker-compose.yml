@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "3000:3000"
+      - "7777:7777"
 
     environment:
       # OpenRouter
@@ -18,10 +18,15 @@ services:
       - DB_TYPE=duckdb
       - DB_PATH=/app/data/synthetic_snuh.duckdb
 
+      # Required: web_interface.py refuses to start without this (see
+      # agno_fastomop/.env.example). Generate with:
+      #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+      - OS_SECURITY_KEY=${OS_SECURITY_KEY}
+
       # Langfuse disabled
       - LANGFUSE_PUBLIC_KEY=disabled
       - LANGFUSE_SECRET_KEY=disabled
-      - LANGFUSE_HOST=http://localhost:3000
+      - LANGFUSE_HOST=http://localhost:7777
 
       # Tracing disabled
       - OTEL_SDK_DISABLED=true
@@ -29,9 +34,6 @@ services:
     volumes:
       # DuckDB data file
       - ${DB_HOST_PATH:-../data}:/app/data:ro
-
-      # Local config override (OpenRouter model config)
-      - ./agno_fastomop/config.local.toml:/app/agno_fastomop/config.local.toml:ro
 
     logging:
       driver: "json-file"

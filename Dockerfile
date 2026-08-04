@@ -8,12 +8,15 @@ RUN pip install --no-cache-dir uv
 WORKDIR /app
 
 # Install omcp first
-COPY omcp/pyproject.toml omcp/uv.lock* /app/omcp/
+# Full source (not just pyproject.toml/uv.lock) is required here: omcp's
+# pyproject.toml declares readme = "README.md", and hatchling's editable
+# build fails validation if that file isn't present yet.
+COPY omcp/ /app/omcp/
 WORKDIR /app/omcp
 RUN uv sync --frozen --no-dev
 
 # Install agno_fastomop
-COPY agno_fastomop/pyproject.toml agno_fastomop/uv.lock* /app/agno_fastomop/
+COPY agno_fastomop/ /app/agno_fastomop/
 WORKDIR /app/agno_fastomop
 RUN uv sync --frozen --no-dev
 
@@ -44,9 +47,9 @@ ENV PYTHONPATH="/app/agno_fastomop/src:$PYTHONPATH"
 ENV MCP_COMMAND="/app/omcp/.venv/bin/python /app/omcp/src/omcp/main.py"
 ENV OTEL_SDK_DISABLED="true"
 
-EXPOSE 3000
+EXPOSE 7777
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+    CMD curl -f http://localhost:7777/health || exit 1
 
 CMD ["python", "-m", "agno_fastomop.web_interface"]
