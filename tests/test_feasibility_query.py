@@ -72,5 +72,50 @@ class FeasibilityQueryTests(unittest.TestCase):
         self.assertIn("Medical Intensive Care Unit (MICU)", sql)
 
 
+DUCKDB_DATASETS = BigQueryDatasets(backend="duckdb", duckdb_path="data/mimiciv_omop.duckdb", duckdb_schema="main")
+
+
+class DuckDBFeasibilityQueryTests(unittest.TestCase):
+    """Same SQL generator, `backend="duckdb"` -- must drop every
+    BigQuery-only construct (`DATETIME_ADD`, backtick-qualified
+    `project.dataset.table` identifiers) that DuckDB's parser rejects."""
+
+    def test_no_datetime_add_or_backtick_identifiers(self):
+        sql = feasibility_sql(
+            DUCKDB_DATASETS,
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+        )
+        self.assertNotIn("DATETIME_ADD", sql)
+        self.assertNotIn("`", sql)
+        self.assertIn('"main"."person"', sql)
+        self.assertIn("INTERVAL (24) HOUR", sql)
+
+    def test_negative_covariate_window_hours_are_parenthesized(self):
+        from causal.queries.feasibility import CovariateSpec, analytic_cohort_sql
+
+        covariate = CovariateSpec(
+            column_name="diabetes",
+            domain="condition",
+            concept_ids=(201820,),
+            window_start_hours=-876000,
+            window_end_hours=0,
+            aggregation="presence_in_window",
+        )
+        sql = analytic_cohort_sql(
+            DUCKDB_DATASETS,
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            covariates=(covariate,),
+        )
+        self.assertIn("INTERVAL (-876000) HOUR", sql)
+        self.assertNotIn("DATETIME_ADD", sql)
+
+    def test_bigquery_output_is_unchanged_by_the_duckdb_branch(self):
+        sql = feasibility_sql(
+            BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+        )
+        self.assertIn("DATETIME_ADD(e.index_datetime, INTERVAL 24 HOUR)", sql)
+
+
 if __name__ == "__main__":
     unittest.main()

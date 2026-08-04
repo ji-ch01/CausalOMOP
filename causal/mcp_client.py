@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from causal.config import BigQueryDatasets
+
 
 @dataclass(frozen=True)
 class MCPToolResponse:
@@ -39,19 +41,45 @@ def _subprocess_environment(overrides: dict[str, str]) -> dict[str, str]:
     return inherited
 
 
+def _omcp_db_overrides(datasets: BigQueryDatasets) -> tuple[dict[str, str], str]:
+    """The `DB_*`/schema env overrides and `uv run --extra` group for
+    `datasets.backend`. A pure function of `datasets` (no env/subprocess
+    access) so the backend-selection logic is unit-testable on its own,
+    without spawning the OMCP subprocess (see `_call_tool`)."""
+    common = {
+        "DB_READ_ONLY": "true",
+        "MCP_TRANSPORT": "stdio",
+        "ENABLE_LANGFUSE": os.environ.get("ENABLE_LANGFUSE", "false"),
+    }
+    if datasets.backend == "duckdb":
+        return {
+            "DB_TYPE": "duckdb",
+            "DB_PATH": str(datasets.resolved_duckdb_path()),
+            "CDM_SCHEMA": datasets.duckdb_schema,
+            "VOCAB_SCHEMA": datasets.duckdb_schema,
+            **common,
+        }, "duckdb"
+    return {
+        "DB_TYPE": "bigquery",
+        "DB_PROJECT": datasets.project,
+        "DB_DATASET": datasets.omop,
+        "CDM_SCHEMA": datasets.omop,
+        "VOCAB_SCHEMA": datasets.omop,
+        **common,
+    }, "bigquery"
+
+
 class OMCPClient:
     """Small synchronous facade over the official asynchronous MCP client."""
 
     def __init__(
         self,
+        datasets: BigQueryDatasets,
         *,
-        project: str,
-        dataset: str,
         omcp_dir: str | Path = "omcp",
         timeout_seconds: float = 180.0,
     ) -> None:
-        self.project = project
-        self.dataset = dataset
+        self.datasets = datasets.validated()
         self.omcp_dir = Path(omcp_dir).resolve()
         self.timeout_seconds = timeout_seconds
         if not self.omcp_dir.is_dir():
@@ -114,20 +142,12 @@ class OMCPClient:
                 "Install the MCP client with: pip install -r requirements-mcp.txt"
             ) from exc
 
-        environment = _subprocess_environment({
-            "DB_TYPE": "bigquery",
-            "DB_PROJECT": self.project,
-            "DB_DATASET": self.dataset,
-            "DB_READ_ONLY": "true",
-            "CDM_SCHEMA": self.dataset,
-            "VOCAB_SCHEMA": self.dataset,
-            "MCP_TRANSPORT": "stdio",
-            "ENABLE_LANGFUSE": os.environ.get("ENABLE_LANGFUSE", "false"),
-        })
+        overrides, extra = _omcp_db_overrides(self.datasets)
+        environment = _subprocess_environment(overrides)
         parameters = StdioServerParameters(
             command="uv",
             args=[
-                "run", "--extra", "bigquery", "--directory", str(self.omcp_dir),
+                "run", "--extra", extra, "--directory", str(self.omcp_dir),
                 "python", "src/omcp/main.py",
             ],
             env=environment,

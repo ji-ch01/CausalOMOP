@@ -120,6 +120,37 @@ def _string_literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _dt_add(datasets: BigQueryDatasets, expr: str, amount: int, unit: str = "HOUR") -> str:
+    """Portable `datetime_expression + amount unit`. BigQuery keeps the
+    existing `DATETIME_ADD` form (unchanged SQL for that backend); DuckDB has
+    no `DATETIME_ADD` function (only `DATE_ADD`, which requires a DATE, not a
+    DATETIME/TIMESTAMP, argument), so it gets interval arithmetic instead.
+    `amount` may be negative (a covariate window's `window_start_hours` often
+    is); DuckDB's parser rejects a bare negative literal immediately after
+    `INTERVAL`, hence the parens.
+    """
+    amount = int(amount)
+    if datasets.backend == "duckdb":
+        return f"({expr} + INTERVAL ({amount}) {unit})"
+    return f"DATETIME_ADD({expr}, INTERVAL {amount} {unit})"
+
+
+def unnest_ids(datasets: BigQueryDatasets, ids: str, column_name: str) -> str:
+    """Portable `UNNEST([ids]) AS column_name` table-function fragment, for a
+    `FROM`/join clause that turns an integer-id literal list into one row per
+    id, in a column named `column_name`. BigQuery's `UNNEST(expr) AS alias`
+    names the single output *column* `alias`; DuckDB's `AS alias` instead
+    names the table (leaving the column named "unnest"), so it needs the
+    `AS table_alias(column_name)` form for the same result -- a syntax
+    BigQuery does not accept. Public (not module-private) so
+    `causal.mapping.audit` can build the same `UNNEST` fragment without
+    duplicating this dialect branch.
+    """
+    if datasets.backend == "duckdb":
+        return f"UNNEST([{ids}]) AS _unnest_t({column_name})"
+    return f"UNNEST([{ids}]) AS {column_name}"
+
+
 def concept_ids_literal(spec: ConceptSetSpec, field: str) -> str:
     if spec.domain not in DOMAIN_TABLES:
         raise ValueError(f"{field} domain must be one of {tuple(DOMAIN_TABLES)}")
@@ -145,9 +176,9 @@ def expanded_concepts_cte(alias: str, spec: ConceptSetSpec, field: str, datasets
         base = f"""SELECT descendant_concept_id AS concept_id
       FROM {datasets.table('omop', 'concept_ancestor')}
       WHERE ancestor_concept_id IN ({ids})
-      UNION DISTINCT SELECT concept_id FROM UNNEST([{ids}]) AS concept_id"""
+      UNION DISTINCT SELECT concept_id FROM {unnest_ids(datasets, ids, 'concept_id')}"""
     else:
-        base = f"SELECT concept_id FROM UNNEST([{ids}]) AS concept_id"
+        base = f"SELECT concept_id FROM {unnest_ids(datasets, ids, 'concept_id')}"
     if not spec.excluded_concept_ids:
         return f"""{alias} AS (
       {base}
@@ -213,8 +244,8 @@ def _covariate_ctes_columns_and_joins(
         ctes.append(_expanded_concepts_cte(concepts_alias, concept_spec, name, datasets))
 
         window_filter = (
-            f"t.{dt_col} >= DATETIME_ADD(e.index_datetime, INTERVAL {int(covariate.window_start_hours)} HOUR)\n"
-            f"       AND t.{dt_col} <= DATETIME_ADD(e.index_datetime, INTERVAL {int(covariate.window_end_hours)} HOUR)"
+            f"t.{dt_col} >= {_dt_add(datasets, 'e.index_datetime', covariate.window_start_hours)}\n"
+            f"       AND t.{dt_col} <= {_dt_add(datasets, 'e.index_datetime', covariate.window_end_hours)}"
         )
 
         if covariate.aggregation in _PRESENCE_AGGREGATIONS:
@@ -294,9 +325,19 @@ def _cohort_ctes(
     site_filter = ""
     if care_site_names:
         names = ", ".join(_string_literal(name) for name in care_site_names)
+        # A hospitalization (`visit_occurrence`) commonly spans several
+        # `visit_detail` stays (e.g. ED -> MICU -> ward). Joining on
+        # `visit_occurrence_id` alone would match a person whose
+        # population-defining event happened anywhere in that
+        # hospitalization as long as *any* stay touched a named unit --
+        # including one they were only in before or after the event. The
+        # added datetime bounds require the population event to have
+        # actually occurred during that specific stay.
         site_join = f"""
       JOIN {datasets.table('omop', 'visit_detail')} vd
         ON vd.visit_occurrence_id = ev.visit_occurrence_id
+       AND ev.{pop_dt_col} >= vd.visit_detail_start_datetime
+       AND ev.{pop_dt_col} <= COALESCE(vd.visit_detail_end_datetime, vd.visit_detail_start_datetime)
       JOIN {datasets.table('omop', 'care_site')} cs USING (care_site_id)"""
         site_filter = f"AND cs.care_site_name IN ({names})"
 
@@ -315,7 +356,7 @@ def _cohort_ctes(
       JOIN population_concepts pc ON ev.{pop_concept_col} = pc.concept_id{site_join}
       WHERE ev.{pop_dt_col} IS NOT NULL {site_filter}
       QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY ev.person_id ORDER BY ev.{pop_dt_col}
+        PARTITION BY ev.person_id ORDER BY ev.{pop_dt_col}, ev.{pop_concept_col}
       ) = 1
     )""",
         f"""eligible AS (
@@ -335,12 +376,12 @@ def _cohort_ctes(
       LEFT JOIN {datasets.table('omop', trt_table)} t
         ON t.person_id = e.person_id
        AND t.{trt_dt_col} >= e.index_datetime
-       AND t.{trt_dt_col} < DATETIME_ADD(e.index_datetime, INTERVAL {int(grace_period_hours)} HOUR)
+       AND t.{trt_dt_col} < {_dt_add(datasets, 'e.index_datetime', grace_period_hours)}
       LEFT JOIN treatment_concepts tc ON t.{trt_concept_col} = tc.concept_id
       LEFT JOIN {datasets.table('omop', cmp_table)} c
         ON c.person_id = e.person_id
        AND c.{cmp_dt_col} >= e.index_datetime
-       AND c.{cmp_dt_col} < DATETIME_ADD(e.index_datetime, INTERVAL {int(grace_period_hours)} HOUR)
+       AND c.{cmp_dt_col} < {_dt_add(datasets, 'e.index_datetime', grace_period_hours)}
       LEFT JOIN comparator_concepts cc ON c.{cmp_concept_col} = cc.concept_id
       GROUP BY e.person_id
     )""",
@@ -365,9 +406,16 @@ def _cohort_ctes(
         d.death_date IS NOT NULL
           AND d.death_date >= DATE(e.index_datetime)
           AND d.death_date <= DATE_ADD(DATE(e.index_datetime), INTERVAL {int(follow_up_days)} DAY) AS outcome_event,
+        -- death_date is DATE-only in the OMOP CDM (no time-of-day), unlike
+        -- every other domain's datetime column below, so this can only
+        -- approximate the same [index, index + grace_period) window to
+        -- day granularity. Kept exclusive on the upper bound to match the
+        -- non-death branch's semantics -- an inclusive bound against a
+        -- DATE-truncated boundary would silently count deaths up to ~24h
+        -- past the true grace-period cutoff as "during" it.
         d.death_date IS NOT NULL
           AND d.death_date >= DATE(e.index_datetime)
-          AND d.death_date <= DATE(DATETIME_ADD(e.index_datetime, INTERVAL {int(grace_period_hours)} HOUR))
+          AND d.death_date < DATE({_dt_add(datasets, 'e.index_datetime', grace_period_hours)})
           AS outcome_event_during_grace_period
       FROM eligible e
       JOIN exposure x USING (person_id)
@@ -384,12 +432,12 @@ def _cohort_ctes(
         COUNTIF(
           oc.concept_id IS NOT NULL
           AND o.{out_dt_col} >= e.index_datetime
-          AND o.{out_dt_col} <= DATETIME_ADD(e.index_datetime, INTERVAL {int(follow_up_days)} DAY)
+          AND o.{out_dt_col} <= {_dt_add(datasets, 'e.index_datetime', follow_up_days, 'DAY')}
         ) > 0 AS outcome_event,
         COUNTIF(
           oc.concept_id IS NOT NULL
           AND o.{out_dt_col} >= e.index_datetime
-          AND o.{out_dt_col} < DATETIME_ADD(e.index_datetime, INTERVAL {int(grace_period_hours)} HOUR)
+          AND o.{out_dt_col} < {_dt_add(datasets, 'e.index_datetime', grace_period_hours)}
         ) > 0 AS outcome_event_during_grace_period
       FROM eligible e
       JOIN exposure x USING (person_id)

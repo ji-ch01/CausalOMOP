@@ -1,5 +1,9 @@
 -r requirements.txt
 google-cloud-bigquery>=3.25.0,<4
+pyarrow>=16.0.0
+# Optional but strongly recommended for scripts/bigquery_etl/export_duckdb.py:
+# without it, large-table export falls back to BigQuery's slower REST pagination API.
+google-cloud-bigquery-storage>=2.24.0,<3
 # Keep compatibility with grpcio-tools used by the FastOMOP stack.
 protobuf>=6.31.1,<7
 grpcio>=1.76,<1.77
