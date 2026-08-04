@@ -27,6 +27,37 @@ class ExecutionReadinessArtifact:
         return asdict(self)
 
 
+def analysis_plan_blockers(
+    analysis_plan: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """The three reasons an analysis plan is not yet execution-ready:
+    `(unresolved_issues, covariates_not_ready, phenotypes_not_approved)`.
+    Shared by `ExecutionAgent.run` (the automated gate, evaluated every time
+    readiness is computed) and `WorkflowManager._block_if_analysis_plan_
+    incomplete` (the human-approval gate, evaluated once when a reviewer
+    approves the `analysis_plan` gate) so the two can never disagree about
+    what "complete" means.
+
+    A malformed entry (not a dict, or missing the expected field) counts as
+    incomplete for both covariates and phenotypes -- treating it as
+    "somehow already fine" would let a hand-edited or buggily-generated
+    plan slip past review.
+    """
+    unresolved = tuple(str(value) for value in analysis_plan.get("unresolved_issues", ()))
+    incomplete_covariates = tuple(
+        str(item.get("name", "unnamed")) if isinstance(item, dict) else "unnamed"
+        for item in analysis_plan.get("covariates", ())
+        if not isinstance(item, dict) or item.get("status") != "ready"
+    )
+    incomplete_phenotypes = tuple(
+        str(item.get("name", "unnamed")) if isinstance(item, dict) else "unnamed"
+        for item in analysis_plan.get("phenotypes", ())
+        if not isinstance(item, dict)
+        or (item.get("approval_required", True) and item.get("status") != "approved")
+    )
+    return unresolved, incomplete_covariates, incomplete_phenotypes
+
+
 class ExecutionAgent:
     """Translate a reviewed plan into an explicit execution decision.
 
@@ -49,23 +80,20 @@ class ExecutionAgent:
             raise ValueError("mode must be exploratory or final")
         study_id = self._required_text(analysis_plan, "study_id")
 
-        unresolved = tuple(str(value) for value in analysis_plan.get("unresolved_issues", ()))
-        incomplete_covariates = tuple(
-            str(item.get("name", "unnamed"))
-            for item in analysis_plan.get("covariates", ())
-            if not isinstance(item, dict) or item.get("status") != "ready"
-        )
-        incomplete_phenotypes = tuple(
-            str(item.get("name", "unnamed"))
-            for item in analysis_plan.get("phenotypes", ())
-            if isinstance(item, dict)
-            and item.get("approval_required", True)
-            and item.get("status") != "approved"
-        )
+        unresolved, incomplete_covariates, incomplete_phenotypes = analysis_plan_blockers(analysis_plan)
 
-        aggregate_allowed = mode == "exploratory" and clinical_mapping_status in {
-            "provisional", "approved"
-        }
+        # Exploratory mode may probe aggregate feasibility as soon as
+        # clinical mapping is at least provisional; final mode is held to
+        # the stricter bar of a fully approved mapping (mirrors
+        # `omcp.governance.authorize_causal_operation`'s own
+        # `mode == "final"` check for this same operation -- that check is
+        # unreachable unless this agent can actually grant the allowance it
+        # gates on).
+        aggregate_allowed = (
+            clinical_mapping_status in {"provisional", "approved"}
+            if mode == "exploratory"
+            else clinical_mapping_status == "approved"
+        )
         dataset_flag = (
             analysis_plan.get("exploratory_execution_allowed")
             if mode == "exploratory"

@@ -1,6 +1,6 @@
 import unittest
 
-from causal.agents import ExecutionAgent
+from causal.agents import ExecutionAgent, analysis_plan_blockers
 
 
 def plan(exploratory_allowed=False, unresolved=()):
@@ -58,6 +58,44 @@ class ExecutionAgentTests(unittest.TestCase):
         )
         self.assertFalse(result.causal_estimation_allowed)
         self.assertIn("covariate_not_ready:sofa_score", result.blockers)
+
+    def test_final_mode_allows_aggregate_feasibility_once_mapping_is_approved(self):
+        """`omcp.governance.authorize_causal_operation` has a dedicated
+        `mode == "final"` branch for `aggregate_feasibility` that requires
+        `clinical_mapping_status == "approved"` -- that branch is only
+        reachable at all if this agent can actually grant
+        `aggregate_feasibility_allowed=True` for `mode="final"` in the first
+        place. It previously never did (bug: `aggregate_allowed` was
+        unconditionally `mode == "exploratory"`), permanently blocking every
+        read-only diagnostic for final-mode runs regardless of approval."""
+        result = ExecutionAgent().run(
+            plan(),
+            mode="final",
+            clinical_mapping_status="approved",
+            analysis_plan_status="pending",
+        )
+        self.assertTrue(result.aggregate_feasibility_allowed)
+
+    def test_final_mode_blocks_aggregate_feasibility_when_mapping_only_provisional(self):
+        result = ExecutionAgent().run(
+            plan(),
+            mode="final",
+            clinical_mapping_status="provisional",
+            analysis_plan_status="pending",
+        )
+        self.assertFalse(result.aggregate_feasibility_allowed)
+
+    def test_malformed_phenotype_entry_blocks_like_a_malformed_covariate_would(self):
+        """`incomplete_covariates` always treated a non-dict list entry as
+        incomplete; `incomplete_phenotypes` used to only check `isinstance
+        (item, dict) AND ...`, so a non-dict entry (e.g. a stray `None` from
+        a hand-edited or buggily-generated analysis_plan.json) fell out of
+        the filter entirely instead of blocking -- the two lists must treat
+        malformed entries the same way."""
+        unresolved, incomplete_covariates, incomplete_phenotypes = analysis_plan_blockers(
+            {"phenotypes": [None, {"name": "population", "status": "approved"}], "covariates": []}
+        )
+        self.assertEqual(incomplete_phenotypes, ("unnamed",))
 
 
 if __name__ == "__main__":

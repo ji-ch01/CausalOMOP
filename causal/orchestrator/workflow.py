@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from causal.orchestrator.state import ApprovalGate, NEXT_PHASE, RunState
-from causal.agents import DataScienceAgent, ExecutionAgent, HypothesisAgent, QueryValidationAgent
+from causal.agents import (
+    DataScienceAgent,
+    ExecutionAgent,
+    HypothesisAgent,
+    QueryValidationAgent,
+    analysis_plan_blockers,
+)
 from causal.agents.dag_identification import assess_identification, review_dag
 from causal.agents.hypothesis import DAG_VARIABLE_DOMAINS, DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
 from causal.agents.user_question import GeneratedHypothesis
@@ -26,8 +32,11 @@ from causal.data_builder import AnalyticCohortBuilder
 from causal.mapping.audit import (
     approved_concepts_missing_from_data_sql,
     concept_row_and_person_counts_sql,
+    incidence_rate_sql,
+    index_event_breakdown_sql,
     invalid_or_nonstandard_concepts_sql,
     observed_units_sql,
+    orphan_concepts_sql,
 )
 from causal.mapping.registry import (
     VALUE_DOMAINS,
@@ -67,15 +76,25 @@ _LOCK_STALE_SECONDS = 30.0
 
 
 class _RunLock:
-    """Advisory, filesystem-based lock over one run's on-disk `protocol.json`
-    (and the `hypothesis.json` regenerated from it), so two reviewers acting
-    on the same covariate at the same time (`review_covariate`,
-    `map_covariate_concepts`, `review_covariate_aggregation` -- all
-    read-modify-write `candidate_dag`) get a clear, bounded wait or a
-    `TimeoutError` instead of the last writer silently discarding the
-    other's change. Not a database transaction, just enough to turn a silent
-    race into a loud one; `os.O_CREAT | os.O_EXCL` is atomic on both Windows
-    and POSIX, so no external dependency is needed for this.
+    """Advisory, filesystem-based lock over one run's on-disk state, so two
+    callers acting on the same run at the same time get a clear, bounded
+    wait or a `TimeoutError` instead of the last writer silently discarding
+    the other's change. Not a database transaction, just enough to turn a
+    silent race into a loud one; `os.O_CREAT | os.O_EXCL` is atomic on both
+    Windows and POSIX, so no external dependency is needed for this.
+
+    Two distinct things share this one lock per run directory:
+    `protocol.json`/`hypothesis.json` (read-modify-write `candidate_dag` --
+    `review_covariate`, `map_covariate_concepts`,
+    `review_covariate_aggregation`, etc.) and `state.json`
+    (`decide_gate`, `advance`, `run_data_science_agent`,
+    `run_execution_readiness`, `build_cohort_plan` -- all load-mutate-save
+    `RunState`). Not reentrant: a caller that already holds this lock must
+    never acquire it again on the same run_dir (deadlock, since acquisition
+    just spin-polls `__enter__` until its own timeout). `build_cohort_plan`
+    calls `run_execution_readiness` for this reason -- as a plain call that
+    fully acquires and releases its own lock, never nested inside
+    `build_cohort_plan`'s.
     """
 
     def __init__(self, run_dir: Path, timeout_seconds: float = 10.0, poll_seconds: float = 0.05):
@@ -500,36 +519,96 @@ class WorkflowManager:
         temporary.replace(path)
 
     def decide_gate(self, run_id: str, gate: str, status: str, reviewer: str, comment: str | None = None) -> RunState:
-        state = self.load(run_id)
-        if gate not in state.gates:
-            raise ValueError(f"Unknown gate: {gate}")
-        if status not in {"approved", "rejected", "provisional"}:
-            raise ValueError("status must be approved, rejected, or provisional")
-        if gate == "protocol" and status == "approved":
-            self._block_if_major_confounders_unresolved(run_id)
-            self._block_if_not_identified(run_id)
-        state.gates[gate].decide(status, reviewer, comment)  # type: ignore[arg-type]
-        state.record("gate_decided", f"{gate}={status} by {reviewer}")
-        self.save(state)
+        run_dir = self.runs_dir / run_id
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            if gate not in state.gates:
+                raise ValueError(f"Unknown gate: {gate}")
+            if status not in {"approved", "rejected", "provisional"}:
+                raise ValueError("status must be approved, rejected, or provisional")
+            if gate == "protocol" and status == "approved":
+                self._block_if_major_confounders_unresolved(run_id)
+                self._block_if_not_identified(run_id)
+            if gate == "analysis_plan" and status == "approved":
+                self._block_if_analysis_plan_incomplete(run_id)
+            state.gates[gate].decide(status, reviewer, comment)  # type: ignore[arg-type]
+            state.record("gate_decided", f"{gate}={status} by {reviewer}")
+            self.save(state)
         return state
 
-    def advance(self, run_id: str) -> RunState:
-        state = self.load(run_id)
-        gate_name = REQUIRED_GATES.get(state.phase)
-        if gate_name:
-            gate = state.gates[gate_name]
-            accepted = gate.status == "approved" or (
-                state.mode == "exploratory" and gate.status == "provisional" and gate_name == "clinical_mapping"
+    def _invalidate_gate(self, state: RunState, gate: str, reason: str) -> None:
+        """Reset an already-decided gate back to `pending` after a review
+        action changes the content it approved.
+
+        Without this, `ExecutionAgent`/OMCP governance (see
+        `causal.agents.execution.ExecutionAgent.run`,
+        `omcp.governance.authorize_causal_operation`) trust
+        `state.gates[...].status` as a bare string with no link to the
+        artifact's current content -- a gate approved once would keep
+        authorizing execution even after the analysis plan or a covariate's
+        clinical mapping was silently regenerated or edited underneath it.
+        A no-op when the gate is not currently `approved`/`provisional`
+        (the ordinary "review, then approve" flow never triggers this).
+        """
+        gate_obj = state.gates.get(gate)
+        if gate_obj is None or gate_obj.status not in {"approved", "provisional"}:
+            return
+        previous_status = gate_obj.status
+        gate_obj.status = "pending"
+        gate_obj.reviewer = None
+        gate_obj.comment = None
+        gate_obj.decided_at = None
+        state.record("gate_invalidated", f"{gate} reset from {previous_status} to pending: {reason}")
+
+    def _block_if_analysis_plan_incomplete(self, run_id: str) -> None:
+        """The `analysis_plan` gate cannot be approved while the plan itself
+        still has unresolved issues or a covariate/phenotype that isn't
+        ready -- otherwise approval is a rubber stamp that
+        `causal.agents.execution.ExecutionAgent` would refuse to act on
+        anyway (see `analysis_plan_blockers`), just without ever telling the
+        reviewer what was actually missing.
+        """
+        plan_path = self.runs_dir / run_id / "analysis_plan.json"
+        if not plan_path.is_file():
+            raise ValueError(
+                "Cannot approve the analysis_plan gate: run the Data Science Agent to "
+                "generate analysis_plan.json first"
             )
-            if not accepted:
-                raise RuntimeError(f"Gate {gate_name} must be accepted before leaving {state.phase}")
-        next_phase = NEXT_PHASE.get(state.phase)
-        if next_phase is None:
-            raise RuntimeError("Workflow is already at its final phase")
-        previous = state.phase
-        state.phase = next_phase
-        state.record("phase_advanced", f"{previous}->{next_phase}")
-        self.save(state)
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        unresolved, incomplete_covariates, incomplete_phenotypes = analysis_plan_blockers(plan)
+        if not (unresolved or incomplete_covariates or incomplete_phenotypes):
+            return
+        details = []
+        if unresolved:
+            details.append(f"unresolved issues: {', '.join(unresolved)}")
+        if incomplete_covariates:
+            details.append(f"covariates not ready: {', '.join(incomplete_covariates)}")
+        if incomplete_phenotypes:
+            details.append(f"phenotypes not approved: {', '.join(incomplete_phenotypes)}")
+        raise ValueError(
+            "Cannot approve the analysis_plan gate while the plan is incomplete "
+            f"({'; '.join(details)})."
+        )
+
+    def advance(self, run_id: str) -> RunState:
+        run_dir = self.runs_dir / run_id
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            gate_name = REQUIRED_GATES.get(state.phase)
+            if gate_name:
+                gate = state.gates[gate_name]
+                accepted = gate.status == "approved" or (
+                    state.mode == "exploratory" and gate.status == "provisional" and gate_name == "clinical_mapping"
+                )
+                if not accepted:
+                    raise RuntimeError(f"Gate {gate_name} must be accepted before leaving {state.phase}")
+            next_phase = NEXT_PHASE.get(state.phase)
+            if next_phase is None:
+                raise RuntimeError("Workflow is already at its final phase")
+            previous = state.phase
+            state.phase = next_phase
+            state.record("phase_advanced", f"{previous}->{next_phase}")
+            self.save(state)
         return state
 
     def run_hypothesis_agent(self, run_id: str) -> RunState:
@@ -577,10 +656,11 @@ class WorkflowManager:
         (see `HypothesisAgent._unresolved_concept_sets`), so
         `hypothesis.json` is regenerated here too, same as `review_covariate`.
 
-        Only `domain`/`concept_ids`/`status` are written here; `role`,
-        `source_value_rule`, and `lookup_term` (protocol-author-set) are left
-        untouched. `concept_lookup` is the same optional, opt-in domain
-        cross-check as `map_covariate_concepts` -- see its docstring.
+        Only `domain`/`concept_ids`/`status`/`reviewer`/`provenance` are
+        written here; `role`, `source_value_rule`, and `lookup_term`
+        (protocol-author-set) are left untouched. `concept_lookup` is the
+        same optional, opt-in domain cross-check as `map_covariate_concepts`
+        -- see its docstring, including what it means for `provenance`.
 
         `domain='death'` is only valid for an entry whose declared `role` is
         `'outcome'` (see `OUTCOME_DOMAINS`) and needs no `concept_ids` -- the
@@ -639,7 +719,27 @@ class WorkflowManager:
                 "concept_ids": entry.get("concept_ids", []),
                 "status": entry.get("status", "missing"),
             }
-            updated_entry = {**entry, "domain": domain, "concept_ids": concept_ids, "status": status}
+            # `reviewer`/`provenance` mirror the fix in
+            # `map_covariate_concepts` for `candidate_dag` -- without
+            # writing them here, `causal.mapping.registry.
+            # variable_from_concept_set` (which reads both back via
+            # `definition.get("reviewer", "")`/`definition.get("provenance",
+            # "protocol_declared")`) left every phenotype's `reviewer` blank
+            # and `provenance` always defaulted to `"protocol_declared"`,
+            # regardless of who actually approved it or whether a live
+            # `concept_lookup` OMCP cross-check was used -- the same dead
+            # safety net the covariate fix closed, just still open here.
+            updated_entry = {
+                **entry,
+                "domain": domain,
+                "concept_ids": concept_ids,
+                "status": status,
+                "reviewer": reviewer.strip(),
+                "provenance": (
+                    "omcp_candidate" if concept_lookup is not None
+                    else entry.get("provenance", "protocol_declared")
+                ),
+            }
             protocol["concept_sets"] = {**concept_sets, name: updated_entry}
             temporary = protocol_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
@@ -656,6 +756,8 @@ class WorkflowManager:
                 "after": {"domain": domain, "concept_ids": concept_ids, "status": status},
             },
         )
+        self._invalidate_gate(state, "clinical_mapping", f"concept_sets['{name}'] changed")
+        self._invalidate_gate(state, "analysis_plan", f"concept_sets['{name}'] changed")
         self.save(state)
         return state
 
@@ -779,6 +881,8 @@ class WorkflowManager:
             "covariate_reviewed", f"{label}={decision} by {reviewer}",
             changes={"before": previous_entry, "after": new_entry},
         )
+        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' {decision}ed")
+        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' {decision}ed")
         self.save(state)
         return state
 
@@ -859,6 +963,8 @@ class WorkflowManager:
             "covariate_domain_reviewed", detail,
             changes={"before": {"domain": previous_domain}, "after": {"domain": domain}},
         )
+        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' domain changed")
+        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' domain changed")
         self.save(state)
         return state
 
@@ -882,7 +988,8 @@ class WorkflowManager:
         role/temporal_classification/rationale just to record a concept_id.
         The `candidate_dag` entry must already exist (i.e. the covariate was
         already accepted via `review_covariate`); every field but
-        `concept_ids`/`mapping_status` is left untouched.
+        `concept_ids`/`mapping_status`/`mapping_reviewer`/`provenance` is
+        left untouched.
 
         `concept_lookup` (optional) verifies each approved concept_id's real
         OMOP `domain_id` actually matches the covariate's declared `domain`
@@ -890,7 +997,10 @@ class WorkflowManager:
         just pick one of the search results), so nothing else confirms it
         belongs to the expected domain. Skipped entirely when omitted, same
         as `run_data_science_agent`'s `concept_lookup`: this method stays
-        filesystem-only/offline-testable by default.
+        filesystem-only/offline-testable by default. Whether it was passed
+        also decides the `provenance` written onto the entry
+        (`"omcp_candidate"` vs. whatever provenance the entry already
+        carried) -- see `causal.mapping.registry._UNSUPERVISED_PROVENANCE`.
         """
         label = label.strip()
         if not label:
@@ -946,7 +1056,42 @@ class WorkflowManager:
                 raise RuntimeError(
                     f"'{label}' has no candidate_dag entry yet -- accept it via review_covariate first"
                 )
-            updated_entry = {**entry, "concept_ids": concept_ids, "mapping_status": mapping_status.strip()}
+            # `mapping_reviewer` is what `causal.mapping.registry.
+            # variable_from_candidate_dag_entry` reads back out (see
+            # `entry.get("mapping_reviewer", "")`) to populate
+            # `OMOPVariableDefinition.reviewer` -- without writing it here,
+            # that field (and the module's "an automated-provenance mapping
+            # may never be approved without a named human reviewer" check)
+            # stayed permanently blank for every real covariate this method
+            # ever approved, even though `reviewer` was already required and
+            # validated as an argument above.
+            #
+            # `provenance` mirrors `run_data_science_agent`'s own
+            # `source = "omcp_candidates" if concept_lookup is not None
+            # else ...` distinction: a live `concept_lookup` cross-check is
+            # this codebase's one signal that a concept_id was OMCP-vetted
+            # rather than purely human-supplied. Without writing this,
+            # `causal.mapping.registry`'s `_UNSUPERVISED_PROVENANCE` check
+            # (`provenance in ("llm_proposed", "omcp_candidate")` requires a
+            # named reviewer) could never actually fire for a real
+            # covariate -- every entry silently fell back to the adapter's
+            # `"protocol_declared"` default regardless of how the mapping
+            # was really produced, leaving that invariant a dead check (not
+            # exploitable today only because `reviewer` above is already
+            # unconditionally required). Falls back to whatever provenance
+            # the entry already carried (not a blind reset to
+            # "protocol_declared") so a legitimate prior value survives a
+            # later re-review that happens not to use `concept_lookup`.
+            updated_entry = {
+                **entry,
+                "concept_ids": concept_ids,
+                "mapping_status": mapping_status.strip(),
+                "mapping_reviewer": reviewer.strip(),
+                "provenance": (
+                    "omcp_candidate" if concept_lookup is not None
+                    else entry.get("provenance", "protocol_declared")
+                ),
+            }
             protocol["candidate_dag"] = [
                 updated_entry if item.get("label") == label else item for item in candidate_dag
             ]
@@ -968,6 +1113,8 @@ class WorkflowManager:
                 "after": {"concept_ids": concept_ids, "mapping_status": mapping_status.strip()},
             },
         )
+        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' concept mapping changed")
+        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' concept mapping changed")
         self.save(state)
         return state
 
@@ -1044,6 +1191,8 @@ class WorkflowManager:
                 "after": {"aggregation": aggregation},
             },
         )
+        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' aggregation changed")
+        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' aggregation changed")
         self.save(state)
         return state
 
@@ -1125,6 +1274,8 @@ class WorkflowManager:
                 "after": {"window_start_hours": window_start_hours, "window_end_hours": window_end_hours},
             },
         )
+        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' window changed")
+        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' window changed")
         self.save(state)
         return state
 
@@ -1214,22 +1365,32 @@ class WorkflowManager:
         carried_forward = False
         if concept_lookup is None:
             artifact, carried_forward = _carry_forward_concept_candidates(artifact, artifact_path)
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
-        if "analysis_plan.json" not in state.artifacts:
-            state.artifacts.append("analysis_plan.json")
         if concept_lookup is not None:
             source = "omcp_candidates"
         elif carried_forward:
             source = "carried_forward_candidates"
         else:
             source = "protocol_only"
-        state.record(
-            "agent_completed",
-            f"data_science_agent->analysis_plan.json; mapping_source={source}",
-        )
-        self.save(state)
+        # `DataScienceAgent().run` above (LLM/OMCP calls) can take seconds --
+        # deliberately outside the lock, same rationale as the
+        # `concept_lookup` peek in `map_covariate_concepts`. Only the actual
+        # file write and state bookkeeping below need to be atomic, and
+        # `state` is reloaded fresh here (not reused from the top of this
+        # method) so a concurrent `decide_gate`/review that completed while
+        # the agent was running isn't silently overwritten by a stale save.
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            temporary = artifact_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+            temporary.replace(artifact_path)
+            if "analysis_plan.json" not in state.artifacts:
+                state.artifacts.append("analysis_plan.json")
+            state.record(
+                "agent_completed",
+                f"data_science_agent->analysis_plan.json; mapping_source={source}",
+            )
+            self._invalidate_gate(state, "analysis_plan", "analysis_plan.json regenerated")
+            self.save(state)
         return state
 
     def build_variable_registry(self, run_id: str) -> RunState:
@@ -1268,53 +1429,62 @@ class WorkflowManager:
         return state
 
     def run_execution_readiness(self, run_id: str) -> RunState:
-        """Create the execution policy artifact without running an estimator."""
-        state = self.load(run_id)
-        if state.phase not in {"feasibility", "analysis_plan", "execution"}:
-            raise RuntimeError(
-                "Execution readiness requires feasibility, analysis_plan, or execution phase"
-            )
+        """Create the execution policy artifact without running an estimator.
+
+        The whole body runs under `_RunLock`: unlike the covariate-review
+        methods, there is no slow network/LLM call here (`ExecutionAgent.run`
+        is a pure policy function over already-loaded JSON), so there is no
+        reason to narrow the critical section -- and reading
+        `state.gates[...]` under the lock means a concurrent `decide_gate`
+        can't be interleaved between that read and this method's own save.
+        """
         run_dir = self.runs_dir / run_id
-        plan_path = run_dir / "analysis_plan.json"
-        if not plan_path.is_file():
-            raise RuntimeError("Run the Data Science Agent first")
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        artifact = ExecutionAgent().run(
-            plan,
-            mode=state.mode,
-            clinical_mapping_status=state.gates["clinical_mapping"].status,
-            analysis_plan_status=state.gates["analysis_plan"].status,
-        ).to_dict()
-        artifact_path = run_dir / "execution_readiness.json"
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
-        mcp_context = {
-            "run_id": state.run_id,
-            "study_id": state.study_id,
-            "mode": state.mode,
-            "clinical_mapping_status": state.gates["clinical_mapping"].status,
-            "analysis_plan_status": state.gates["analysis_plan"].status,
-            "aggregate_feasibility_allowed": artifact["aggregate_feasibility_allowed"],
-            "analytic_dataset_build_allowed": artifact["analytic_dataset_build_allowed"],
-            "causal_estimation_allowed": artifact["causal_estimation_allowed"],
-            "readiness_input_sha256": artifact["metadata"]["input_sha256"],
-        }
-        context_path = run_dir / "mcp_context.json"
-        context_temporary = context_path.with_suffix(".tmp")
-        context_temporary.write_text(
-            json.dumps(mcp_context, indent=2), encoding="utf-8"
-        )
-        context_temporary.replace(context_path)
-        if "execution_readiness.json" not in state.artifacts:
-            state.artifacts.append("execution_readiness.json")
-        if "mcp_context.json" not in state.artifacts:
-            state.artifacts.append("mcp_context.json")
-        state.record(
-            "agent_completed",
-            "execution_agent->execution_readiness.json+mcp_context.json; no causal effect estimated",
-        )
-        self.save(state)
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            if state.phase not in {"feasibility", "analysis_plan", "execution"}:
+                raise RuntimeError(
+                    "Execution readiness requires feasibility, analysis_plan, or execution phase"
+                )
+            plan_path = run_dir / "analysis_plan.json"
+            if not plan_path.is_file():
+                raise RuntimeError("Run the Data Science Agent first")
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            artifact = ExecutionAgent().run(
+                plan,
+                mode=state.mode,
+                clinical_mapping_status=state.gates["clinical_mapping"].status,
+                analysis_plan_status=state.gates["analysis_plan"].status,
+            ).to_dict()
+            artifact_path = run_dir / "execution_readiness.json"
+            temporary = artifact_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+            temporary.replace(artifact_path)
+            mcp_context = {
+                "run_id": state.run_id,
+                "study_id": state.study_id,
+                "mode": state.mode,
+                "clinical_mapping_status": state.gates["clinical_mapping"].status,
+                "analysis_plan_status": state.gates["analysis_plan"].status,
+                "aggregate_feasibility_allowed": artifact["aggregate_feasibility_allowed"],
+                "analytic_dataset_build_allowed": artifact["analytic_dataset_build_allowed"],
+                "causal_estimation_allowed": artifact["causal_estimation_allowed"],
+                "readiness_input_sha256": artifact["metadata"]["input_sha256"],
+            }
+            context_path = run_dir / "mcp_context.json"
+            context_temporary = context_path.with_suffix(".tmp")
+            context_temporary.write_text(
+                json.dumps(mcp_context, indent=2), encoding="utf-8"
+            )
+            context_temporary.replace(context_path)
+            if "execution_readiness.json" not in state.artifacts:
+                state.artifacts.append("execution_readiness.json")
+            if "mcp_context.json" not in state.artifacts:
+                state.artifacts.append("mcp_context.json")
+            state.record(
+                "agent_completed",
+                "execution_agent->execution_readiness.json+mcp_context.json; no causal effect estimated",
+            )
+            self.save(state)
         return state
 
     def build_cohort_plan(
@@ -1360,21 +1530,30 @@ class WorkflowManager:
             raise RuntimeError(
                 f"Cohort SQL failed governance validation: {', '.join(validation.violations)}"
             )
-        (run_dir / "cohort.sql").write_text(sql, encoding="utf-8")
-        (run_dir / "cohort_manifest.json").write_text(
-            json.dumps(manifest.to_dict(), indent=2), encoding="utf-8"
-        )
-        (run_dir / "cohort_query_validation.json").write_text(
-            json.dumps(validation.to_dict(), indent=2), encoding="utf-8"
-        )
-        for artifact in ("cohort.sql", "cohort_manifest.json", "cohort_query_validation.json"):
-            if artifact not in state.artifacts:
-                state.artifacts.append(artifact)
-        state.record(
-            "cohort_plan_generated",
-            f"cohort.sql; execution_allowed={manifest.execution_allowed}; query_validation=passed",
-        )
-        self.save(state)
+        # `run_execution_readiness` above already acquired and released its
+        # own `_RunLock`; taking a second one here (after it returned, not
+        # nested inside it) protects only this method's own file writes and
+        # state save without risking deadlock against a non-reentrant lock.
+        # `state` is reloaded fresh so a concurrent gate decision or review
+        # made while the (local, but non-trivial) SQL build above ran isn't
+        # silently overwritten by a stale save.
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            (run_dir / "cohort.sql").write_text(sql, encoding="utf-8")
+            (run_dir / "cohort_manifest.json").write_text(
+                json.dumps(manifest.to_dict(), indent=2), encoding="utf-8"
+            )
+            (run_dir / "cohort_query_validation.json").write_text(
+                json.dumps(validation.to_dict(), indent=2), encoding="utf-8"
+            )
+            for artifact in ("cohort.sql", "cohort_manifest.json", "cohort_query_validation.json"):
+                if artifact not in state.artifacts:
+                    state.artifacts.append(artifact)
+            state.record(
+                "cohort_plan_generated",
+                f"cohort.sql; execution_allowed={manifest.execution_allowed}; query_validation=passed",
+            )
+            self.save(state)
         return state
 
     def run_cohort_profile_mcp(
@@ -1563,6 +1742,9 @@ class WorkflowManager:
             "concept_row_and_person_counts": concept_row_and_person_counts_sql(datasets, plan),
             "approved_concepts_missing_from_data": approved_concepts_missing_from_data_sql(datasets, plan),
             "invalid_or_nonstandard_concepts": invalid_or_nonstandard_concepts_sql(datasets, plan),
+            "orphan_concepts": orphan_concepts_sql(datasets, plan),
+            "index_event_breakdown": index_event_breakdown_sql(datasets, plan),
+            "incidence_rate": incidence_rate_sql(datasets, plan),
         }
         if plan.domain in VALUE_DOMAINS:
             sql_by_check["observed_units"] = observed_units_sql(datasets, plan)

@@ -478,6 +478,37 @@ class WorkflowMapCovariateConceptsTests(unittest.TestCase):
         self.assertEqual(event["changes"]["before"]["concept_ids"], [111])
         self.assertEqual(event["changes"]["after"]["concept_ids"], [222])
 
+    def test_persists_the_reviewer_onto_the_candidate_dag_entry(self):
+        """`causal.mapping.registry.variable_from_candidate_dag_entry` reads
+        `entry["mapping_reviewer"]` back out into `OMOPVariableDefinition.
+        reviewer` -- this was previously never written here, so the
+        registry's reviewer field (and its "an automated mapping needs a
+        named reviewer" check) stayed blank for every real approval."""
+        self.manager.map_covariate_concepts(
+            self.state.run_id, "SOFA score", [4301868], "Dr. Lee",
+        )
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        entry = next(item for item in protocol["candidate_dag"] if item["label"] == "SOFA score")
+        self.assertEqual(entry["mapping_reviewer"], "Dr. Lee")
+
+        from causal.mapping.registry import variable_from_candidate_dag_entry
+        variable = variable_from_candidate_dag_entry(entry)
+        self.assertEqual(variable.reviewer, "Dr. Lee")
+
+    def test_defaults_provenance_to_protocol_declared_without_a_concept_lookup(self):
+        """Without a live `concept_lookup` cross-check, this mapping is
+        purely human-supplied -- `provenance` must stay outside
+        `causal.mapping.registry._UNSUPERVISED_PROVENANCE` (see
+        `test_persists_omcp_candidate_provenance_when_concept_lookup_is_used`
+        in `WorkflowMapCovariateConceptsDomainCheckTests` for the contrasting
+        case)."""
+        self.manager.map_covariate_concepts(
+            self.state.run_id, "SOFA score", [4301868], "Dr. Lee",
+        )
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        entry = next(item for item in protocol["candidate_dag"] if item["label"] == "SOFA score")
+        self.assertEqual(entry["provenance"], "protocol_declared")
+
 
 class MismatchedConceptDomainsTests(unittest.TestCase):
     """Pure-parsing unit tests for the `Get_Concepts_By_Id` CSV response
@@ -609,6 +640,27 @@ class WorkflowMapCovariateConceptsDomainCheckTests(unittest.TestCase):
         )
         self.assertEqual(lookup.calls, [])
 
+    def test_persists_omcp_candidate_provenance_when_concept_lookup_is_used(self):
+        """A live `concept_lookup` cross-check is this codebase's one signal
+        that the approved concept_id was OMCP-vetted, not purely
+        human-supplied -- `causal.mapping.registry`'s
+        `_UNSUPERVISED_PROVENANCE` check treats `"omcp_candidate"` as
+        needing a named reviewer (already required here regardless), rather
+        than the always-trusted `"protocol_declared"` default."""
+        lookup = _FakeConceptDomainLookup(
+            "concept_id,concept_name,concept_code,vocabulary_id,domain_id\n"
+            "4301868,SOFA score,x,LOINC,Measurement\n"
+        )
+        self.manager.map_covariate_concepts(
+            self.state.run_id, "SOFA score", [4301868], "Dr. Lee", concept_lookup=lookup,
+        )
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        entry = next(item for item in protocol["candidate_dag"] if item["label"] == "SOFA score")
+        self.assertEqual(entry["provenance"], "omcp_candidate")
+
+        from causal.mapping.registry import _UNSUPERVISED_PROVENANCE
+        self.assertIn(entry["provenance"], _UNSUPERVISED_PROVENANCE)
+
 
 class WorkflowMapConceptSetTests(unittest.TestCase):
     """`map_concept_set` is the governed way to record a `concept_sets[name]`
@@ -667,6 +719,38 @@ class WorkflowMapConceptSetTests(unittest.TestCase):
         self.assertEqual(entry["concept_ids"], [132797])
         self.assertEqual(entry["status"], "approved")
         self.assertEqual(entry["role"], "population")  # untouched
+
+    def test_persists_the_reviewer_and_default_provenance_onto_the_entry(self):
+        """`causal.mapping.registry.variable_from_concept_set` reads
+        `entry["reviewer"]`/`entry["provenance"]` back out into
+        `OMOPVariableDefinition.reviewer`/`.provenance` -- neither was ever
+        written here, so both stayed permanently blank/defaulted for every
+        real phenotype approval, the same dead-safety-net gap
+        `map_covariate_concepts` had for `candidate_dag` (see
+        `WorkflowMapCovariateConceptsTests.
+        test_persists_the_reviewer_onto_the_candidate_dag_entry`)."""
+        self.manager.map_concept_set(
+            self.state.run_id, "population", "condition", [132797], "Dr. Chen",
+        )
+        entry = self._protocol()["concept_sets"]["population"]
+        self.assertEqual(entry["reviewer"], "Dr. Chen")
+        self.assertEqual(entry["provenance"], "protocol_declared")
+
+        from causal.mapping.registry import variable_from_concept_set
+        variable = variable_from_concept_set("population", entry)
+        self.assertEqual(variable.reviewer, "Dr. Chen")
+
+    def test_persists_omcp_candidate_provenance_when_concept_lookup_is_used(self):
+        lookup = _FakeConceptDomainLookup(
+            "concept_id,concept_name,concept_code,vocabulary_id,domain_id\n"
+            "132797,Sepsis,x,SNOMED,Condition\n"
+        )
+        self.manager.map_concept_set(
+            self.state.run_id, "population", "condition", [132797], "Dr. Chen",
+            concept_lookup=lookup,
+        )
+        entry = self._protocol()["concept_sets"]["population"]
+        self.assertEqual(entry["provenance"], "omcp_candidate")
 
     def test_regenerates_hypothesis_so_unresolved_issues_clear(self):
         before = self._hypothesis()["unresolved_issues"]
@@ -735,6 +819,137 @@ class WorkflowMapConceptSetTests(unittest.TestCase):
             self.manager.map_concept_set(
                 self.state.run_id, "population", "death", [], "Dr. Chen",
             )
+
+
+class WorkflowGateInvalidationTests(unittest.TestCase):
+    """An `approved`/`provisional` gate must not silently keep authorizing
+    execution once the content it approved changes underneath it --
+    `ExecutionAgent`/`omcp.governance` only ever see the gate's bare status
+    string, with nothing tying it to the artifact version a human actually
+    reviewed. Every review action that mutates `concept_sets`/`candidate_dag`
+    must reset an already-decided `clinical_mapping`/`analysis_plan` gate
+    back to `pending` (see `WorkflowManager._invalidate_gate`)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE"
+            },
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "pending_omop_mapping",
+                    "concept_ids": [], "domain": "",
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        self.state = self.manager.run_hypothesis_agent(state.run_id)
+        self.run_dir = root / "runs" / self.state.run_id
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_map_concept_set_invalidates_an_approved_clinical_mapping_gate(self):
+        self.manager.decide_gate(self.state.run_id, "clinical_mapping", "approved", "tester")
+        state = self.manager.map_concept_set(
+            self.state.run_id, "population", "condition", [132797], "Dr. Chen",
+        )
+        self.assertEqual(state.gates["clinical_mapping"].status, "pending")
+        self.assertIsNone(state.gates["clinical_mapping"].reviewer)
+        self.assertTrue(any(event["event"] == "gate_invalidated" for event in state.history))
+
+    def test_map_concept_set_invalidates_a_provisional_analysis_plan_gate(self):
+        self.manager.decide_gate(self.state.run_id, "analysis_plan", "provisional", "tester")
+        state = self.manager.map_concept_set(
+            self.state.run_id, "population", "condition", [132797], "Dr. Chen",
+        )
+        self.assertEqual(state.gates["analysis_plan"].status, "pending")
+
+    def test_map_concept_set_leaves_a_pending_gate_alone(self):
+        """The ordinary review flow (map, then approve) must not spam the
+        audit trail with spurious invalidation events for a gate nobody had
+        decided yet."""
+        state = self.manager.map_concept_set(
+            self.state.run_id, "population", "condition", [132797], "Dr. Chen",
+        )
+        self.assertEqual(state.gates["clinical_mapping"].status, "pending")
+        self.assertFalse(any(event["event"] == "gate_invalidated" for event in state.history))
+
+
+class WorkflowAnalysisPlanApprovalGateTests(unittest.TestCase):
+    """`decide_gate(..., "analysis_plan", "approved", ...)` must not rubber-
+    stamp an incomplete plan -- `causal.agents.execution.ExecutionAgent`
+    would refuse to authorize execution against it anyway (see
+    `analysis_plan_blockers`), so approval should fail loudly with the same
+    reasons instead of silently succeeding and only surfacing the problem
+    later at execution time."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({"study_id": "test_study"}), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        self.state = self.manager.start(self.protocol)
+        self.run_dir = root / "runs" / self.state.run_id
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_plan(self, **overrides):
+        plan = {
+            "schema_version": "1.0",
+            "study_id": "test_study",
+            "data_source": "project.dataset",
+            "design": "target_trial_emulation",
+            "exploratory_execution_allowed": False,
+            "final_execution_allowed": False,
+            "unresolved_issues": [],
+            "phenotypes": [{"name": "population", "status": "approved", "approval_required": True}],
+            "covariates": [{"name": "age", "status": "ready"}],
+            "feasibility_checks": [],
+        }
+        plan.update(overrides)
+        (self.run_dir / "analysis_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    def test_blocks_approval_before_a_plan_exists(self):
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.state.run_id, "analysis_plan", "approved", "tester")
+
+    def test_blocks_approval_while_unresolved_issues_remain(self):
+        self._write_plan(unresolved_issues=["albumin mapping pending"])
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.state.run_id, "analysis_plan", "approved", "tester")
+        state = self.manager.load(self.state.run_id)
+        self.assertEqual(state.gates["analysis_plan"].status, "pending")
+
+    def test_blocks_approval_while_a_covariate_is_not_ready(self):
+        self._write_plan(covariates=[{"name": "sofa_score", "status": "definition_pending"}])
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.state.run_id, "analysis_plan", "approved", "tester")
+
+    def test_allows_approval_once_the_plan_is_complete(self):
+        self._write_plan()
+        state = self.manager.decide_gate(self.state.run_id, "analysis_plan", "approved", "tester")
+        self.assertEqual(state.gates["analysis_plan"].status, "approved")
+
+    def test_rejecting_an_incomplete_plan_is_still_allowed(self):
+        """The completeness guard only protects `approved`, mirroring
+        `_block_if_major_confounders_unresolved`/`_block_if_not_identified`
+        for the `protocol` gate: a reviewer must always be able to reject an
+        incomplete plan outright."""
+        self._write_plan(unresolved_issues=["albumin mapping pending"])
+        state = self.manager.decide_gate(self.state.run_id, "analysis_plan", "rejected", "tester")
+        self.assertEqual(state.gates["analysis_plan"].status, "rejected")
 
 
 class LoadConceptSpecsTests(unittest.TestCase):
@@ -1196,6 +1411,55 @@ class WorkflowConcurrentCovariateReviewTests(unittest.TestCase):
         entry = next(item for item in protocol["candidate_dag"] if item["label"] == "SOFA score")
         self.assertIn(entry["concept_ids"], ([111], [222]))
         self.assertFalse((self.run_dir / ".review.lock").exists())
+
+
+class WorkflowConcurrentGateDecisionTests(unittest.TestCase):
+    """`decide_gate`/`advance`/`run_data_science_agent`/
+    `run_execution_readiness`/`build_cohort_plan` all load-mutate-save
+    `state.json` (`RunState`) the same way `map_covariate_concepts` etc.
+    load-mutate-save `protocol.json` -- without `_RunLock` around that
+    cycle too, two reviewers deciding *different* gates on the same run at
+    the same time could race: both `load()` the same on-disk state, and
+    whichever `save()`s second silently discards the other's gate
+    decision, even though neither reviewer touched the same gate."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        protocol = root / "protocol.json"
+        protocol.write_text(json.dumps({"study_id": "test_study"}), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(protocol)
+        self.run_id = state.run_id
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_concurrent_decisions_on_different_gates_both_survive(self):
+        errors: list[Exception] = []
+
+        def _decide(gate: str, reviewer: str) -> None:
+            try:
+                self.manager.decide_gate(self.run_id, gate, "approved", reviewer)
+            except Exception as exc:  # noqa: BLE001 -- surfaced via `errors`, not raised in-thread
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_decide, args=("clinical_mapping", "Dr. A")),
+            threading.Thread(target=_decide, args=("results", "Dr. B")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        state = self.manager.load(self.run_id)
+        self.assertEqual(state.gates["clinical_mapping"].status, "approved")
+        self.assertEqual(state.gates["clinical_mapping"].reviewer, "Dr. A")
+        self.assertEqual(state.gates["results"].status, "approved")
+        self.assertEqual(state.gates["results"].reviewer, "Dr. B")
+        self.assertFalse((Path(self.temp.name) / "runs" / self.run_id / ".review.lock").exists())
 
 
 class _FakeConceptLookup:
@@ -1737,7 +2001,7 @@ class WorkflowMappingAuditMcpTests(unittest.TestCase):
         variable gets."""
         client = _FakeCausalSelectClient()
         state = self.manager.run_mapping_audit_mcp(self.run_id, "sofa_score", client, self.datasets)
-        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(len(client.calls), 7)
         self.assertTrue(all(operation == "aggregate_feasibility" for _, operation, _ in client.calls))
         artifact_path = self.run_dir / "mapping_audit_sofa_score.json"
         self.assertTrue(artifact_path.is_file())
@@ -1751,6 +2015,9 @@ class WorkflowMappingAuditMcpTests(unittest.TestCase):
                 "approved_concepts_missing_from_data",
                 "invalid_or_nonstandard_concepts",
                 "observed_units",
+                "orphan_concepts",
+                "index_event_breakdown",
+                "incidence_rate",
             },
         )
         self.assertIn("mapping_audit_sofa_score.json", state.artifacts)
@@ -1765,7 +2032,10 @@ class WorkflowMappingAuditMcpTests(unittest.TestCase):
             (self.run_dir / "mapping_audit_population.json").read_text(encoding="utf-8")
         )
         self.assertNotIn("observed_units", artifact["checks"])
-        self.assertEqual(len(client.calls), 3)
+        self.assertIn("orphan_concepts", artifact["checks"])
+        self.assertIn("index_event_breakdown", artifact["checks"])
+        self.assertIn("incidence_rate", artifact["checks"])
+        self.assertEqual(len(client.calls), 6)
 
     def test_requires_registry_json_to_already_exist(self):
         other = self.manager.start(self.protocol_path)
