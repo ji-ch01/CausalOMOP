@@ -81,12 +81,25 @@ class NoPatientIdentifiersTests(unittest.TestCase):
         self.assertIn("persons_root_only", sql)
         self.assertIn("persons_with_descendants", sql)
 
+    def test_orphan_concepts_is_aggregate_only(self):
+        sql = audit.orphan_concepts_sql(DATASETS, _condition_plan())
+        self._assert_aggregate_only(sql)
+        self.assertIn("COUNT(DISTINCT t.person_id) AS person_count", sql)
+
+    def test_index_event_breakdown_is_aggregate_only(self):
+        sql = audit.index_event_breakdown_sql(DATASETS, _condition_plan())
+        self._assert_aggregate_only(sql)
+
+    def test_incidence_rate_is_aggregate_only(self):
+        sql = audit.incidence_rate_sql(DATASETS, _condition_plan())
+        self._assert_aggregate_only(sql)
+
 
 class AuditSqlShapeTests(unittest.TestCase):
     def test_concept_row_and_person_counts_expands_descendants(self):
         sql = audit.concept_row_and_person_counts_sql(DATASETS, _condition_plan())
         self.assertIn("concept_ancestor", sql)
-        self.assertIn("GROUP BY concept_id", sql)
+        self.assertIn("GROUP BY t.condition_concept_id", sql)
 
     def test_concept_zero_rate_rejects_unknown_domain(self):
         with self.assertRaises(ValueError):
@@ -110,6 +123,74 @@ class AuditSqlShapeTests(unittest.TestCase):
         self.assertIn("root_only_concepts AS (", sql)
         self.assertIn("expanded_concepts AS (", sql)
         self.assertIn("concept_ancestor", sql)
+
+
+class CohortEntryDiagnosticsTests(unittest.TestCase):
+    """`orphan_concepts_sql`/`index_event_breakdown_sql`/`incidence_rate_sql`
+    -- the simplified CohortDiagnostics-inspired diagnostics (see
+    `causal.mapping.audit` module docstring for the citation and the two
+    documented simplifications)."""
+
+    def test_orphan_concepts_excludes_already_included_concepts(self):
+        sql = audit.orphan_concepts_sql(DATASETS, _condition_plan())
+        self.assertIn("sibling_parents AS (", sql)
+        self.assertIn("min_levels_of_separation = 1", sql)
+        self.assertIn("LEFT JOIN included_concepts ic ON sc.concept_id = ic.concept_id", sql)
+        self.assertIn("WHERE ic.concept_id IS NULL", sql)
+
+    def test_orphan_concepts_filters_by_the_domain_id_of_the_plan(self):
+        sql = audit.orphan_concepts_sql(DATASETS, _condition_plan())
+        self.assertIn("con.domain_id = 'Condition'", sql)
+        sql = audit.orphan_concepts_sql(DATASETS, _measurement_plan())
+        self.assertIn("con.domain_id = 'Measurement'", sql)
+
+    def test_orphan_concepts_respects_top_n(self):
+        sql = audit.orphan_concepts_sql(DATASETS, _condition_plan(), top_n=5)
+        self.assertIn("LIMIT 5", sql)
+
+    def test_index_event_breakdown_groups_by_concept_and_orders_by_person_count(self):
+        sql = audit.index_event_breakdown_sql(DATASETS, _condition_plan())
+        self.assertIn("GROUP BY fe.concept_id, con.concept_name", sql)
+        self.assertIn("ORDER BY person_count DESC", sql)
+        self.assertIn("QUALIFY ROW_NUMBER() OVER (", sql)
+
+    def test_index_event_breakdown_breaks_ties_deterministically_by_concept_id(self):
+        sql = audit.index_event_breakdown_sql(DATASETS, _condition_plan())
+        self.assertIn("ORDER BY t.condition_start_datetime, t.condition_concept_id", sql)
+
+    def test_incidence_rate_divides_by_observation_period_person_years(self):
+        sql = audit.incidence_rate_sql(DATASETS, _condition_plan())
+        self.assertIn("observation_period", sql)
+        self.assertIn("/ 365.25", sql)
+        self.assertIn("SAFE_DIVIDE(", sql)
+        self.assertIn("incidence_rate_per_1000_person_years", sql)
+
+
+DUCKDB_DATASETS = BigQueryDatasets(backend="duckdb", duckdb_path="data/mimiciv_omop.duckdb", duckdb_schema="main")
+
+
+class DuckDBAuditSqlTests(unittest.TestCase):
+    """Same SQL generators, `backend="duckdb"` -- must drop every
+    BigQuery-only construct (`SAFE_DIVIDE`, `DATE_DIFF`'s BigQuery argument
+    order, backtick identifiers) that DuckDB's parser/catalog rejects, while
+    leaving the default BigQuery output byte-identical (see
+    `test_incidence_rate_divides_by_observation_period_person_years` above)."""
+
+    def test_concept_zero_rate_has_no_safe_divide_or_backticks(self):
+        sql = audit.concept_zero_rate_sql(DUCKDB_DATASETS, "condition")
+        self.assertNotIn("SAFE_DIVIDE", sql)
+        self.assertNotIn("`", sql)
+        self.assertIn("CASE WHEN", sql)
+        self.assertIn('"main"."condition_occurrence"', sql)
+
+    def test_incidence_rate_uses_duckdb_date_diff_argument_order(self):
+        sql = audit.incidence_rate_sql(DUCKDB_DATASETS, _condition_plan())
+        self.assertNotIn("SAFE_DIVIDE", sql)
+        self.assertNotIn("`", sql)
+        self.assertIn(
+            "date_diff('day', observation_period_start_date, observation_period_end_date)", sql
+        )
+        self.assertIn("incidence_rate_per_1000_person_years", sql)
 
 
 if __name__ == "__main__":
