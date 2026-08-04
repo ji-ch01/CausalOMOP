@@ -6,6 +6,11 @@ analysis and FastOMOP testing.
 They are dataset-specific. Reusable causal logic should live under `causal/`,
 not in this folder.
 
+SYN-SNUH is a development dataset, not the primary causal-validation source.
+For the active MIMIC-IV policy and local export path, see
+[`docs/datasets.md`](../../docs/datasets.md). OMOP vocabulary downloads are
+managed through [OHDSI Athena](https://athena.ohdsi.org/).
+
 ## Defaults
 
 The scripts use:
@@ -56,4 +61,3 @@ data/backups/
 ```
 
 These backups are local artifacts and should not be committed.
-

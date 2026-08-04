@@ -1,110 +1,69 @@
 # Repository Map
 
-This repository is a project-level integration repo. It combines local research
-code, documentation, notebooks, local data conventions, and pinned FastOMOP
-submodules.
+CausalOMOP is an integration repository. Project-owned research code and
+documentation live beside pinned external Git submodules and ignored local
+data.
 
-## Top-Level Structure
+## Ownership
 
-| Path | Purpose | Git policy |
+| Path | Owner and purpose | Git policy |
 |---|---|---|
-| `README.md` | short project entry point | tracked |
-| `document_design.md` | long-form causal reasoning design draft | tracked |
-| `docs/` | focused explanatory docs | tracked |
-| `scripts/snuh_etl/` | SNUH synthetic ETL and data-quality scripts | tracked |
-| `causal/` | causal prototype code owned by this project | tracked |
-| `notebooks/` | exploratory analyses | tracked selectively |
-| `data/` | local DuckDB files, backups, vocabulary CSVs | mostly ignored |
-| `agno_fastomop/` | FastOMOP NL-to-SQL implementation | submodule |
-| `omcp/` | OMOP MCP server | submodule |
-| `foem/` | FastOMOP evaluation toolkit | submodule |
-| `Dockerfile`, `docker-compose.yml` | local integrated runtime | tracked |
+| `README.md`, `docs/` | CausalOMOP documentation | tracked |
+| `causal/` | CausalOMOP workflow, agents, contracts, mapping, queries, and UI | tracked |
+| `studies/` | versioned study specifications and reference audits | tracked, no patient data |
+| `scripts/bigquery_etl/` | project-owned BigQuery-to-DuckDB exporter | tracked |
+| `scripts/snuh_etl/` | project-owned SYN-SNUH ETL and validation | tracked |
+| `notebooks/` | exploratory analysis | tracked selectively; strip large outputs |
+| `tests/` | deterministic project test suite | tracked |
+| `artifacts/runs/` | generated workflow artifacts | generated; review before any commit or sharing |
+| `data/` | local databases, vocabularies, and backups | `data/README.md` only; data ignored |
+| `agno_fastomop/` | [FastOMOP](https://github.com/ji-ch01/agno_fastomop) | Git submodule |
+| `omcp/` | [OMCP](https://github.com/ji-ch01/omcp) | Git submodule |
+| `foem/` | [FOEM](https://github.com/ji-ch01/foem) | Git submodule |
+| `external/ohdsi_mimic/` | [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) | Git submodule |
 
-## Submodules
+Runtime prompt templates under `causal/prompts/` are part of application
+behavior even though they use Markdown syntax. Treat their edits like code
+changes, with tests and review; they are not general documentation pages.
 
-The FastOMOP-related folders are not ordinary copied source folders. They are
-Git submodules. The root repository tracks a commit pointer for each submodule.
+## Submodule rules
 
-```text
-agno_fastomop/  -> FastOMOP agent implementation
-omcp/           -> OMOP MCP server
-foem/           -> evaluation and monitoring
-```
+The root repository records only a commit pointer for each submodule. Read the
+upstream README for that component and avoid duplicating its installation guide
+in CausalOMOP documentation.
 
-This means:
-
-- edits inside a submodule must be committed inside that submodule;
-- the root repo then records the updated submodule pointer;
-- upstream updates should be reviewed before merging because local fork changes
-  may exist.
-
-Use:
-
-```bash
+```powershell
 git submodule status --recursive
-git -C agno_fastomop status
-git -C omcp status
-git -C foem status
+git -C agno_fastomop status -sb
+git -C omcp status -sb
+git -C foem status -sb
+git -C external/ohdsi_mimic status -sb
 ```
 
-## Project-Owned Code
+An intentional submodule change must be committed in that repository first;
+the root repository can then record the new pointer.
 
-Project-owned code should live outside the FastOMOP submodules unless it is a
-deliberate contribution to FastOMOP itself.
+## Generated and sensitive files
 
-Use these locations:
+Do not commit:
 
-```text
-scripts/snuh_etl/          SNUH-specific preparation and vocabulary cleanup
-causal/                    causal cohort construction and future estimators
-causal/knowledge_graph/    OptimusKG client for DAG-evidence grounding
-causal/queries/            concept-set-driven feasibility/cohort SQL builders
-docs/                      project documentation
-docs/reproducible_causal_review.md
-                           literature and public dataset review work package
-notebooks/                 exploratory analysis
-```
+- `.env` files, tokens, credentials, or real cloud identifiers;
+- DuckDB files, WAL files, BigQuery exports, or patient-level extracts;
+- Athena vocabulary CSVs and generated backups;
+- virtual environments, caches, and Python bytecode;
+- generated reports or LLM traces without an explicit reproducibility and
+  disclosure decision.
 
-This keeps the thesis/project work separate from upstream FastOMOP code.
+Generated `demo_report.md` files under `artifacts/runs/` are snapshots, not
+maintained documentation. Regenerate them from the workflow instead of editing
+them by hand.
 
-## Data and Generated Files
+## Documentation rules
 
-The following should not be committed:
-
-- DuckDB files;
-- Athena vocabulary CSVs;
-- generated backups;
-- virtual environments;
-- `.env` files;
-- Python cache folders;
-- generated HTML exports unless explicitly needed.
-
-The `data/README.md` file is tracked so the expected local layout is visible on
-GitHub without committing any data.
-
-## Recommended Cleanup Rules
-
-Keep:
-
-- `causal/`;
-- `docs/`;
-- `document_design.md`;
-- `scripts/snuh_etl/`;
-- selected notebooks that support the research story;
-- FastOMOP submodule pointers.
-
-Do not keep:
-
-- local virtual environments such as `fhir/`;
-- empty cache-only folders;
-- local database backups in Git;
-- copied upstream repositories outside submodules.
-
-## Naming Conventions
-
-Use folder names to mark ownership:
-
-- `snuh_etl` means dataset-specific preparation;
-- `causal` means reusable causal workflow code;
-- `docs` means human-facing project explanation;
-- submodule folders keep their upstream names.
+- Begin at [docs/index.md](index.md).
+- Keep operational status in `README.md`, `causal/README.md`, and
+  `docs/causal_roadmap.md`.
+- Keep dataset access and handling rules in `docs/datasets.md`.
+- Keep external component details in their official repositories.
+- Preserve superseded proposals as short historical notes or rely on Git
+  history; do not maintain a second, conflicting architecture.

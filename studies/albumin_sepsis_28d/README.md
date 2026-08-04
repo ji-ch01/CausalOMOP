@@ -8,6 +8,18 @@ The protocol is intentionally marked as a draft. Candidate concepts found by
 name are evidence for review, not executable concept sets. Approve seed concepts
 and descendant rules before cohort SQL is generated.
 
+Reference artifacts in this directory:
+
+- `protocol.json`: versioned study draft;
+- `reference_dag.json`: published/reference DAG used for structural metrics;
+- `reference_concept_mappings.json`: reference mapping benchmark;
+- `icu_time_zero.json`: time-zero audit notes;
+- `concept_audit.md`: dated feasibility snapshot, not a current causal result.
+
+The active blockers are a reproducible Sepsis-3 population, validated ICU time
+zero, approved albumin/crystalloid phenotypes, baseline covariate coverage,
+follow-up/censoring rules, and the absence of an implemented estimator.
+
 ## Concept audit
 
 Run from the repository root with the virtual environment active:
@@ -27,3 +39,7 @@ python -m causal.cli source-usage drug "ringer" --limit 30
 
 The next gate is human approval of concept sets. Only after that gate should the
 pipeline count the eligible population and treatment arms.
+
+For the full governed command sequence, use the
+[responsible demo guide](../../docs/responsible_demo_guide.md) and
+`python -m causal.cli workflow --help`.

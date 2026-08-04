@@ -2,6 +2,11 @@
 
 Dataset audited: restricted OMOP dataset configured at runtime.
 
+> Dated feasibility snapshot. Counts below reflect the dataset version,
+> mappings, and provisional phenotype rules used on 2026-07-15. Re-run the
+> governed audits for current values; do not treat this file as a current
+> cohort definition or causal result.
+
 ## Conditions
 
 The following standard SNOMED concepts occur in `condition_occurrence`:

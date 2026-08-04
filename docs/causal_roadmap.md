@@ -1,168 +1,146 @@
 # CausalOMOP Causal Roadmap
 
+This is the normative scientific sequence for CausalOMOP and the reference for
+what the current prototype may claim.
+
 ## Product objective
 
-CausalOMOP must answer a causal question from longitudinal observational data
-stored in OMOP CDM. It is not a DAG generator and it is not a natural-language
-wrapper around an estimator. Its output is an auditable causal study whose
-scientific design exists before database extraction or model fitting.
+CausalOMOP should produce an auditable causal study from longitudinal data in
+OMOP CDM. A successful SQL query or an acyclic graph is not, by itself, a
+causal analysis. The question, target trial, counterfactual estimand, causal
+model, identification assumptions, data support, statistical estimand,
+estimator, diagnostics, and interpretation must remain distinguishable.
 
-The architecture follows the Causal Roadmap and target-trial emulation described
-as grounding frameworks for medical causal co-pilots in Alaa et al. (2024).
-
-## Required order of operations
+## Required order
 
 ```text
-Natural-language causal question
-  -> 1. Clarify the causal question and clinical equipoise
-  -> 2. Specify the target trial
-  -> 3. Define the counterfactual causal estimand
-  -> 4. Construct and review the causal DAG
-  -> 5. Identify the effect and an admissible adjustment set
-  -> 6. Map every required variable to OMOP concepts, tables and time windows
-  -> 7. Audit data support, missingness, positivity and follow-up
-  -> 8. Define the observed-data statistical estimand
-  -> 9. Prespecify and run estimators
-  -> 10. Run diagnostics and sensitivity analyses
-  -> 11. Interpret and report without exceeding the assumptions
+Clinical question
+  -> 1. classify and clarify the causal question
+  -> 2. specify the target trial
+  -> 3. define the counterfactual estimand
+  -> 4. construct and clinically review the causal DAG
+  -> 5. assess identification and select an admissible adjustment set
+  -> 6. map required variables to OMOP concepts, fields, and windows
+  -> 7. audit availability, missingness, follow-up, and positivity
+  -> 8. define the observed-data statistical estimand
+  -> 9. prespecify and run estimators
+  -> 10. run diagnostics and sensitivity analyses
+  -> 11. report estimates without exceeding their assumptions
 ```
 
-An effect is not executable merely because SQL can produce treatment and outcome
-columns. Steps 1-7 must either pass human review or conclude that the effect is
-not identifiable/estimable with the available data.
+OMOP operationalization begins only after the scientific variables have been
+defined. A clinically important but unobserved confounder stays in the DAG and
+becomes an explicit limitation; it must not disappear because no convenient
+OMOP concept exists.
 
-## Core artifacts
+## Current implementation map
 
-### 1. Causal question
+| Roadmap stage | Implementation |
+|---|---|
+| 1. Question classification | Implemented as an LLM-based `causal`, `descriptive`, or `needs_clarification` gate in CLI and Streamlit. It can be skipped explicitly and does not automatically invoke FastOMOP. |
+| 2. Target-trial draft | Implemented for manual protocols and strictly parsed LLM drafts; human protocol approval is required. |
+| 3. Counterfactual estimand | Represented in protocol fields and general contracts, but the persistent workflow does not yet validate the full `CausalEstimand` contract. |
+| 4. Causal DAG | Implemented: literature/KG drafting, typed roles and timing, bounded critique/revision, optional tournament, human covariate review. |
+| 5. Identification | Implemented for backdoor adjustment: cycle/temporal checks, d-separation, minimum adjustment sets, explicit failure. |
+| 6. OMOP operationalization | Implemented as a first governed version: concept-set and covariate review actions, `OMOPVariableRegistry`, windows, aggregations, and deterministic SQL adapters. |
+| 7. Data support | Partly implemented: aggregate feasibility, mapping audits, cohort profile, and follow-up observability. Full positivity, missing-data, and censoring validation remain incomplete. |
+| 8. Statistical estimand | Not implemented as an executable contract. |
+| 9. Estimation | Not implemented. |
+| 10. Diagnostics and sensitivity | Only pre-estimation data diagnostics exist; estimator diagnostics and causal sensitivity analyses are not implemented. |
+| 11. Causal report | Not implemented. `demo_report.md` is explicitly a technical/feasibility report. |
 
-The question records the target population, well-defined treatment strategies,
-comparator and outcome. Ambiguous interventions must be refined before moving
-forward.
+## Core contracts
 
-### 2. Target-trial protocol
+`causal/roadmap.py` defines `CausalQuestion`, `TargetTrialProtocol`,
+`CausalEstimand`, `CausalDAG`, and `CausalStudySpecification`. The general DAG
+logic is used by the live workflow. The question, protocol, and estimand
+contracts are not yet instantiated as one persistent workflow object, so the
+current `protocol` human gate carries more responsibility than the target
+architecture intends.
 
-The protocol records eligibility, treatment strategies, assignment procedure,
-time zero, grace period, follow-up, outcome definition, censoring and analysis
-strategy. Eligibility, assignment and follow-up must be aligned to prevent
-immortal-time and selection biases.
+The deterministic DAG layer rejects unknown nodes, duplicate identifiers,
+cycles, self-loops, temporal contradictions, and inadmissible adjustment for
+exposure, outcome, unobserved variables, mediators, colliders, selection
+variables, or treatment descendants. It assesses d-separation in the exposure
+backdoor graph and enumerates minimum-cardinality adjustment sets for bounded,
+reviewable graphs.
 
-### 3. Causal estimand
+## Evidence and LLM boundary
 
-The estimand is counterfactual and explicit about population summary (ATE, ATT
-or CATE), effect measure, treatment contrast, outcome and horizon. It is distinct
-from both a regression coefficient and the estimator used later.
+- The question gate and drafting agents are advisory LLM steps. They cannot
+  approve a protocol, a DAG, an OMOP mapping, or execution.
+- PubMed and OpenAlex provide literature records; OptimusKG is an optional
+  relation source. Retrieved identifiers form a deterministic allow-list for
+  citations emitted by the model.
+- The critique/revision loop is bounded and auditable. Its output remains a
+  candidate DAG.
+- SHD and SID quantify structural differences; they do not validate clinical
+  correctness.
+- Human reviewers remain responsible for clinical completeness, causal roles,
+  temporal interpretation, mappings, and gate decisions.
 
-### 4. Causal DAG
+See [llm_hypothesis_integration.md](llm_hypothesis_integration.md) and the
+dated [DAG audit](dag_generation_audit.md).
 
-The DAG supports exposure, outcome, confounder, mediator, collider, prognostic,
-effect-modifier, selection and other nodes. Every node declares whether it is
-observed and when it occurs. Every edge has a rationale, evidence identifiers
-and review status.
+## OMOP variable registry
 
-The deterministic layer rejects:
+`causal/mapping/registry.py` separates:
 
-- unknown nodes and duplicate identifiers;
-- cycles and self-loops;
-- edges that contradict declared temporal order;
-- adjustment for exposure, outcome or unobserved variables;
-- adjustment for mediators, colliders, selection variables or other descendants
-  of treatment.
+- lookup candidates from approved root concepts;
+- mapping approval from observed availability;
+- a stored review decision from derived SQL executability;
+- phenotype definitions from baseline covariate definitions;
+- concept inclusion from descendant and exclusion rules;
+- temporal windows, aggregation, missingness, provenance, and reviewer data.
 
-It checks adjustment sets using d-separation in the exposure backdoor graph and
-can enumerate minimum-cardinality valid sets for small reviewable DAGs. Failure
-to find a set is a valid scientific result: the effect is not identified by
-observed backdoor adjustment under the proposed graph.
+The workflow builds `registry.json` from `protocol.json`. Covariate SQL adapters
+consume registry-shaped definitions, while population/treatment/comparator/
+outcome query specs still resolve directly from the reviewed `concept_sets`
+store in `protocol.json`. This is one human-reviewed store, but the registry is
+not yet the sole persisted source used by every query builder.
 
-### 5. OMOP operationalization
+`workflow mapping-audit` executes aggregate-only diagnostics through OMCP and
+writes `mapping_audit_<variable_id>.json`. Audit findings do not silently
+change the mapping; a reviewer must act through `concept-set-map` or the
+`covariate-*` review commands.
 
-Only after identification is each required DAG variable mapped to:
+## Governance boundary
 
-- an OMOP domain and standard concept set;
-- one or more CDM tables and fields;
-- an index-relative measurement window;
-- a deterministic aggregation rule;
-- missingness and provenance rules;
-- human mapping status.
+The persistent workflow currently has four named gates: `protocol`,
+`clinical_mapping`, `analysis_plan`, and `results`. A final-mode run requires
+approval; exploratory provisional mapping can authorize only the limited
+operations encoded by the Execution Agent and OMCP context.
 
-OMOP availability must not determine the DAG. An important unobserved confounder
-stays in the causal model and becomes an identification limitation; it must not
-silently disappear because no convenient column exists.
+The target architecture should split the combined protocol decision into
+separate reviews for:
 
-This artifact is implemented, as a first version, in `causal/mapping/registry.py`:
-`OMOPVariableDefinition` (one entry per DAG node) covers every field above plus
-the fields the initial prototype's scattered `protocol.json`/`candidate_dag`/
-`analysis_plan.json` fields never had one place for -- excluded concepts,
-optional descendant inclusion, a reviewer and review comment on the mapping
-itself, provenance, schema/vocabulary versioning, and the explicit distinction
-between a *candidate* concept and an *approved* one. `OMOPVariableRegistry.
-from_protocol` is the backward-compatible adapter (an existing `protocol.json`
-needs no schema change); `build_extraction_plan` and
-`extraction_plan_to_concept_set_spec`/`extraction_plan_to_covariate_spec`
-resolve an approved, observed entry down to the existing
-`causal.queries.feasibility` SQL builders without replacing them.
-`causal.mapping.audit` adds the aggregate-only mapping diagnostics (row/person
-counts, `concept_id = 0` rate, unmapped source values, non-standard/invalid
-concepts, observed units, descendant-expansion coverage) this section implies
-but does not itself specify.
+1. question and target trial;
+2. causal DAG and clinical completeness;
+3. identification and estimand;
+4. OMOP operationalization.
 
-Not yet done: `causal.orchestrator.workflow._load_concept_specs` (the
-population/treatment/comparator/outcome query loader) still reads
-`protocol.json` directly rather than through the registry -- only the
-covariate loader (`_load_covariate_specs`) was rewired to consume it this
-round; there is no reviewer-facing workflow action yet to set
-`include_descendants`/`excluded_concept_ids` (`protocol.json` hand-editing
-only); and the audit queries are unit-tested on their SQL shape but not yet
-wired to run through OMCP.
+OMCP is the default governed execution transport. The direct BigQuery
+feasibility path is retained for equivalence testing, not as the preferred
+causal workflow. Aggregate diagnostic paths rely on OMCP's SQL and causal
+authorization checks; the local `QueryValidationAgent` is not a full SQL
+parser and is not applied uniformly to those aggregate paths.
 
-## Role of LLM, literature retrieval and MCP
+## Remaining scientific milestones
 
-- The LLM is a co-pilot that proposes structured artifacts and critiques known
-  bias patterns. It never declares its own output identified or approved.
-- PubMed and OpenAlex, queried together through `LiteratureOrchestrator`,
-  ground clinical relationships and edge rationales. A citation supports an
-  assertion; it does not prove the whole DAG is correct.
-- MCP/OMCP provides governed metadata, vocabulary lookup and aggregate data
-  audits after the scientific specification is established.
-- Deterministic code validates schemas, temporal consistency, acyclicity,
-  backdoor adjustment, execution gates and artifact provenance.
-- Human reviewers approve the question, target trial, DAG/identification and
-  OMOP operationalization at separate gates.
+1. Make `CausalStudySpecification` the persistent pre-OMOP contract and split
+   the combined protocol gate.
+2. Finish reviewer controls for descendant inclusion/exclusion and make the
+   registry the operational source used consistently by every builder.
+3. Validate the MIMIC-IV Sepsis-3 population, time zero, exposure strategies,
+   censoring, outcome, baseline covariates, missingness, and positivity.
+4. Define the observed-data estimand and missing-data/censoring strategy.
+5. Implement a transparent g-computation baseline, then prespecified TMLE and
+   CATE analyses with reproducible nuisance-model specifications.
+6. Add balance, overlap, positivity, calibration, and model diagnostics.
+7. Add negative controls and quantitative sensitivity analyses where the study
+   design supports them.
+8. Produce a final report that links estimates to protocol versions, registry
+   versions, code versions, diagnostics, assumptions, and human decisions.
 
-## Migration from the current prototype
-
-The existing `HypothesisAgent.candidate_dag` is a prototype limited to
-`confounder_to_treatment` and `confounder_to_outcome` edges. It cannot express a
-general graph or establish identification. The hard-coded Data Science Agent
-also mixes scientific variables with study-specific OMOP mappings.
-
-Migration should proceed incrementally:
-
-1. Keep existing prototype runs readable during the transition.
-2. Make `causal.roadmap.CausalStudySpecification` the pre-OMOP contract.
-3. Replace the single protocol gate with question, target-trial and
-   DAG/identification review gates.
-4. Build an OMOP variable registry from approved DAG nodes rather than fixed
-   phenotype names. **Implemented as a first version** -- see "OMOP
-   operationalization" above and `causal/mapping/registry.py`.
-5. Allow feasibility queries only after the required variables and windows are
-   explicit.
-6. Add the observed-data estimand and estimator plan only after identification
-   and data-support audits pass.
-
-Literature-retrieval and MCP code remain reusable, but they move under the
-appropriate Roadmap stage instead of defining the pipeline order.
-
-## Current implementation boundary
-
-The deterministic causal foundation is implemented in `causal/roadmap.py`:
-
-- causal question, target trial and causal estimand contracts;
-- general DAG nodes and edges;
-- temporal and acyclicity checks;
-- backdoor adjustment-set assessment;
-- bounded enumeration of minimum adjustment sets;
-- explicit assumptions still requiring scientific review.
-
-It is not yet wired into the filesystem workflow or the LLM prompt. Until that
-integration is complete, existing workflow commands remain prototype commands
-and must not be presented as the final causal pipeline.
+Until these milestones are complete, CausalOMOP is a governed design and
+feasibility prototype, not a clinical causal-effect engine.

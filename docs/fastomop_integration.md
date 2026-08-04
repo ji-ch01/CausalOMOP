@@ -3,6 +3,12 @@
 This project uses OMCP as the shared governed OMOP access layer for both
 FastOMOP descriptive queries and CausalOMOP causal workflows.
 
+Component-specific installation and API details remain authoritative in the
+official repositories: [FastOMOP](https://github.com/ji-ch01/agno_fastomop),
+[OMCP](https://github.com/ji-ch01/omcp), and
+[FOEM](https://github.com/ji-ch01/foem). This page documents only the
+CausalOMOP integration and governance boundary.
+
 ## Division of Responsibility
 
 | Component | Role | Never does |
@@ -21,8 +27,7 @@ entry's `candidate_concept_ids` (via `causal.agents.data_science`'s
 `map_covariate_concepts`, `map_concept_set`, ...), can move a concept into
 `root_concept_ids` with `mapping_status = "approved"` -- nothing in
 `causal.mapping` itself ever does this automatically. See
-[docs/causal_roadmap.md](docs/causal_roadmap.md) migration step 4 for the
-full design.
+[causal roadmap](causal_roadmap.md) for the full design.
 
 ## Included FastOMOP Repositories
 
@@ -56,7 +61,7 @@ agno_fastomop
 
 `foem` is not required for normal runtime. It is useful for evaluation.
 
-## Why Causal Work Should Stay Near NL-to-SQL
+## Relationship to NL-to-SQL
 
 Causal questions still need:
 
@@ -83,8 +88,10 @@ NL-to-SQL team
         causal study spec -> OMOP cohort/covariate SQL -> estimate/report
 ```
 
-The orchestrator should route intent. The causal planner should create a target
-trial specification before SQL is generated.
+The current CausalOMOP CLI and UI classify a question before drafting. A
+descriptive question is redirected to FastOMOP, but the applications are not
+yet connected by automatic process-level routing. A causal question must create
+a target-trial specification before SQL is generated.
 
 ## Shared MCP Contract
 
@@ -177,6 +184,63 @@ so this is no longer CLI/manual-`protocol.json`-edit only.
 
 The resulting `feasibility.json` records `execution_transport = "omcp"`, the
 OMCP query hash, run identifier, study identifier, and causal permission flag.
+
+`workflow mapping-audit <run_id> <variable_id>` runs `causal.mapping.audit`'s
+aggregate-only SQL diagnostics for one `registry.json` variable (any approved
+phenotype -- population/treatment/comparator/outcome -- or covariate) through
+the same governed OMCP path, and writes `mapping_audit_<variable_id>.json`.
+Every concept-based-domain variable gets: row/person counts per included
+concept, approved root concepts missing from the data, invalid/non-standard
+concepts, and three cohort-entry diagnostics adapted from OHDSI's
+CohortDiagnostics methodology (Rao et al. 2025, PLOS ONE,
+doi:10.1371/journal.pone.0310634; see `causal/mapping/audit.py`'s module
+docstring for the two simplifications made) -- `orphan_concepts` (related
+concepts present in the data but not in the approved set), `index_event_breakdown`
+(which specific concept drove each person's earliest qualifying event), and
+`incidence_rate` (crude, unstratified entries per 1,000 person-years).
+Measurement/observation variables also get `observed_units`. Diagnostic only:
+this never changes `mapping_status` or blocks extraction -- a reviewer acts on
+a finding through the existing `covariate-map-concepts`/`concept-set-map`
+review commands.
+
+## Governance Enforcement Boundary
+
+Two things worth being explicit about, since a security audit (2026-08-04)
+found the first genuinely broken and asked for a decision on the second.
+
+**FastOMOP cannot reach `Causal_Select_Query`.** `agno_fastomop`'s workflow
+(`workflows/omop_workflow.py`) builds one shared `MCPTools` connection for
+both of its agents. That connection is scoped with an explicit `include_tools`
+allowlist (`Get_Information_Schema`, `Select_Query`, `Lookup_Drug`,
+`Lookup_Condition`, `Lookup_Concept`, `Get_Concepts_By_Id`, `Get_Capabilities`)
+that does not include `Causal_Select_Query`. This matters because
+`causal_context` (see above) is a plain dict supplied by whichever caller
+invokes the tool -- OMCP validates its *shape* and its boolean gates, but has
+no session binding back to a real CausalOMOP orchestrator run, so a
+network-facing LLM agent with access to the tool could otherwise fabricate an
+"approved" readiness snapshot. The allowlist removes that tool from FastOMOP's
+reachable surface entirely, rather than relying on the agent's prompt to
+never ask for it.
+
+**The three OMCP-diagnostic paths in `causal.orchestrator.workflow`
+(`run_cohort_profile_mcp`, `run_followup_audit_mcp`, `run_mapping_audit_mcp`)
+send builder-generated SQL to `Causal_Select_Query` with no local
+`QueryValidationAgent` pre-check, and this is intentional, not an oversight.**
+`QueryValidationAgent`'s final-projection check (`causal/agents/
+query_validation.py`) is a word-boundary regex, not a SQL parser -- it cannot
+tell `COUNT(DISTINCT t.person_id)` (a legitimate aggregate, fine for
+`aggregate_feasibility`) apart from a bare `person_id` projection (a real
+patient-level leak). Applying it to these three paths would produce false
+positives on the exact aggregate SQL `causal.mapping.audit` and
+`AnalyticCohortBuilder.profile_sql`/`followup_audit_sql` are built to emit.
+The decision (audit finding F-03/F-04, confirmed 2026-08-04): keep it that
+way. `omcp/src/omcp/sql_validator.py` (single-statement, OMOP-table-only,
+source-value-column-blocking) and `omcp/src/omcp/governance.py`
+(`CausalExecutionContext`/`authorize_causal_operation`, fail-closed on any
+missing or unapproved gate) are therefore the **sole** enforcement point for
+these three paths. Any future change to either file is security-critical and
+must ship with tests, the same way the F-01 stacked-statement fix
+(`sg.parse()` + single-statement check in `validate_sql`) did.
 
 ## Local Configuration
 

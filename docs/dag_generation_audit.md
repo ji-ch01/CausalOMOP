@@ -1,8 +1,15 @@
-# DAG Generation — Audit (as of 2026-07-24, updated 2026-07-28)
+# DAG Generation — Technical Audit
+
+> Historical audit log covering the July–August 2026 DAG implementation.
+> Module names and design findings remain useful, but exact test counts and
+> point-in-time status belong to Git/CI. For the maintained overview, see
+> [LLM and evidence integration](llm_hypothesis_integration.md), the
+> [causal roadmap](causal_roadmap.md), and the live CLI help.
 
 Status snapshot of the causal-DAG generation pipeline, for presentation purposes.
 Covers what exists today, how it is governed, what is deliberately out of scope,
-and what is still missing. All 258 tests pass (`pytest tests/ -q`, 258 passed).
+and what was still missing at each dated update. Run `python -m pytest tests -q`
+for the current suite rather than relying on a frozen count in this audit.
 
 **Headline caveat:** the machinery below is solid — the governance, the
 identification checks, the audit trail all work as designed — but the DAGs it
@@ -351,8 +358,9 @@ each with its own trust boundary:
 
 1. **Drafting** — an LLM proposes candidate variables from literature/knowledge-
    graph evidence (`causal/prompts/dag.md`).
-2. **Critique** — a second, independent LLM call challenges the draft before it
-   is accepted, with at most one bounded revision round
+2. **Critique** — independent LLM calls challenge the draft before it is
+   accepted, with a bounded critique/revision loop (two critique rounds by
+   default)
    (`causal/prompts/dag_critique.md`, `causal/agents/dag_critique.py`).
 3. **Structural + clinical review** — deterministic, LLM-free checks decide
    whether the resulting graph is identified by backdoor adjustment, and

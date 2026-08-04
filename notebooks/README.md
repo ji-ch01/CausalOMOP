@@ -1,28 +1,21 @@
 # Notebooks
 
-This folder contains exploratory analysis notebooks.
+These notebooks are exploratory research artifacts, not workflow entry points
+or production implementations.
 
 | Notebook | Purpose |
 |---|---|
-| `omop_analysis.ipynb` | general OMOP/SNUH readiness analysis |
-| `t2dm_analysis.ipynb` | Type 2 Diabetes treatment, measurement, and adverse-event exploration |
-| `depressive_disorder_analysis.ipynb` | depressive disorder exploratory analysis |
+| `omop_analysis.ipynb` | general OMOP and historical SYN-SNUH readiness exploration |
+| `t2dm_analysis.ipynb` | type 2 diabetes treatment and outcome exploration |
+| `depressive_disorder_analysis.ipynb` | depressive-disorder exploration |
 
-## Policy
+Notebook findings are snapshots tied to their input data and execution state.
+They must not be treated as current MIMIC-IV validation results unless the
+notebook records that dataset, configuration, date, and reproducible run.
 
-Use notebooks for:
+Use notebooks for investigation, figures, and research notes. Move reusable
+SYN-SNUH preparation to `scripts/snuh_etl/` and reusable workflow logic to
+`causal/`. Do not commit embedded patient-level rows, credentials, database
+files, large rendered outputs, or local paths.
 
-- exploration;
-- figures;
-- data-quality investigation;
-- research notes.
-
-Move reusable logic into:
-
-```text
-scripts/snuh_etl/   for SNUH-specific ETL
-causal/             for reusable causal workflow code
-```
-
-Avoid committing large rendered outputs or local data exports.
-
+See [docs/datasets.md](../docs/datasets.md) for the current dataset policy.

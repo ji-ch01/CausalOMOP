@@ -1,57 +1,110 @@
-# Datasets
+# Datasets and Data Policy
 
-This project separates dataset preparation from causal inference claims.
+CausalOMOP separates source-data access, OMOP conversion, local development
+copies, generated run artifacts, and causal claims. No patient-level dataset is
+distributed with the repository.
 
-## Primary Analysis Dataset (MIMIC-IV 2.2)
+## Primary research dataset
 
-MIMIC-IV has been converted to OMOP CDM 5.3.1 in BigQuery. The dataset roles
-are deliberately separated:
+The current validation environment uses credentialed
+[MIMIC-IV 2.2](https://physionet.org/content/mimiciv/2.2/) converted to OMOP CDM
+5.3.1 using the [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) project. The
+conversion is queried either in BigQuery or from a controlled local DuckDB
+export.
 
-| Role | Runtime environment variable |
+MIMIC-IV access remains subject to PhysioNet credentialing and the applicable
+data-use agreement. Conversion does not make the data public. Local exports,
+query results, run artifacts containing sensitive context, and derived
+person-level datasets inherit the source restrictions.
+
+## Runtime backends
+
+Set `CAUSALOMOP_DB_BACKEND` to `bigquery` or `duckdb`.
+
+For BigQuery:
+
+| Role | Environment variable |
 |---|---|
 | GCP project | `CAUSALOMOP_BQ_PROJECT` |
 | analysis-ready OMOP CDM | `CAUSALOMOP_BQ_OMOP_DATASET` |
 | vocabulary preparation/audit | `CAUSALOMOP_BQ_VOCAB_DATASET` |
-| staging, lookups, intermediate ETL | `CAUSALOMOP_BQ_ETL_DATASET` |
+| staging and intermediate ETL | `CAUSALOMOP_BQ_ETL_DATASET` |
 | tests, run logs, and metrics | `CAUSALOMOP_BQ_METRICS_DATASET` |
 
-Analyses must read clinical data from the configured OMOP role. They must not
-silently use staging tables. Generated quality metrics and provenance belong in
-the configured metrics role; the clean OMOP dataset is treated as read-only.
+Clinical analyses must read from the configured OMOP role, not silently from
+staging tables. The analysis-ready OMOP dataset is treated as read-only.
 
-Real project identifiers, dataset names, bucket paths, credentials, converted
-tables, and patient-level artifacts are local configuration and must not be
-committed or published.
+For DuckDB:
 
-## SYN-SNUH Synthetic Dataset
+```text
+CAUSALOMOP_DB_BACKEND=duckdb
+CAUSALOMOP_DUCKDB_PATH=data/mimiciv_omop.duckdb
+CAUSALOMOP_DUCKDB_SCHEMA=main
+```
 
-The SYN-SNUH synthetic dataset was used to test the FastOMOP and OMOP
-infrastructure pipeline:
+The CausalOMOP configuration above is distinct from the environment passed to
+the OMCP subprocess (`DB_TYPE`, `DB_PATH`, `CDM_SCHEMA`, `VOCAB_SCHEMA`). The
+CausalOMOP MCP client resolves and supplies the appropriate OMCP values.
 
-- OMOP CDM table access through DuckDB;
-- Athena vocabulary loading;
-- FastOMOP concept lookup and NL-to-SQL behavior;
-- early causal cohort-builder mechanics.
+Check the resolved configuration without querying a database:
 
-It is kept in the project as a test and demonstration dataset. It should not be
-presented as the primary causal inference dataset or as evidence that the full
-causal workflow is clinically valid. The main issue is not that SYN-SNUH is
-useless, but that it does not contain enough clinically realistic detail for
-causal adjustment in many target trial settings. For example, BMI or related
-anthropometric information is absent or not sufficiently usable, even though it
-can be an important baseline confounder and effect modifier in cardiometabolic
-questions.
+```powershell
+python -m causal.cli config --json
+```
 
-## Local File Layout
+## BigQuery-to-DuckDB export
 
-Expected local files:
+The standalone exporter copies the configured BigQuery OMOP dataset into one
+local DuckDB schema using Arrow batches and verifies source/destination row
+counts by default:
+
+```powershell
+pip install -r requirements-bigquery.txt
+python -m scripts.bigquery_etl.export_duckdb data/mimiciv_omop.duckdb
+```
+
+Useful options:
+
+```powershell
+python -m scripts.bigquery_etl.export_duckdb data/mimiciv_omop.duckdb `
+  --tables person concept --schema main
+```
+
+- `--tables` exports a subset;
+- `--schema` chooses the destination schema;
+- `--overwrite` replaces destination tables that already exist;
+- `--no-verify` skips row-count verification.
+
+See [scripts/bigquery_etl/README.md](../scripts/bigquery_etl/README.md). The
+output file must remain ignored, access-controlled, and outside public or shared
+locations.
+
+## SYN-SNUH
+
+The synthetic SNUH DuckDB assets remain useful for:
+
+- ETL and vocabulary tests;
+- descriptive FastOMOP smoke tests;
+- OMOP concept-coverage checks;
+- early workflow and SQL mechanics.
+
+They are not the primary causal-validation dataset. Known limitations include
+synthetic temporal artifacts, incomplete or insufficiently detailed baseline
+variables, sparse vital signs, limited adverse-event signal, some prevalent-user
+patterns, and incomplete vocabulary hierarchy coverage.
+
+Prepare SYN-SNUH using [scripts/snuh_etl/README.md](../scripts/snuh_etl/README.md).
+
+## Local layout
 
 ```text
 data/
+  README.md
+  mimiciv_omop.duckdb              # restricted local export
   synthetic_snuh_raw.duckdb
   synthetic_snuh_curated.duckdb
-  synthetic_snuh_v1.duckdb              # optional historical/local copy
-  backups/                             # generated by ETL scripts
+  synthetic_snuh_v1.duckdb         # optional historical copy
+  backups/
   vocabulary/
     CONCEPT.csv
     CONCEPT_RELATIONSHIP.csv
@@ -61,109 +114,33 @@ data/
     DRUG_STRENGTH.csv
 ```
 
-These files are ignored by Git because they are large and/or derived.
+All database files, WAL files, backups, vocabulary exports, and derived
+person-level datasets must stay out of Git.
 
-## SYN-SNUH Dataset Status
+Vocabulary downloads are managed through
+[OHDSI Athena](https://athena.ohdsi.org/) and remain subject to their source
+licences.
 
-Current validated use:
+## Validation study
 
-- FastOMOP smoke testing;
-- vocabulary coverage checks;
-- descriptive OMOP analysis;
-- feasibility exploration.
+Dataset selection is complete; the active work is validation of the
+albumin/sepsis target trial against the converted MIMIC-IV data. The study still
+requires a reproducible Sepsis-3 phenotype, approved albumin and crystalloid
+mappings, validated ICU time zero, baseline covariate coverage, censoring and
+follow-up rules, and positivity assessment.
 
-Known limitations for causal inference:
+See [studies/albumin_sepsis_28d](../studies/albumin_sepsis_28d/README.md) and
+the [causal roadmap](causal_roadmap.md).
 
-- synthetic temporal artifacts;
-- missing or insufficiently detailed BMI/body-size information;
-- limited adverse-event signal;
-- some prevalent-user patterns;
-- sparse vital-sign coverage;
-- incomplete observation remapping;
-- limited drug hierarchy coverage for non-self ancestors.
+## Handling rules
 
-Because of these limitations, the SYN-SNUH synthetic dataset should be described
-as a development dataset for infrastructure and workflow prototyping, not as the
-final causal evidence source.
-
-## Vocabulary Loading
-
-Athena vocabulary files are expected under:
-
-```text
-data/vocabulary/
-```
-
-The ETL scripts use:
-
-```text
-OMOP_VOCAB_DIR=data/vocabulary
-OMOP_DB_PATH=data/synthetic_snuh_curated.duckdb
-```
-
-Override these variables when running against another database:
-
-```bash
-set OMOP_DB_PATH=C:\path\to\omop.duckdb
-set OMOP_VOCAB_DIR=C:\path\to\vocabulary
-```
-
-On Unix-like shells:
-
-```bash
-export OMOP_DB_PATH=/path/to/omop.duckdb
-export OMOP_VOCAB_DIR=/path/to/vocabulary
-```
-
-## Rebuild Order
-
-Run from the repository root:
-
-```bash
-python -m scripts.snuh_etl.load_vocabulary
-python -m scripts.snuh_etl.fix_drugs
-python -m scripts.snuh_etl.fix_measurements
-python -m scripts.snuh_etl.remap_observations
-python -m scripts.snuh_etl.extend_concept_ancestor
-python -m scripts.snuh_etl.validate_vocabulary
-```
-
-The scripts create timestamped DuckDB backups in `data/backups/`.
-
-## Future Causal Dataset Requirements
-
-A more suitable causal dataset should ideally have:
-
-- richer longitudinal history before treatment initiation;
-- reliable drug exposure timing;
-- outcome events with enough treated and comparator cases;
-- baseline confounders such as BMI, renal function, diabetes severity, and
-  prior infection history;
-- enough sample size for positivity and balance diagnostics;
-- stable coding for adverse events.
-
-The causal workflow should remain OMOP-based so it can run against a better
-database without being tied to SNUH-specific artifacts.
-
-## Public Dataset Review
-
-The next work package should identify a public dataset that can support a
-published or reproducible causal question. Preference should go to datasets
-that have already been used in peer-reviewed causal studies, because they allow
-the pipeline output to be compared against published design choices, variables,
-assumptions, and expected results.
-
-The review should capture:
-
-- existing literature on reproducible causal studies;
-- available public datasets suitable for causal reasoning;
-- causal questions that can be tested with each dataset;
-- required exposure, outcome, baseline covariate, and effect-modifier
-  variables;
-- OMOP compatibility or feasibility of OMOP conversion;
-- sample size, follow-up, positivity, and missingness constraints;
-- expected results from the literature for future validation.
-
-The ideal validation dataset should support CATE estimation, not only an average
-treatment effect. That means it should contain enough baseline heterogeneity and
-sample size to evaluate clinically meaningful effect modifiers.
+- Never commit credentials, project identifiers, database files, raw query
+  results, or patient-level analytic tables.
+- Never send patient-level data or sensitive free text to an LLM provider.
+- Treat `artifacts/runs/` as research records that may contain submitted
+  clinical questions and review metadata.
+- Prefer aggregate diagnostics for review and demonstrations.
+- A generated SQL plan is not authorization to export, publish, or share its
+  result.
+- Follow the source data-use agreement, institutional policy, and reviewer
+  decisions even when a technical control would permit more.

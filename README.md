@@ -1,585 +1,229 @@
 # CausalOMOP
 
-Research repository for building an auditable causal-inference workflow over
-observational health data represented in OMOP CDM.
+CausalOMOP is a research prototype for designing and auditing causal studies
+over observational health data represented in OMOP CDM. It turns a clinical
+question into reviewable artifacts: a target-trial draft, an evidence-grounded
+causal DAG, an identification assessment, an OMOP variable registry, governed
+SQL, feasibility diagnostics, and an execution-readiness decision.
 
-The repository has two complementary roles:
+The repository does **not** yet estimate treatment effects. No ATE, ATT, CATE,
+g-computation, TMLE, or clinical conclusion should be inferred from its current
+outputs.
 
-- keep a working FastOMOP NL-to-SQL stack around OMOP data;
-- transform a clinical causal question into a target trial, counterfactual
-  estimand, reviewed causal DAG, identification strategy, OMOP
-  operationalization, statistical analysis and qualified report.
+## Documentation
 
-The SNUH synthetic dataset is kept because it is useful for testing ETL,
-FastOMOP, OMOP concept access, and early workflow mechanics. It is not treated
-as the primary validation dataset for causal inference.
+Start with the [documentation index](docs/index.md). The authoritative pages
+are:
 
-## Causal Roadmap
+- [causal package and implementation status](causal/README.md);
+- [causal roadmap and remaining scientific gaps](docs/causal_roadmap.md);
+- [datasets and data-handling policy](docs/datasets.md);
+- [FastOMOP/OMCP integration and trust boundaries](docs/fastomop_integration.md);
+- [LLM, literature, knowledge-graph, and critique workflow](docs/llm_hypothesis_integration.md);
+- [current architecture diagrams](docs/project_architecture_diagrams.md);
+- [responsible demonstration guide](docs/responsible_demo_guide.md).
 
-The scientific design comes before database extraction. OMOP determines whether
-required causal variables can be operationalized; it must not determine which
-variables are allowed to exist in the causal model.
+`document_design.md`, `docs/causal_architecture.md`, and
+`docs/reproducible_causal_review.md` are retained as short historical records;
+they are not current specifications.
 
-Target workflow:
+## What is implemented
 
-```text
-User question
-  -> 1. clarify the causal question
-  -> 2. specify the target trial
-  -> 3. define the counterfactual causal estimand
-  -> 4. construct and review the causal DAG
-  -> 5. identify the effect and an admissible adjustment set
-  -> 6. map required variables to OMOP concepts, tables and time windows
-  -> 7. audit feasibility, missingness, positivity and follow-up
-  -> 8. define the observed-data statistical estimand
-  -> 9. run prespecified estimators
-  -> 10. run diagnostics and sensitivity analyses
-  -> 11. produce an auditable, assumption-qualified report
-```
-
-This follows the Causal Roadmap and target-trial grounding recommended for
-medical causal co-pilots in Alaa et al. (2024) — see [References](#references)
-below. The LLM assists with structured proposals and critiques; deterministic
-code and human gates decide whether artifacts are coherent, identified and
-approved. Grounding an LLM co-pilot in external, verifiable evidence rather
-than its own claims motivated the Hypothesis Agent design: candidate DAG
-edges are drafted only from literature/knowledge-graph evidence actually
-retrieved for the question, and any citation the LLM invents that was not
-retrieved is rejected deterministically. See
-[docs/llm_hypothesis_integration.md](docs/llm_hypothesis_integration.md) for
-the implementation.
-
-The primary methodological objective remains heterogeneous treatment-effect
-estimation with OMOP CDM data. Planned estimators include g-computation and TMLE
-with SuperLearner-style nuisance models, after identification and data-support
-checks pass.
-
-## References
-
-This is a general causal-inference tool: the pipeline, agents and SQL
-builders are protocol-driven and not specific to any one disease, drug or
-outcome (see [Repository Map](#repository-map) and
-[`causal/queries/feasibility.py`](causal/queries/feasibility.py)). Its
-design choices are grounded in existing causal-inference and biomedical-
-informatics literature rather than invented from scratch:
-
-- **Causal DAGs and the backdoor criterion** — Pearl, J. (1995). Causal
-  diagrams for empirical research. *Biometrika*, 82(4), 669–688.
-  [doi:10.1093/biomet/82.4.669](https://doi.org/10.1093/biomet/82.4.669). The
-  identification logic in `causal/roadmap.py` (d-separation,
-  minimum-adjustment-set enumeration) implements this framework.
-- **Target trial emulation** — Hernán, M.A. & Robins, J.M. (2016). Using Big
-  Data to Emulate a Target Trial When a Randomized Trial Is Not Available.
-  *American Journal of Epidemiology*, 183(8), 758–764.
-  [doi:10.1093/aje/kwv254](https://doi.org/10.1093/aje/kwv254). Every study
-  protocol in this repo (`protocol.json`) is a target-trial specification in
-  this sense, not a bespoke, hand-tuned query.
-- **The Causal Roadmap** — Petersen, M.L. & van der Laan, M.J. (2014). Causal
-  Models and Learning from Data: Integrating Causal Modeling and Statistical
-  Estimation. *Epidemiology*, 25(3), 418–426. The 11-step pipeline above
-  follows this roadmap's separation of causal model, causal question,
-  identification, and statistical estimation.
-- **TMLE** — van der Laan, M.J. & Rubin, D. (2006). Targeted Maximum
-  Likelihood Learning. *The International Journal of Biostatistics*, 2(1),
-  Article 11. Planned estimator for the statistical-estimation stage, once
-  identification and data-support checks pass (see Implementation Status
-  below).
-- **Grounding an LLM causal co-pilot in verifiable evidence** — Alaa, A. et
-  al. (2024). [arXiv:2407.19118](https://arxiv.org/abs/2407.19118). Directly
-  shaped the Hypothesis Agent design described above.
-- **OptimusKG** — Vittor et al. OptimusKG: Unifying biomedical knowledge in
-  a modern multimodal graph. [arXiv:2604.27269](https://arxiv.org/pdf/2604.27269)
-  (Zitnik Lab, Harvard Medical School;
-  [github.com/mims-harvard/OptimusKG](https://github.com/mims-harvard/OptimusKG)).
-  Knowledge-graph evidence source used to corroborate DAG edges alongside
-  PubMed/OpenAlex (`causal/knowledge_graph/`).
-- **Worked validation case** — the albumin-plus-crystalloids-vs-crystalloids,
-  ICU sepsis, 28-day-mortality question and its MIMIC-IV OMOP grounding
-  follow *Step-by-step causal analysis of EHRs to ground decision-making*,
-  [doi:10.1371/journal.pdig.0000721](https://doi.org/10.1371/journal.pdig.0000721).
-  This is the first worked example used to validate the pipeline end-to-end,
-  not a constraint on what the pipeline can study — see
-  [MIMIC-IV OMOP Setup](#mimic-iv-omop-setup).
-- **Second candidate validation study** — Wang, X., Zhang, K., Wu, Y., Zhang,
-  Z., Li, Y., Han, R., & Liang, F. (2026). Target trial emulation of early
-  acetaminophen use and mortality in critically ill stroke patients.
-  *Scientific Reports*.
-  [doi:10.1038/s41598-026-46381-5](https://doi.org/10.1038/s41598-026-46381-5).
-  Also a target-trial emulation on MIMIC-IV ICU data; planned as a second
-  reference to check the causal-question and identification process and
-  results against a published study.
-
-## Implementation Status
-
-| Layer | Status |
+| Area | Current status |
 |---|---|
-| Causal question, target trial and causal estimand contracts | Implemented |
-| General causal DAG with roles and temporal ordering | Implemented |
-| Cycle detection and backdoor adjustment assessment | Implemented |
-| Minimum adjustment-set enumeration for reviewable DAGs | Implemented |
-| LLM question-to-protocol prototype, PubMed/OpenAlex/OptimusKG grounding | Implemented as an initial prototype |
-| OMCP vocabulary candidates and aggregate feasibility | Implemented as governed prototype |
-| Hypothesis Agent, DAG identification and workflow gates | Wired: `workflow start-question` drafts a protocol, `workflow hypothesis` builds the DAG, and the `protocol` gate blocks approval both on unresolved major confounders and on failed backdoor identification |
-| DAG critique and bounded-revision agent | Implemented: an independent LLM pass reviews each drafted DAG against structural and clinical checks before it is accepted |
-| SQL governance (`QueryValidationAgent`) | Implemented: every generated query (feasibility, cohort, governed causal tool) is checked for unbound parameters, disallowed tables, and `person_id` leakage before execution |
-| Generalized feasibility/cohort SQL (`ConceptSetSpec`-driven) | Implemented: replaces the earlier hardcoded albumin/sepsis query with builders that work for any protocol-declared population/treatment/comparator/outcome |
-| OMOP variable registry (`causal.mapping.registry`) | Implemented as a first version: a versioned `OMOPVariableDefinition`/`OMOPVariableRegistry` turns every `concept_sets` phenotype and `candidate_dag` covariate into one typed, validated contract (candidate vs. approved concepts, observed vs. unobserved, mapping approved vs. data available vs. SQL-executable), converted to the existing BigQuery builders via `ExtractionPlan`. `workflow registry-build` persists `registry.json`; `causal.mapping.audit` adds aggregate-only mapping diagnostics (row/person counts, zero-concept rate, unmapped source values, unit/vocabulary hygiene, descendant-expansion coverage). See [docs/causal_roadmap.md](docs/causal_roadmap.md) migration step 4. |
-| Statistical estimand, estimation and sensitivity analysis | Not yet implemented |
+| Natural-language question intake | LLM-based causal/descriptive/clarification gate in the CLI and Streamlit UI; descriptive questions are redirected to FastOMOP, but automatic cross-application routing is not implemented |
+| Target-trial draft | Strictly parsed LLM or manually supplied protocol; human approval remains mandatory |
+| Evidence grounding | PubMed and OpenAlex retrieval, optional OptimusKG relations, deterministic citation allow-list |
+| DAG review | Role/timing validation, cycle checks, bounded critique/revision, optional multi-candidate tournament, backdoor identification, minimum adjustment sets, SHD/SID audit metrics |
+| OMOP operationalization | Human-reviewed concept mapping, versioned variable registry, mapping diagnostics, windows and aggregation rules |
+| Data access | BigQuery or local DuckDB, with governed OMCP execution as the default causal path |
+| Study construction | Aggregate feasibility and follow-up audits, plus governed person-level analytic-cohort SQL generation |
+| Estimation and final causal report | Not implemented |
 
-The existing filesystem workflow remains available for technical testing, but
-its restricted `candidate_dag` is not the final causal pipeline and cannot by
-itself establish identification. The normative design is documented in
-[docs/causal_roadmap.md](docs/causal_roadmap.md).
+The current workflow still uses one combined `protocol` review gate instead of
+separate target-trial, DAG, and identification gates. The general
+`CausalStudySpecification` contracts exist in `causal/roadmap.py`, but the
+protocol and estimand contracts are not yet the persistent workflow's single
+source of truth.
 
-The next validation step is to identify a public dataset and a causal question
-that has already been studied in the scientific literature, so the pipeline can
-later be compared against published assumptions, variables, and expected
-results.
-
-## Repository Map
+## Repository layout
 
 ```text
 CausalOMOP/
-  README.md
-  document_design.md              # long causal extension design draft
-
-  docs/
-    repo_map.md                   # what each folder is for
-    datasets.md                   # local data policy and SNUH status
-    fastomop_integration.md       # FastOMOP submodules and runtime notes
-    causal_roadmap.md             # normative causal pipeline and integration plan
-    causal_architecture.md        # earlier architecture, retained for history
-    reproducible_causal_review.md # next literature and dataset review package
-
-  scripts/
-    snuh_etl/                     # SNUH synthetic ETL and data-quality scripts
-
-  causal/
-    roadmap.py                    # causal contracts and DAG identification
-    agents/                       # hypothesis, DAG identification/critique,
-                                   # data science, query validation, execution
-    knowledge_graph/              # OptimusKG client for DAG-evidence grounding
-    literature/                   # PubMed/OpenAlex retrieval and evidence grounding
-    llm/                          # dev/cloud and production/local LLM adapters
-    orchestrator/                 # persistent governed workflow prototype
-    data_builder/                 # analytic-cohort contracts and SQL builders
-    queries/                      # concept-set-driven feasibility/cohort SQL builders
-    mapping/                      # OMOP variable registry (model, validation, adapters, audits)
-    prompts/                      # hypothesis, DAG-critique and literature-DAG prompt templates
-
-  notebooks/                      # exploratory analyses
-
-  agno_fastomop/                  # FastOMOP NL-to-SQL agent submodule
-  omcp/                           # OMOP MCP server submodule
-  foem/                           # FastOMOP evaluation submodule
-
-  data/                           # local DuckDB/vocabulary files, not committed
+  causal/                         project-owned causal workflow
+  docs/                           maintained documentation and audit notes
+  studies/albumin_sepsis_28d/     first literature-backed validation case
+  scripts/bigquery_etl/           BigQuery-to-DuckDB export utility
+  scripts/snuh_etl/               SYN-SNUH preparation and validation
+  notebooks/                      exploratory analyses only
+  data/                           local, ignored datasets and vocabularies
+  artifacts/runs/                 generated run artifacts (may be sensitive)
+  agno_fastomop/                  FastOMOP Git submodule
+  omcp/                           OMCP Git submodule
+  foem/                           FOEM Git submodule
+  external/ohdsi_mimic/           OHDSI MIMIC ETL Git submodule
 ```
 
-See [docs/repo_map.md](docs/repo_map.md) for the detailed ownership and Git
-policy for each folder.
+See [docs/repo_map.md](docs/repo_map.md) for ownership and Git rules.
 
-## FastOMOP Components
+## External projects
 
-This repo currently keeps three FastOMOP-related dependencies as submodules:
+The integration repositories are pinned as Git submodules. Their own READMEs
+remain authoritative for installation and upstream behavior:
 
-| Path | Role |
+| Local path | Official repository |
 |---|---|
-| `agno_fastomop/` | NL-to-SQL agent workflow using semantic and database agents |
-| `omcp/` | MCP server exposing OMOP database tools |
-| `foem/` | evaluation and monitoring queries for FastOMOP |
+| `agno_fastomop/` | [ji-ch01/agno_fastomop](https://github.com/ji-ch01/agno_fastomop) |
+| `omcp/` | [ji-ch01/omcp](https://github.com/ji-ch01/omcp) |
+| `foem/` | [ji-ch01/foem](https://github.com/ji-ch01/foem) |
+| `external/ohdsi_mimic/` | [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) |
 
-For this project, FastOMOP is used first as the descriptive OMOP query layer.
-The causal extension should reuse this NL-to-SQL / SQL execution layer as its
-data-access layer. Causal planning and estimation are separate responsibilities,
-but they should not bypass OMOP concept mapping, controlled SQL generation, or
-schema-aware extraction.
-
-See [docs/fastomop_integration.md](docs/fastomop_integration.md).
-
-## Data Policy
-
-Local data files are intentionally excluded from Git:
-
-- `data/*.duckdb`
-- `data/backups/`
-- `data/vocabulary/`
-- `.env` files and local virtual environments
-
-Expected local files include:
-
-```text
-data/synthetic_snuh_raw.duckdb
-data/synthetic_snuh_curated.duckdb
-data/vocabulary/CONCEPT.csv
-data/vocabulary/CONCEPT_RELATIONSHIP.csv
-data/vocabulary/CONCEPT_ANCESTOR.csv
-```
-
-The SNUH synthetic DuckDB is useful for:
-
-- smoke-testing OMOP ETL;
-- validating concept coverage;
-- testing FastOMOP NL-to-SQL;
-- prototyping cohort-builder mechanics.
-
-It should not be presented as the main causal inference dataset. See
-[docs/datasets.md](docs/datasets.md).
-
-MIMIC-IV v2.2 is a credentialed-access dataset available through
-https://physionet.org/content/mimiciv/2.2/. Its source data and converted OMOP
-tables must remain in an access-controlled environment and are not distributed
-with this repository.
-
-## Installation and Tests
-
-Create or activate the project virtual environment, install dependencies and
-run the deterministic suite without contacting a cloud service:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python -m unittest discover -s tests -v
-python -m causal.cli config --json
-```
-
-LLM, MCP and BigQuery dependencies remain separated:
-
-```powershell
-pip install -r requirements-llm.txt
-pip install -r requirements-mcp.txt
-pip install -r requirements-bigquery.txt
-```
-
-Optional extras for the Streamlit UI and the knowledge-graph-grounded DAG pipeline:
-
-```powershell
-pip install -r requirements-ui.txt
-pip install -r requirements-knowledge-graph.txt
-```
-
-### Local configuration (`.env`)
-
-Copy the template once and fill in only what the workflow you're running needs;
-`.env` is git-ignored and must never be committed:
-
-```powershell
-Copy-Item sample.env .env
-```
-
-| Group | Keys | Notes |
-|---|---|---|
-| BigQuery datasets | `CAUSALOMOP_BQ_PROJECT`, `CAUSALOMOP_BQ_OMOP_DATASET`, `CAUSALOMOP_BQ_VOCAB_DATASET`, `CAUSALOMOP_BQ_ETL_DATASET`, `CAUSALOMOP_BQ_METRICS_DATASET` | required for `preflight`, `workflow feasibility`, `cohort-plan`, `cohort-profile`, `followup-audit` |
-| LLM provider | `OPENROUTER_API_KEY`, `CAUSALOMOP_LLM_MODEL`, `CAUSALOMOP_ENV`, `LOCAL_LLM_BASE_URL`, `LOCAL_LLM_MODEL`, `LOCAL_LLM_API_KEY` | `CAUSALOMOP_ENV=dev` (default) uses OpenRouter; `prod` requires the local provider and refuses to start if a cloud key is still set. See [docs/llm_hypothesis_integration.md](docs/llm_hypothesis_integration.md) |
-| Literature grounding | `NCBI_API_KEY` | optional; raises the PubMed E-utilities rate limit used by the DAG-drafting stage |
-
-## MIMIC-IV OMOP Setup
-
-The MIMIC-IV to OMOP CDM conversion follows the OHDSI repository:
-https://github.com/OHDSI/MIMIC.
-
-Development currently uses the study *Step-by-step causal analysis of EHRs to
-ground decision-making* (https://doi.org/10.1371/journal.pdig.0000721) as a
-reference for the causal question and study specification.
-
-Resolve the production BigQuery dataset configuration without contacting GCP:
-
-```bash
-python -m causal.cli config --json
-```
-
-Install the BigQuery runtime, configure Application Default Credentials, then
-validate access and the minimum OMOP table contract:
-
-```bash
-pip install -r requirements-bigquery.txt
-python -m causal.cli preflight --count-persons
-```
-
-The private project and dataset identifiers are configured locally through
-environment variables. They must never be committed. Dataset roles are
-documented using generic names in [docs/datasets.md](docs/datasets.md).
-
-The first technical validation case is albumin plus crystalloids versus
-crystalloids alone for 28-day mortality in ICU patients with sepsis. Its draft
-target-trial protocol and concept-audit instructions live in
-[`studies/albumin_sepsis_28d/`](studies/albumin_sepsis_28d/). Nothing about
-the pipeline itself is specific to this question: population, treatment,
-comparator and outcome are all declared as `ConceptSetSpec` entries in
-`protocol.json` and consumed by the same generic SQL builders
-([`causal/queries/feasibility.py`](causal/queries/feasibility.py)), so a new
-study is a new protocol file, not new code. See [References](#references)
-for the study this validation case is grounded in.
-
-### Current technical workflow
-
-Start and inspect the existing persistent exploratory workflow. These commands
-test orchestration, governance and OMOP access; they do not yet exercise the
-complete causal-roadmap identification pipeline:
-
-```powershell
-$state = python -m causal.cli workflow start studies\albumin_sepsis_28d\protocol.json |
-    ConvertFrom-Json
-$runId = $state.run_id
-
-python -m causal.cli workflow hypothesis $runId
-python -m causal.cli workflow gate $runId protocol approved `
-    --reviewer "technical-reviewer"
-python -m causal.cli workflow advance $runId
-
-python -m causal.cli workflow plan $runId
-python -m causal.cli workflow gate $runId clinical_mapping provisional `
-    --reviewer "technical-reviewer" `
-    --comment "Exploratory feasibility only"
-python -m causal.cli workflow advance $runId
-
-python -m causal.cli workflow feasibility $runId --transport mcp
-python -m causal.cli workflow advance $runId
-python -m causal.cli workflow execution-readiness $runId
-python -m causal.cli workflow cohort-plan $runId
-python -m causal.cli workflow cohort-profile $runId
-python -m causal.cli workflow followup-audit $runId
-python -m causal.cli workflow demo-report $runId
-```
-
-Use `workflow plan $runId --with-mcp` instead of `workflow plan $runId` to
-retrieve review-only vocabulary candidates. This never approves a concept set.
-
-Feasibility uses the shared OMCP server by default. During migration, the old
-direct BigQuery path remains available only for equivalence checks:
-
-```powershell
-pip install -r requirements-mcp.txt
-python -m causal.cli workflow feasibility <run_id> --transport mcp
-python -m causal.cli workflow feasibility <run_id> --transport direct
-```
-
-Create a governed draft from a natural-language clinical question
-through OpenRouter. The default development model is
-`openai/gpt-oss-120b`:
-
-```powershell
-pip install -r requirements-llm.txt
-python -m causal.cli workflow start-question "Among adult ICU patients with sepsis, what is the effect of albumin plus crystalloids versus crystalloids alone on 28-day mortality?"
-```
-
-The generated run remains at the protocol-review gate. The LLM cannot approve
-the target trial, causal graph, OMOP mappings or causal execution.
-
-Each exact LLM response is displayed in the terminal on stderr. Successful runs
-also persist the unmodified responses in:
-
-```text
-artifacts/runs/<run_id>/llm_outputs.json
-```
-
-Outputs are tagged as `target_trial_draft` and, when PubMed returns literature,
-`literature_dag_draft`. Raw output can contain the submitted clinical question;
-never send patient-level data to the cloud LLM and protect run artifacts as
-sensitive research material.
-
-Use `--skip-literature` to test only the first LLM call:
-
-```powershell
-python -m causal.cli workflow start-question "<causal question>" --skip-literature
-```
-
-An exploratory run may pass `clinical_mapping` with a `provisional` decision;
-a final run requires full approval.
-
-See [docs/responsible_demo_guide.md](docs/responsible_demo_guide.md) for a
-step-by-step demonstration script and the boundary between technical findings
-and causal results. An English version, updated for the `start-question` /
-PubMed-grounded DAG flow and grounded in real stored runs, is at
-[docs/responsible_demo_guide_en.md](docs/responsible_demo_guide_en.md).
-
-The current natural-language prototype is documented in
-[docs/llm_hypothesis_integration.md](docs/llm_hypothesis_integration.md). LLM
-output is treated as an unapproved draft and must pass the same deterministic
-contract and human gates as a manually authored protocol.
-
-Initialize submodules:
+Initialize them with:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-Install the lightweight root dependencies:
+## Installation
 
-```bash
+Python 3.12 is used by CI. From the repository root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install pytest
 ```
 
-Run the SNUH ETL/data-quality scripts from the repository root. Use module
-execution so imports resolve correctly:
+Install only the optional groups needed for the task:
 
-```bash
-python -m scripts.snuh_etl.load_vocabulary
-python -m scripts.snuh_etl.fix_drugs
-python -m scripts.snuh_etl.fix_measurements
-python -m scripts.snuh_etl.remap_observations
-python -m scripts.snuh_etl.extend_concept_ancestor
-python -m scripts.snuh_etl.validate_vocabulary
+```powershell
+pip install -r requirements-bigquery.txt
+pip install -r requirements-mcp.txt
+pip install -r requirements-llm.txt
+pip install -r requirements-ui.txt
+pip install -r requirements-knowledge-graph.txt
+pip install -r requirements-causal-discovery.txt
 ```
 
-The scripts default to:
+Copy `sample.env` to `.env` and replace placeholders locally:
 
-```text
-OMOP_DB_PATH=data/synthetic_snuh_curated.duckdb
-OMOP_VOCAB_DIR=data/vocabulary
+```powershell
+Copy-Item sample.env .env
 ```
 
-Override those environment variables when using another OMOP database or
-vocabulary directory.
+Never commit `.env`, credentials, local databases, vocabulary exports, or
+patient-level artifacts.
 
-## Running FastOMOP
+## Configuration and tests
 
-Docker support is kept at the root for convenience:
+The deterministic suite does not require a live cloud service:
 
-```bash
-docker compose up --build
+```powershell
+python -m pytest tests -q
+python -m causal.cli config --json
 ```
 
-Check `docker-compose.yml` before running: the container `DB_PATH` must match
-the DuckDB filename mounted under `/app/data`.
+With BigQuery dependencies and Application Default Credentials configured:
 
-For local development, use the submodule instructions:
-
-```bash
-cd agno_fastomop
-uv sync
-uv run python -m agno_fastomop.run_agent
+```powershell
+python -m causal.cli preflight --count-persons
 ```
 
-The agent stack launches `omcp` through the configured MCP command. See
-[docs/fastomop_integration.md](docs/fastomop_integration.md) for details.
+Dataset roles are configured through `CAUSALOMOP_BQ_PROJECT` and the four
+`CAUSALOMOP_BQ_*_DATASET` variables documented in
+[docs/datasets.md](docs/datasets.md).
 
-## Causal Work
+## Start a causal workflow
 
-The causal foundation lives in:
+From a reviewed protocol:
 
-```text
-causal/roadmap.py
+```powershell
+$state = python -m causal.cli workflow start studies\albumin_sepsis_28d\protocol.json |
+  ConvertFrom-Json
+$runId = $state.run_id
+
+python -m causal.cli workflow hypothesis $runId
+python -m causal.cli workflow status $runId
 ```
 
-It currently provides:
+From a natural-language causal question:
 
-- structured causal question, target-trial and estimand contracts;
-- a general DAG containing observed or unobserved exposure, outcome,
-  confounder, mediator, collider, prognostic, effect-modifier and selection
-  nodes;
-- node temporal ordering, edge provenance and cycle detection;
-- deterministic validation of proposed adjustment sets;
-- d-separation in the exposure backdoor graph;
-- bounded enumeration of minimum-cardinality adjustment sets;
-- explicit failure when the proposed effect is not identified through observed
-  backdoor adjustment.
-
-The existing cohort builders and initial agents remain useful infrastructure,
-but must be integrated behind the causal-roadmap gates. This integration adds:
-
-- causal intent routing inside the NL-to-SQL team;
-- separate human review of the question/target trial, DAG and identification;
-- evidence-grounded construction of the general DAG;
-- a DAG-node-to-OMOP variable registry with concepts, tables, fields, windows,
-  aggregation and missingness rules (implemented as a first version in
-  `causal/mapping/registry.py` -- see below);
-- controlled SQL/OMOP extraction only after identification;
-- leakage-safe cohort and covariate extraction;
-- CATE-oriented causal estimation with TMLE/SuperLearner and g-computation;
-- diagnostics for positivity, overlap, balance, model fit and missingness;
-- negative controls and quantitative sensitivity analyses where appropriate;
-- an auditable causal report.
-
-### OMOP Variable Registry
-
-`causal/mapping/registry.py` is the versioned source of truth this project
-uses to tie one DAG node (a `candidate_dag` covariate, or a `concept_sets`
-phenotype -- population/treatment/comparator/outcome) to its OMOP
-operationalization and, from there, to deterministic SQL:
-
-```text
-OMOPVariableDefinition -> ExtractionPlan -> ConceptSetSpec/CovariateSpec -> existing BigQuery builders
+```powershell
+python -m causal.cli workflow start-question "Among adult ICU patients with sepsis, what is the effect of albumin plus crystalloids versus crystalloids alone on 28-day mortality?"
 ```
 
-`OMOPVariableDefinition` distinguishes, as separate fields, what earlier
-prototype fields conflated: a *candidate* concept a lookup tool proposed
-(`candidate_concept_ids`) from an *approved* one (`root_concept_ids`);
-`mapping_status == "approved"` from `available_in_data` (an audit result, not
-a review decision) from `is_sql_executable(...)` (a pure, re-derived
-capability check -- never a stored/stale flag). `variable_from_concept_set`/
-`variable_from_candidate_dag_entry`/`variable_from_covariate_plan` are
-backward-compatible adapters: an existing `protocol.json`/`analysis_plan.json`
-needs no schema change to be read into a registry. `causal.mapping.audit`
-adds aggregate-only diagnostics (row/person counts per concept, approved
-concepts absent from the data, `concept_id = 0` rate, top unmapped source
-values, non-standard/invalid concepts, observed units, and coverage before
-versus after `concept_ancestor` expansion) -- never a patient-level row.
+This path first classifies the question. A descriptive question is refused with
+a pointer to FastOMOP; an ambiguous question returns a clarification request.
+`--skip-question-gate` exists for controlled testing, not as a scientific
+approval mechanism.
 
-Nothing in this module ever sets `mapping_status = "approved"` on its own;
-FastOMOP/OMCP concept-lookup tools may only ever populate
-`candidate_concept_ids`, never `root_concept_ids` -- a human reviewer decides
-that, through the existing `causal.orchestrator.workflow` gates.
+Useful optional flags are `--skip-literature`, `--skip-knowledge-graph`,
+`--skip-critique`, `--max-critique-rounds`, and `--tournament-size`. Every raw
+LLM response is persisted in `artifacts/runs/<run_id>/llm_outputs.json`; do not
+put patient-level information in prompts.
 
-`workflow registry-build <run_id>` writes `registry.json` from
-`protocol.json` alone (it does not require the Data Science Agent to have
-run, since a registry entry must remain valid before, and regardless of,
-OMOP data availability). See [docs/causal_roadmap.md](docs/causal_roadmap.md)
-migration step 4 and [docs/fastomop_integration.md](docs/fastomop_integration.md)
-for the division of responsibility between FastOMOP, OMCP, CausalOMOP and
-FOEM.
+## Review, mapping, and feasibility
 
-See [docs/causal_roadmap.md](docs/causal_roadmap.md) for the normative
-pipeline and integration boundary. The earlier design discussions remain in
-[docs/causal_architecture.md](docs/causal_architecture.md) and
-[document_design.md](document_design.md). See
-[docs/reproducible_causal_review.md](docs/reproducible_causal_review.md) for the
-next literature and dataset review work package.
+The CLI exposes explicit review actions. A typical exploratory sequence is:
 
-## Notebooks
+```powershell
+python -m causal.cli workflow gate $runId protocol approved --reviewer "reviewer-id"
+python -m causal.cli workflow advance $runId
+python -m causal.cli workflow plan $runId --with-mcp
 
-The notebooks are exploratory analysis artifacts, not production code:
+# Review protocol concept sets and DAG covariates with the dedicated
+# concept-set-map / covariate-* commands or the Streamlit interface.
 
-| Notebook | Purpose |
-|---|---|
-| `notebooks/omop_analysis.ipynb` | general OMOP/SNUH readiness check |
-| `notebooks/t2dm_analysis.ipynb` | Type 2 Diabetes treatment and outcome exploration |
-| `notebooks/depressive_disorder_analysis.ipynb` | depressive disorder exploratory analysis |
+python -m causal.cli workflow registry-build $runId
+python -m causal.cli workflow gate $runId clinical_mapping provisional `
+  --reviewer "reviewer-id" --comment "Aggregate exploration only"
+python -m causal.cli workflow advance $runId
+python -m causal.cli workflow feasibility $runId --transport mcp
+python -m causal.cli workflow execution-readiness $runId
+python -m causal.cli workflow cohort-plan $runId
+python -m causal.cli workflow cohort-profile $runId
+python -m causal.cli workflow followup-audit $runId
+python -m causal.cli workflow mapping-audit $runId <variable_id>
+python -m causal.cli workflow demo-report $runId
+```
 
-See [notebooks/README.md](notebooks/README.md).
+Use `python -m causal.cli workflow --help` for the full command list. The
+direct BigQuery feasibility transport remains available for equivalence checks;
+OMCP is the default governed path.
 
-## Development Notes
+The review interface can be started with:
 
-- Treat `agno_fastomop/`, `omcp/`, and `foem/` as submodules. Changes inside
-  them belong to their own Git history.
-- Keep local `.duckdb`, Athena vocabulary CSVs, backups, `.env`, and virtual
-  environments out of Git.
-- Keep SNUH-specific ETL under `scripts/snuh_etl/`.
-- Keep causal reusable code under `causal/`.
-- Keep long design discussion in `document_design.md` and short operational
-  guidance in `docs/`.
+```powershell
+streamlit run causal/ui/streamlit_app.py
+```
 
-## Current Next Steps
+## Data
 
-1. Wire `CausalStudySpecification` into the persistent workflow.
-2. Add separate gates for question/target-trial review, DAG review and
-   identification review.
-3. Replace the restricted prototype `candidate_dag` with the general DAG
-   contract while retaining PMID and expert-judgment provenance.
-4. ~~Implement the OMOP variable registry from approved DAG nodes instead of
-   hard-coded phenotype names.~~ Done as a first version: `causal.mapping.registry`
-   (`OMOPVariableDefinition`/`OMOPVariableRegistry`, `ExtractionPlan`) plus
-   `causal.mapping.audit`. Remaining follow-ups: `causal.orchestrator.workflow.
-   _load_concept_specs` (population/treatment/comparator/outcome) still reads
-   `protocol.json` directly rather than through the registry (only the
-   covariate loader was rewired this round); there is no reviewer-facing action
-   yet to set `include_descendants`/`excluded_concept_ids` (only
-   `protocol.json` hand-editing); Streamlit does not yet render `registry.json`
-   or run the new audit queries.
-5. Audit whether MIMIC-IV OMOP supports the required baseline variables,
-   treatment strategies, outcome, follow-up and positivity assumptions.
-6. Define the observed-data statistical estimand and analysis plan.
-7. Implement g-computation first, then TMLE and prespecified CATE analyses with
-   appropriate diagnostics and sensitivity analyses.
-8. Wire descriptive-versus-causal routing into the user-facing orchestrator and
-   produce the final auditable report package.
+The primary research dataset is a credentialed MIMIC-IV 2.2 conversion to OMOP
+CDM 5.3.1. Neither source data nor converted patient-level tables are included.
+Access is governed by [PhysioNet's MIMIC-IV terms](https://physionet.org/content/mimiciv/2.2/),
+and conversion follows [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC).
+
+SYN-SNUH remains a local development dataset for ETL, vocabulary, FastOMOP, and
+smoke testing. It is not the primary source of causal evidence.
+
+For lower-latency local development, export the configured BigQuery OMOP
+dataset to an ignored DuckDB file:
+
+```powershell
+python -m scripts.bigquery_etl.export_duckdb data/mimiciv_omop.duckdb
+```
+
+The export inherits the source dataset's access restrictions. See
+[docs/datasets.md](docs/datasets.md) before moving or sharing it.
+
+## Scientific boundary
+
+The current outputs support architecture review, protocol review, concept
+mapping, DAG inspection, identification checks, feasibility, and diagnostics.
+They do not support a claim that a treatment causes an outcome. The next major
+scientific work is to wire the complete causal-study contracts into the
+persistent gates, validate study phenotypes and covariates, define the observed
+data estimand, and implement prespecified estimators with diagnostics and
+sensitivity analyses.

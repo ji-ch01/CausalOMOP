@@ -1,16 +1,15 @@
 # Local Data Directory
 
-This folder is for local data only. Large database and vocabulary files are not
-committed to Git.
-
-Expected layout:
+This directory is a mount point for local data. Only this README belongs in
+Git; databases, WAL files, vocabularies, backups, and derived datasets do not.
 
 ```text
 data/
   README.md
+  mimiciv_omop.duckdb              # restricted MIMIC-IV OMOP export
   synthetic_snuh_raw.duckdb
   synthetic_snuh_curated.duckdb
-  synthetic_snuh_v1.duckdb
+  synthetic_snuh_v1.duckdb         # optional historical copy
   backups/
   vocabulary/
     CONCEPT.csv
@@ -21,17 +20,9 @@ data/
     DRUG_STRENGTH.csv
 ```
 
-Git should ignore:
+MIMIC-IV exports retain the source dataset's credentialing and data-use
+restrictions. SYN-SNUH files are development assets for ETL, vocabulary, and
+FastOMOP smoke tests; they are not the primary causal-evidence source.
 
-- `*.duckdb`;
-- `backups/`;
-- `vocabulary/`;
-- exported patient-level rows;
-- intermediate analytic datasets that contain individual-level data.
-
-The SNUH synthetic DuckDB files are development assets for OMOP/FastOMOP
-infrastructure testing. They should not be treated as the main causal inference
-validation dataset.
-
-Use `docs/datasets.md` for dataset notes, rebuild instructions, and the public
-dataset review plan.
+See [docs/datasets.md](../docs/datasets.md) for backend configuration, export
+instructions, access rules, and the active validation study.
