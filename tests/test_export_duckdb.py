@@ -149,19 +149,101 @@ class ExportDuckDBTests(unittest.TestCase):
         self.assertEqual(summary.results[0].source_row_count, 999)
         self.assertEqual(summary.results[0].dest_row_count, 3)
 
-    def test_existing_table_requires_explicit_overwrite(self):
+    def test_existing_table_is_resumed_by_default_and_overwrite_forces_redo(self):
         client = FakeBigQueryClient()
         client.add_table("person", _person_table())
         output = self._output_path()
 
         export_dataset_to_duckdb(client, self.datasets, output, tables=["person"], bqstorage_client=None)
-        with self.assertRaises(FileExistsError):
-            export_dataset_to_duckdb(client, self.datasets, output, tables=["person"], bqstorage_client=None)
+
+        # A second run without --overwrite should resume: skip re-fetching
+        # "person" entirely (proven by breaking list_rows) but still verify
+        # its row count against the source.
+        original_list_rows = client.list_rows
+
+        def _fail_if_called(table_ref, page_size=100_000):
+            raise AssertionError(f"list_rows should not be called for already-exported {table_ref}")
+
+        client.list_rows = _fail_if_called
+        summary = export_dataset_to_duckdb(client, self.datasets, output, tables=["person"], bqstorage_client=None)
+        self.assertTrue(summary.all_verified)
+        self.assertEqual(summary.results[0].dest_row_count, 3)
+        client.list_rows = original_list_rows
 
         summary = export_dataset_to_duckdb(
             client, self.datasets, output, tables=["person"], overwrite=True, bqstorage_client=None
         )
         self.assertTrue(summary.all_verified)
+
+    def test_partial_table_from_a_crash_is_detected_and_reexported(self):
+        client = FakeBigQueryClient()
+        client.add_table("person", _person_table())
+        output = self._output_path()
+
+        # Simulate a process crashing mid-table with chunked writes: the
+        # table exists but has fewer rows than the source. Resume must
+        # notice the mismatch and redo it rather than trusting existence.
+        con = duckdb.connect(output)
+        con.execute("CREATE TABLE person AS SELECT * FROM (VALUES (1, 8507)) AS t(person_id, gender_concept_id)")
+        con.close()
+
+        summary = export_dataset_to_duckdb(client, self.datasets, output, tables=["person"], bqstorage_client=None)
+
+        self.assertTrue(summary.all_verified)
+        self.assertEqual(summary.results[0].dest_row_count, 3)
+        con = duckdb.connect(output, read_only=True)
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM person").fetchone()[0], 3)
+        finally:
+            con.close()
+
+    def test_duckdb_memory_limit_and_temp_directory_are_applied(self):
+        client = FakeBigQueryClient()
+        client.add_table("person", _person_table())
+        temp_dir = str(Path(self.tmpdir.name) / "spill")
+
+        export_dataset_to_duckdb(
+            client, self.datasets, self._output_path(), tables=["person"], bqstorage_client=None,
+            duckdb_memory_limit="500MB", duckdb_temp_directory=temp_dir,
+        )
+
+        self.assertTrue(Path(temp_dir).is_dir())
+
+    def test_transient_errors_are_retried(self):
+        client = FakeBigQueryClient()
+        client.add_table("person", _person_table())
+        original_list_rows = client.list_rows
+        call_count = {"n": 0}
+
+        def _flaky_list_rows(table_ref, page_size=100_000):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise OSError("simulated DNS resolution failure")
+            return original_list_rows(table_ref, page_size)
+
+        client.list_rows = _flaky_list_rows
+
+        summary = export_dataset_to_duckdb(
+            client, self.datasets, self._output_path(), tables=["person"],
+            bqstorage_client=None, max_retries=3, retry_base_delay=0.01,
+        )
+        self.assertTrue(summary.all_verified)
+        self.assertEqual(call_count["n"], 2)
+
+    def test_retries_exhausted_raises(self):
+        client = FakeBigQueryClient()
+        client.add_table("person", _person_table())
+
+        def _always_fail(table_ref, page_size=100_000):
+            raise OSError("simulated DNS resolution failure")
+
+        client.list_rows = _always_fail
+
+        with self.assertRaises(OSError):
+            export_dataset_to_duckdb(
+                client, self.datasets, self._output_path(), tables=["person"],
+                bqstorage_client=None, max_retries=2, retry_base_delay=0.01,
+            )
 
     def test_rejects_unsafe_identifiers(self):
         client = FakeBigQueryClient()

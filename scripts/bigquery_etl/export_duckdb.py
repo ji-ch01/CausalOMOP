@@ -19,6 +19,11 @@ This is a standalone ETL tool (like `scripts/snuh_etl`): no import from
 `causal/`, run directly with:
 
     python -m scripts.bigquery_etl.export_duckdb data/mimiciv_omop.duckdb
+
+Full-CDM exports can take hours, so this is built to survive a crash: each
+table retries transient network/auth errors with backoff, and re-running the
+exact same command against the same output file resumes by skipping tables
+that already made it in (pass --overwrite to force a full redo instead).
 """
 
 from __future__ import annotations
@@ -27,13 +32,56 @@ import argparse
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from scripts.bigquery_etl.config import BigQueryDatasets
 
 logger = logging.getLogger(__name__)
+
+# Exporting the full MIMIC-IV OMOP CDM can take hours; a machine sleeping or a
+# network blip mid-export breaks DNS resolution / the TLS connection for OAuth
+# token refresh long enough that the underlying library's own internal retry
+# (a few minutes) gives up and raises. Retry those transient failures at the
+# per-table level instead of letting one blip kill an entire run's progress.
+# `OSError` alone covers most of it -- `ssl.SSLError` and every
+# `requests.exceptions.*` (ConnectionError, SSLError, Timeout, ...) subclass
+# it -- but google-auth and grpc define their own exception hierarchies that
+# do not, so those are added explicitly when the packages are installed.
+_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (OSError,)
+
+try:
+    from google.api_core import exceptions as _gax_exceptions
+
+    _TRANSIENT_EXCEPTIONS += (
+        _gax_exceptions.RetryError,
+        _gax_exceptions.ServiceUnavailable,
+        _gax_exceptions.DeadlineExceeded,
+        _gax_exceptions.TooManyRequests,
+    )
+except ImportError:
+    pass
+
+try:
+    from google.auth import exceptions as _gauth_exceptions
+
+    _TRANSIENT_EXCEPTIONS += (_gauth_exceptions.TransportError, _gauth_exceptions.RefreshError)
+except ImportError:
+    pass
+
+try:
+    import grpc
+
+    _TRANSIENT_EXCEPTIONS += (grpc.RpcError,)
+except ImportError:
+    pass
+
+# Force an explicit checkpoint after this many rows within one table, so a
+# huge table's WAL never accumulates more than this much unflushed data
+# before DuckDB has to reconcile it -- see `_write_table`.
+_CHECKPOINT_EVERY_ROWS = 1_000_000
 
 # Schema/table names are spliced directly into DDL strings below (DuckDB's
 # Python driver has no identifier-binding parameter); restrict them to a safe
@@ -163,12 +211,32 @@ def _source_row_count(client: Any, table_ref: str) -> int:
     return int(rows[0].n) if rows else 0
 
 
+def _qualified(schema: str, table: str) -> str:
+    return f'"{schema}"."{table}"' if schema != "main" else f'"{table}"'
+
+
 def _table_exists(con: Any, schema: str, table: str) -> bool:
     result = con.execute(
         "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
         [schema, table],
     ).fetchone()
     return result is not None
+
+
+def _with_retries(func: Callable[[], Any], *, max_retries: int, base_delay: float, description: str) -> Any:
+    """Call `func`, retrying transient network/auth errors with exponential backoff."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func()
+        except _TRANSIENT_EXCEPTIONS as exc:
+            if attempt == max_retries:
+                raise
+            delay = min(base_delay * (2 ** (attempt - 1)), 300.0)
+            logger.warning(
+                "Transient error %s (attempt %d/%d): %s -- retrying in %.0fs",
+                description, attempt, max_retries, exc, delay,
+            )
+            time.sleep(delay)
 
 
 def _write_table(
@@ -179,9 +247,23 @@ def _write_table(
     batches: Iterable["pyarrow.RecordBatch"],  # noqa: F821
     overwrite: bool,
 ) -> int:
+    """Write `batches` to `schema.table`, one batch (and DuckDB transaction) at a time.
+
+    A single `CREATE TABLE ... AS SELECT * FROM reader` spanning the whole
+    lazy batch stream keeps the entire table in one uncommitted transaction;
+    for the largest OMOP tables (e.g. `measurement`, tens/hundreds of
+    millions of rows) that accumulates enough buffer-manager memory to raise
+    DuckDB's `Out of Memory Error: Allocation failure`. Committing per batch
+    bounds a single INSERT's memory, but on a RAM-constrained machine even
+    DuckDB's own automatic WAL checkpoint -- triggered once enough
+    uncheckpointed inserts pile up -- can itself OOM if it is left to
+    reconcile many accumulated batches at once. Checkpointing explicitly
+    every `_CHECKPOINT_EVERY_ROWS` rows keeps each checkpoint's own working
+    set small and predictable instead of leaving the threshold to chance.
+    """
     import pyarrow as pa
 
-    qualified = f'"{schema}"."{table}"' if schema != "main" else f'"{table}"'
+    qualified = _qualified(schema, table)
     if schema != "main":
         con.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
     if _table_exists(con, schema, table):
@@ -191,8 +273,24 @@ def _write_table(
             )
         con.execute(f"DROP TABLE {qualified}")
 
-    reader = pa.RecordBatchReader.from_batches(arrow_schema, batches)
-    con.execute(f"CREATE TABLE {qualified} AS SELECT * FROM reader")
+    created = False
+    rows_since_checkpoint = 0
+    for batch in batches:
+        reader = pa.RecordBatchReader.from_batches(arrow_schema, [batch])
+        if created:
+            con.execute(f"INSERT INTO {qualified} SELECT * FROM reader")
+        else:
+            con.execute(f"CREATE TABLE {qualified} AS SELECT * FROM reader")
+            created = True
+        rows_since_checkpoint += batch.num_rows
+        if rows_since_checkpoint >= _CHECKPOINT_EVERY_ROWS:
+            con.execute("CHECKPOINT")
+            rows_since_checkpoint = 0
+    if not created:
+        reader = pa.RecordBatchReader.from_batches(arrow_schema, [])
+        con.execute(f"CREATE TABLE {qualified} AS SELECT * FROM reader")
+
+    con.execute("CHECKPOINT")
     return con.execute(f"SELECT COUNT(*) FROM {qualified}").fetchone()[0]
 
 
@@ -230,6 +328,10 @@ def export_dataset_to_duckdb(
     batch_size: int = 100_000,
     verify_row_counts: bool = True,
     overwrite: bool = False,
+    max_retries: int = 5,
+    retry_base_delay: float = 30.0,
+    duckdb_memory_limit: str | None = None,
+    duckdb_temp_directory: str | None = None,
     bqstorage_client: Any = "auto",
 ) -> ExportSummary:
     """Export `tables` (default: every table in the dataset) to a local DuckDB file.
@@ -250,7 +352,24 @@ def export_dataset_to_duckdb(
             (BigQuery optimizes a bare `COUNT(*)` to a metadata read, so this
             does not bill query bytes) and record any mismatch.
         overwrite: replace tables that already exist in the output file
-            instead of raising.
+            instead of skipping them. Default is resume behavior: a table
+            already present in `output_path` (e.g. left over from a run that
+            crashed partway through) is treated as already exported and
+            skipped, so re-running the same command after a crash resumes
+            from the failure point instead of redoing the whole export.
+        max_retries: per-table retry budget for transient network/auth
+            errors (e.g. a machine sleeping mid-export breaks DNS resolution
+            for OAuth token refresh). Uses exponential backoff, capped at 5
+            minutes between attempts.
+        retry_base_delay: base delay in seconds before the first retry.
+        duckdb_memory_limit: DuckDB `memory_limit` PRAGMA value (e.g.
+            `"3GB"`). DuckDB otherwise defaults to ~80% of detected system
+            RAM, which on a machine with little free memory to begin with
+            can still be enough to trigger an out-of-memory error during a
+            large table's checkpoint; setting an explicit, conservative
+            limit here keeps DuckDB inside a known-safe budget.
+        duckdb_temp_directory: DuckDB `temp_directory` PRAGMA value, a
+            filesystem path DuckDB may spill to when over `memory_limit`.
         bqstorage_client: pass an existing `BigQueryReadClient` to reuse one
             across calls, `None` to force the slower REST fallback, or leave
             "auto" to create one if `google-cloud-bigquery-storage` is
@@ -268,14 +387,71 @@ def export_dataset_to_duckdb(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(output_path))
+    if duckdb_memory_limit is not None:
+        con.execute("PRAGMA memory_limit=?", [duckdb_memory_limit])
+    if duckdb_temp_directory is not None:
+        Path(duckdb_temp_directory).mkdir(parents=True, exist_ok=True)
+        con.execute("PRAGMA temp_directory=?", [duckdb_temp_directory])
     results: list[TableExportResult] = []
     try:
         for table in resolved_tables:
             table_ref = f"{dataset_fqn}.{table}"
+            table_present = not overwrite and _table_exists(con, schema, table)
+
+            # Chunked writes (see `_write_table`) mean a crash mid-table can leave
+            # a partially-populated table behind, so presence alone no longer
+            # implies completeness -- verify the row count matches before
+            # trusting a resume-skip; a mismatch means re-export it.
+            if table_present and verify_row_counts:
+                dest_count = con.execute(f"SELECT COUNT(*) FROM {_qualified(schema, table)}").fetchone()[0]
+                source_count = _with_retries(
+                    lambda: _source_row_count(client, table_ref),
+                    max_retries=max_retries, base_delay=retry_base_delay,
+                    description=f"counting {table_ref}",
+                )
+                if source_count == dest_count:
+                    logger.info(
+                        "Resuming: %s.%s already complete (%d rows), skipping re-fetch",
+                        schema, table, dest_count,
+                    )
+                    results.append(
+                        TableExportResult(table=table, source_row_count=source_count, dest_row_count=dest_count)
+                    )
+                    continue
+                logger.warning(
+                    "%s.%s exists but is incomplete (dest=%d, source=%d) -- likely a partial write "
+                    "from an earlier crash; re-exporting",
+                    schema, table, dest_count, source_count,
+                )
+            elif table_present:
+                logger.info(
+                    "Resuming: %s.%s already present in %s, skipping re-fetch (row-count verification "
+                    "is disabled, so completeness was not checked)",
+                    schema, table, output_path,
+                )
+                dest_count = con.execute(f"SELECT COUNT(*) FROM {_qualified(schema, table)}").fetchone()[0]
+                results.append(TableExportResult(table=table, source_row_count=dest_count, dest_row_count=dest_count))
+                continue
+
             logger.info("Exporting %s -> %s.%s", table_ref, schema, table)
-            arrow_schema, batches = _fetch_arrow_batches(client, table_ref, batch_size, storage_client)
-            dest_count = _write_table(con, schema, table, arrow_schema, batches, overwrite)
-            source_count = _source_row_count(client, table_ref) if verify_row_counts else dest_count
+
+            def _do_export() -> int:
+                arrow_schema, batches = _fetch_arrow_batches(client, table_ref, batch_size, storage_client)
+                return _write_table(con, schema, table, arrow_schema, batches, overwrite=True)
+
+            dest_count = _with_retries(
+                _do_export, max_retries=max_retries, base_delay=retry_base_delay,
+                description=f"exporting {table_ref}",
+            )
+            source_count = (
+                _with_retries(
+                    lambda: _source_row_count(client, table_ref),
+                    max_retries=max_retries, base_delay=retry_base_delay,
+                    description=f"counting {table_ref}",
+                )
+                if verify_row_counts
+                else dest_count
+            )
             result = TableExportResult(table=table, source_row_count=source_count, dest_row_count=dest_count)
             if not result.verified:
                 logger.warning(
@@ -312,7 +488,27 @@ def main() -> int:
         "--no-verify", action="store_true", help="skip the per-table source/dest row-count check"
     )
     parser.add_argument(
-        "--overwrite", action="store_true", help="replace tables that already exist in the output file"
+        "--overwrite", action="store_true",
+        help=(
+            "replace tables that already exist in the output file, instead of the default "
+            "resume behavior (skip tables already present, e.g. after a crashed run)"
+        ),
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=5,
+        help="per-table retry budget for transient network/auth errors (default: 5)",
+    )
+    parser.add_argument(
+        "--memory-limit",
+        help=(
+            "DuckDB memory_limit PRAGMA (e.g. '3GB'); DuckDB otherwise defaults to ~80%% of "
+            "detected system RAM, which on a memory-constrained machine can still be enough "
+            "to OOM while checkpointing a large table. Recommended if exports OOM."
+        ),
+    )
+    parser.add_argument(
+        "--temp-directory",
+        help="DuckDB temp_directory PRAGMA: a filesystem path DuckDB may spill to when over --memory-limit",
     )
     parser.add_argument(
         "--no-bqstorage", action="store_true",
@@ -338,6 +534,9 @@ def main() -> int:
         batch_size=args.batch_size,
         verify_row_counts=not args.no_verify,
         overwrite=args.overwrite,
+        max_retries=args.max_retries,
+        duckdb_memory_limit=args.memory_limit,
+        duckdb_temp_directory=args.temp_directory,
         bqstorage_client=None if args.no_bqstorage else "auto",
     )
     print(json.dumps(summary.to_dict(), indent=2))

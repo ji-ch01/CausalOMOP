@@ -82,6 +82,23 @@ class DuckDBGeneratedSqlExecutesTests(unittest.TestCase):
         sql = feasibility_sql(DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH)
         self.con.execute(sql).fetchall()
 
+    def test_vs_unexposed_sql_executes_without_a_comparator_concept(self):
+        # "vs_unexposed" (e.g. "aspirin vs no aspirin") has no real
+        # comparator exposure to query -- there is no OMOP concept for
+        # "absence of a drug" -- so an entirely empty/unset ConceptSetSpec
+        # must still produce SQL DuckDB can actually run.
+        no_comparator = ConceptSetSpec(domain="", concept_ids=())
+        feasibility = feasibility_sql(
+            DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=no_comparator, outcome=DEATH,
+            exposure_contrast="vs_unexposed",
+        )
+        self.con.execute(feasibility).fetchall()
+        cohort = analytic_cohort_sql(
+            DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=no_comparator, outcome=DEATH,
+            exposure_contrast="vs_unexposed",
+        )
+        self.con.execute(cohort).fetchall()
+
     def test_analytic_cohort_sql_with_covariate_executes(self):
         covariate = CovariateSpec(
             column_name="diabetes", domain="condition", concept_ids=(201820,),
@@ -103,6 +120,35 @@ class DuckDBGeneratedSqlExecutesTests(unittest.TestCase):
             "study1", DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH
         )
         self.con.execute(followup_sql).fetchall()
+
+    def test_analytic_cohort_sql_with_approved_censoring_executes(self):
+        sql = analytic_cohort_sql(
+            DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            censoring_definition_approved=True,
+        )
+        rows = self.con.execute(sql).fetchall()
+        self.assertEqual(rows, [])
+
+    def test_analytic_cohort_builder_positivity_and_missingness_sql_execute(self):
+        covariate = CovariateSpec(
+            column_name="diabetes", domain="condition", concept_ids=(201820,),
+            window_start_hours=-876000, window_end_hours=0, aggregation="presence_in_window",
+        )
+        value_covariate = CovariateSpec(
+            column_name="sofa", domain="measurement", concept_ids=(3004249,),
+            window_start_hours=-24, window_end_hours=0, aggregation="last_value_before_index",
+        )
+        builder = AnalyticCohortBuilder()
+        positivity_sql = builder.positivity_audit_sql(
+            "study1", DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            covariates=(covariate, value_covariate),
+        )
+        self.con.execute(positivity_sql).fetchall()
+        missingness_sql = builder.covariate_missingness_sql(
+            "study1", DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            covariates=(covariate, value_covariate),
+        )
+        self.con.execute(missingness_sql).fetchall()
 
     def test_all_mapping_audit_generators_execute(self):
         condition_plan = self._plan(_CONDITION_ENTRY)
