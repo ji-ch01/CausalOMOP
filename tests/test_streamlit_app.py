@@ -250,15 +250,20 @@ class OmcpLookupDispatchTests(unittest.TestCase):
 
 
 class ConceptOptionLabelTests(unittest.TestCase):
-    def test_includes_match_score_when_present(self):
+    """Leads with the human-readable name -- see `_concept_option_label`'s
+    docstring: relative match quality is conveyed by list order
+    (`_sorted_by_match_score` sorts candidates best-first before this is
+    ever called), not by spelling out the raw edit-distance score inline."""
+
+    def test_formats_name_and_concept_id(self):
         label = app._concept_option_label(
             {"concept_id": 123, "concept_name": "Sepsis", "match_score": 2.0}
         )
-        self.assertEqual(label, "123 — Sepsis (edit distance 2)")
+        self.assertEqual(label, "Sepsis — OMOP concept 123")
 
-    def test_omits_score_suffix_when_absent(self):
+    def test_formats_name_and_concept_id_without_a_score(self):
         label = app._concept_option_label({"concept_id": 123, "concept_name": "Sepsis"})
-        self.assertEqual(label, "123 — Sepsis")
+        self.assertEqual(label, "Sepsis — OMOP concept 123")
 
 
 class SortedByMatchScoreTests(unittest.TestCase):

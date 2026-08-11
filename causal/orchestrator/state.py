@@ -10,7 +10,14 @@ from typing import Any, Literal
 GateStatus = Literal["pending", "approved", "rejected", "provisional"]
 
 PHASES = (
-    "protocol_review",
+    # The first three phases mirror docs/causal_roadmap.md's proposed
+    # governance split of the earlier combined "protocol_review" phase --
+    # question/target-trial, DAG/clinical completeness, and identification/
+    # estimand are three separate scientific review decisions, each with its
+    # own gate (see REQUIRED_GATES in causal.orchestrator.workflow).
+    "target_trial_review",
+    "dag_review",
+    "identification_review",
     "concept_mapping",
     "feasibility",
     "analysis_plan",
@@ -47,7 +54,7 @@ class RunState:
     run_id: str
     study_id: str
     protocol_path: str
-    phase: str = "protocol_review"
+    phase: str = "target_trial_review"
     mode: Literal["exploratory", "final"] = "exploratory"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

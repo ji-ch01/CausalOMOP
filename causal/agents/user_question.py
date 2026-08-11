@@ -978,6 +978,7 @@ class UserQuestionHypothesisService:
         if not _STUDY_ID.fullmatch(normalized_study_id):
             raise ValueError("LLM produced an invalid study_id")
         protocol["study_id"] = normalized_study_id
+        self._validate_target_trial_estimand_fields(protocol.get("target_trial"))
         assumptions = protocol.get("assumptions_requiring_review", [])
         if not isinstance(assumptions, list) or not all(isinstance(item, str) for item in assumptions):
             raise ValueError("assumptions_requiring_review must be a list of strings")
@@ -991,6 +992,37 @@ class UserQuestionHypothesisService:
             "OMOP availability and concept mappings must be verified before execution",
         ]
         return protocol
+
+    @staticmethod
+    def _validate_target_trial_estimand_fields(target: object) -> None:
+        """Fail fast on the target-trial/estimand fields `causal.agents.
+        dag_identification.build_study_specification` needs to construct a
+        `roadmap.CausalStudySpecification` (see `docs/causal_roadmap.md`
+        stage 3) -- `causal.agents.hypothesis.HypothesisAgent.run` (called
+        immediately after this, in `generate`) already validates the
+        original `REQUIRED_TARGET_TRIAL_FIELDS`; these seven are additional
+        and were previously never checked anywhere in the LLM path, only at
+        gate-approval time much later. This is a presence/type check only --
+        e.g. `effect_measure` being one of the five accepted values is the
+        authoritative `CausalEstimand.__post_init__` check's job, not
+        duplicated here.
+        """
+        if not isinstance(target, dict):
+            raise ValueError("LLM response target_trial must be an object")
+        for field in (
+            "assignment_procedure", "censoring_strategy", "analysis_strategy",
+            "effect_measure", "treatment_value", "comparator_value",
+        ):
+            value = target.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"LLM produced an invalid target_trial.{field}")
+        criteria = target.get("eligibility_criteria")
+        if (
+            not isinstance(criteria, list)
+            or not criteria
+            or not all(isinstance(item, str) and item.strip() for item in criteria)
+        ):
+            raise ValueError("LLM produced an invalid target_trial.eligibility_criteria")
 
     @staticmethod
     def _pending_concept_sets(protocol: dict) -> dict:

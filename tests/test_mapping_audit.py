@@ -4,6 +4,7 @@ import unittest
 from causal.config import BigQueryDatasets
 from causal.mapping import audit
 from causal.mapping.registry import build_extraction_plan, variable_from_candidate_dag_entry
+from causal.queries.feasibility import ConceptSetSpec
 
 DATASETS = BigQueryDatasets()
 
@@ -94,6 +95,12 @@ class NoPatientIdentifiersTests(unittest.TestCase):
         sql = audit.incidence_rate_sql(DATASETS, _condition_plan())
         self._assert_aggregate_only(sql)
 
+    def test_concept_mapping_coverage_is_aggregate_only(self):
+        spec = ConceptSetSpec(domain="drug", concept_ids=(1112807,))
+        sql = audit.concept_mapping_coverage_sql(DATASETS, spec, "treatment")
+        self._assert_aggregate_only(sql)
+        self.assertNotIn("t.person_id", sql)
+
 
 class AuditSqlShapeTests(unittest.TestCase):
     def test_concept_row_and_person_counts_expands_descendants(self):
@@ -123,6 +130,20 @@ class AuditSqlShapeTests(unittest.TestCase):
         self.assertIn("root_only_concepts AS (", sql)
         self.assertIn("expanded_concepts AS (", sql)
         self.assertIn("concept_ancestor", sql)
+
+    def test_concept_mapping_coverage_rejects_unknown_domain(self):
+        spec = ConceptSetSpec(domain="not_a_domain", concept_ids=(1,))
+        with self.assertRaises(ValueError):
+            audit.concept_mapping_coverage_sql(DATASETS, spec, "treatment")
+
+    def test_concept_mapping_coverage_uses_domain_specific_source_column(self):
+        spec = ConceptSetSpec(domain="drug", concept_ids=(1112807,))
+        sql = audit.concept_mapping_coverage_sql(DATASETS, spec, "treatment")
+        self.assertIn("drug_source_value", sql)
+        self.assertIn("drug_concept_id = 0", sql)
+        self.assertIn("mapped_row_count", sql)
+        self.assertIn("unmapped_name_matched_row_count", sql)
+        self.assertIn("root_names AS (", sql)
 
 
 class CohortEntryDiagnosticsTests(unittest.TestCase):
@@ -191,6 +212,12 @@ class DuckDBAuditSqlTests(unittest.TestCase):
             "date_diff('day', observation_period_start_date, observation_period_end_date)", sql
         )
         self.assertIn("incidence_rate_per_1000_person_years", sql)
+
+    def test_concept_mapping_coverage_has_no_backticks(self):
+        spec = ConceptSetSpec(domain="drug", concept_ids=(1112807,))
+        sql = audit.concept_mapping_coverage_sql(DUCKDB_DATASETS, spec, "treatment")
+        self.assertNotIn("`", sql)
+        self.assertIn('"main"."drug_exposure"', sql)
 
 
 if __name__ == "__main__":

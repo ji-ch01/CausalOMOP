@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from causal.bigquery import BigQueryOMOPGateway, make_google_client
 from causal.config import BigQueryDatasets
 from causal.agents import HypothesisAgent, UserQuestionHypothesisService
-from causal.agents.dag_identification import review_dag
+from causal.agents.dag_identification import build_study_specification, review_dag
 from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.hypothesis import (
     DAG_VARIABLE_AGGREGATIONS,
@@ -25,6 +26,9 @@ from causal.llm import build_hypothesis_llm
 from causal.mcp_client import OMCPClient
 from causal.orchestrator import WorkflowManager
 from causal.roadmap import to_dagitty
+
+
+_ALLOW_DIRECT_TRANSPORT_ENV = "CAUSALOMOP_ALLOW_DIRECT_TRANSPORT"
 
 
 def _print_raw_llm_output(output: LLMRawOutput) -> None:
@@ -96,7 +100,13 @@ def main() -> int:
     workflow_status.add_argument("run_id")
     workflow_gate = workflow_sub.add_parser("gate")
     workflow_gate.add_argument("run_id")
-    workflow_gate.add_argument("gate", choices=("protocol", "clinical_mapping", "analysis_plan", "results"))
+    workflow_gate.add_argument(
+        "gate",
+        choices=(
+            "target_trial", "dag_review", "identification_estimand",
+            "clinical_mapping", "analysis_plan", "results",
+        ),
+    )
     workflow_gate.add_argument("status", choices=("approved", "rejected", "provisional"))
     workflow_gate.add_argument("--reviewer", required=True)
     workflow_gate.add_argument("--comment")
@@ -226,7 +236,14 @@ def main() -> int:
     workflow_feasibility = workflow_sub.add_parser("feasibility")
     workflow_feasibility.add_argument("run_id")
     workflow_feasibility.add_argument(
-        "--transport", choices=("mcp", "direct"), default="mcp"
+        "--transport",
+        choices=("mcp", "direct"),
+        default="mcp",
+        help=(
+            "'direct' bypasses OMCP's governed SQL surface entirely and is "
+            f"gated behind {_ALLOW_DIRECT_TRANSPORT_ENV}=1 (dev/test only; "
+            "see WorkflowManager.run_feasibility)"
+        ),
     )
     workflow_readiness = workflow_sub.add_parser(
         "execution-readiness", help="evaluate what the Execution Agent may run"
@@ -244,6 +261,16 @@ def main() -> int:
         "followup-audit", help="audit aggregate 28-day follow-up observability through OMCP"
     )
     workflow_followup_audit.add_argument("run_id")
+    workflow_positivity_audit = workflow_sub.add_parser(
+        "positivity-audit",
+        help="audit univariate treatment-arm overlap per reviewed baseline covariate through OMCP",
+    )
+    workflow_positivity_audit.add_argument("run_id")
+    workflow_covariate_missingness_audit = workflow_sub.add_parser(
+        "covariate-missingness-audit",
+        help="audit per-covariate missingness across the analytic cohort through OMCP",
+    )
+    workflow_covariate_missingness_audit.add_argument("run_id")
     workflow_mapping_audit = workflow_sub.add_parser(
         "mapping-audit",
         help="audit one registry.json variable's OMOP mapping (coverage/validity) through OMCP",
@@ -259,6 +286,12 @@ def main() -> int:
         "--highlight-adjustment-set", action="store_true",
         help="mark the computed minimum backdoor adjustment set as [adjusted] in the export",
     )
+    workflow_study_spec = workflow_sub.add_parser(
+        "study-spec",
+        help="build and print the validated CausalStudySpecification (question, target trial, "
+        "estimand, DAG) from protocol.json + hypothesis.json",
+    )
+    workflow_study_spec.add_argument("run_id")
     args = parser.parse_args()
     datasets = BigQueryDatasets.from_env()
 
@@ -408,6 +441,14 @@ def main() -> int:
                     datasets,
                 )
             else:
+                if os.environ.get(_ALLOW_DIRECT_TRANSPORT_ENV) != "1":
+                    print(
+                        "--transport direct bypasses OMCP's governed SQL "
+                        f"surface and is disabled unless {_ALLOW_DIRECT_TRANSPORT_ENV}=1 "
+                        "is set (dev/test only).",
+                        file=sys.stderr,
+                    )
+                    return 1
                 client = make_google_client(datasets.project)
                 state = manager.run_feasibility(
                     args.run_id, BigQueryOMOPGateway(datasets, client)
@@ -424,6 +465,18 @@ def main() -> int:
             )
         elif args.workflow_command == "followup-audit":
             state = manager.run_followup_audit_mcp(
+                args.run_id,
+                OMCPClient(datasets),
+                datasets,
+            )
+        elif args.workflow_command == "positivity-audit":
+            state = manager.run_positivity_audit_mcp(
+                args.run_id,
+                OMCPClient(datasets),
+                datasets,
+            )
+        elif args.workflow_command == "covariate-missingness-audit":
+            state = manager.run_covariate_missingness_audit_mcp(
                 args.run_id,
                 OMCPClient(datasets),
                 datasets,
@@ -494,6 +547,18 @@ def main() -> int:
                         f"sid_to_merged={entry['sid_to_merged']}",
                         file=sys.stderr,
                     )
+            return 0
+        elif args.workflow_command == "study-spec":
+            protocol_path = manager.runs_dir / args.run_id / "protocol.json"
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            hypothesis = HypothesisAgent().run(protocol)
+            spec = build_study_specification(protocol, hypothesis)
+            print(json.dumps(spec.to_dict(), indent=2))
+            print(
+                f"// identified_by_backdoor_adjustment={spec.identified_by_backdoor_adjustment} "
+                f"counterfactual_contrast={spec.estimand.counterfactual_contrast!r}",
+                file=sys.stderr,
+            )
             return 0
         else:
             state = manager.advance(args.run_id)

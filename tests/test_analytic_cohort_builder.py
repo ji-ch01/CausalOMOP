@@ -257,6 +257,103 @@ class AnalyticCohortBuilderTests(unittest.TestCase):
                 execution_allowed=False, covariates=(covariate,),
             )
 
+    def test_censoring_stays_null_when_not_approved(self):
+        sql, manifest = AnalyticCohortBuilder().build(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            execution_allowed=False,
+        )
+        self.assertIn("CAST(NULL AS INT64) AS censored", sql)
+        self.assertIn("censoring and observation-window completeness are not implemented", manifest.unresolved_issues)
+
+    def test_censoring_computed_when_approved(self):
+        sql, manifest = AnalyticCohortBuilder().build(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            execution_allowed=False, censoring_definition_approved=True,
+        )
+        self.assertNotIn("CAST(NULL AS INT64) AS censored", sql)
+        self.assertIn("observation_period_end_date", sql)
+        self.assertIn("death_date", sql)
+        self.assertNotIn(
+            "censoring and observation-window completeness are not implemented", manifest.unresolved_issues
+        )
+        self.assertIn("effect modifiers are not implemented in this cohort query", manifest.unresolved_issues)
+
+
+class PositivityAuditSqlTests(unittest.TestCase):
+    def test_reports_presence_covariate_overlap_by_arm(self):
+        covariate = CovariateSpec(
+            column_name="cov_diabetes",
+            domain="condition",
+            concept_ids=(201820,),
+            window_start_hours=-876000,
+            window_end_hours=0,
+            aggregation="presence_in_window",
+        )
+        sql = AnalyticCohortBuilder().positivity_audit_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            covariates=(covariate,),
+        )
+        self.assertIn("COUNTIF(A = 1 AND cov_diabetes > 0) AS cov_diabetes_treated_present", sql)
+        self.assertIn("COUNTIF(A = 0 AND cov_diabetes > 0) AS cov_diabetes_comparator_present", sql)
+        self.assertIn("COUNTIF(A = 1) AS treated_persons", sql)
+        self.assertNotIn("SELECT *", sql.upper())
+
+    def test_reports_value_covariate_range_by_arm(self):
+        covariate = CovariateSpec(
+            column_name="cov_lactate",
+            domain="measurement",
+            concept_ids=(3004249,),
+            window_start_hours=-24,
+            window_end_hours=0,
+            aggregation="mean_in_window",
+        )
+        sql = AnalyticCohortBuilder().positivity_audit_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            covariates=(covariate,),
+        )
+        self.assertIn("MIN(IF(A = 1, cov_lactate, NULL)) AS cov_lactate_treated_min", sql)
+        self.assertIn("MAX(IF(A = 0, cov_lactate, NULL)) AS cov_lactate_comparator_max", sql)
+        self.assertNotIn("cov_lactate_treated_present", sql)
+
+    def test_no_covariates_still_reports_arm_counts(self):
+        sql = AnalyticCohortBuilder().positivity_audit_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+        )
+        self.assertIn("COUNT(*) AS cohort_persons", sql)
+        self.assertIn("COUNTIF(A = 1) AS treated_persons", sql)
+
+
+class CovariateMissingnessSqlTests(unittest.TestCase):
+    def test_reports_missing_count_per_covariate(self):
+        covariate = CovariateSpec(
+            column_name="cov_sofa_score",
+            domain="measurement",
+            concept_ids=(3004249,),
+            window_start_hours=-24,
+            window_end_hours=0,
+            aggregation="last_value_before_index",
+        )
+        sql = AnalyticCohortBuilder().covariate_missingness_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            covariates=(covariate,),
+        )
+        self.assertIn("COUNTIF(cov_sofa_score IS NULL) AS cov_sofa_score_missing", sql)
+        self.assertIn("COUNT(*) AS cohort_persons", sql)
+        self.assertNotIn("SELECT *", sql.upper())
+
+    def test_no_covariates_still_returns_cohort_count(self):
+        sql = AnalyticCohortBuilder().covariate_missingness_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+        )
+        self.assertIn("COUNT(*) AS cohort_persons", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

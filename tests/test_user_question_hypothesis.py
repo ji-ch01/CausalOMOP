@@ -102,6 +102,13 @@ def valid_response():
             "follow_up_days": 28,
             "primary_estimand": "ATE",
             "secondary_estimands": [],
+            "eligibility_criteria": ["adult", "meets trial eligibility"],
+            "assignment_procedure": "Emulated baseline assignment",
+            "censoring_strategy": "Administrative censoring at end of follow-up",
+            "analysis_strategy": "Intention-to-treat analogue",
+            "effect_measure": "risk_difference",
+            "treatment_value": "treatment_a",
+            "comparator_value": "treatment_b",
         },
         "literature_search": {
             "population_terms": ["critical illness"],

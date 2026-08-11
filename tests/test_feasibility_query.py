@@ -1,7 +1,7 @@
 import unittest
 
 from causal.config import BigQueryDatasets
-from causal.queries import ConceptSetSpec, feasibility_sql
+from causal.queries import ConceptSetSpec, analytic_cohort_sql, feasibility_sql
 
 SEPSIS = ConceptSetSpec(domain="condition", concept_ids=(132797,))
 ALBUMIN = ConceptSetSpec(domain="drug", concept_ids=(1,))
@@ -70,6 +70,61 @@ class FeasibilityQueryTests(unittest.TestCase):
         )
         self.assertIn("care_site_name IN", sql)
         self.assertIn("Medical Intensive Care Unit (MICU)", sql)
+
+    def test_rejects_unknown_exposure_contrast(self):
+        with self.assertRaises(ValueError):
+            feasibility_sql(
+                BigQueryDatasets(),
+                population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                exposure_contrast="not_a_real_mode",
+            )
+
+
+class VsUnexposedExposureContrastTests(unittest.TestCase):
+    """"vs_unexposed" (e.g. "aspirin vs no aspirin"): there is no OMOP
+    concept for "absence of a drug", so `comparator` must not be required to
+    resolve to one -- unlike every other exposure_contrast, where an empty
+    concept set is rejected (`test_rejects_unmapped_concept_ids` above)."""
+
+    NO_COMPARATOR = ConceptSetSpec(domain="", concept_ids=())
+
+    def test_feasibility_sql_does_not_require_a_comparator_concept(self):
+        sql = feasibility_sql(
+            BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=self.NO_COMPARATOR, outcome=DEATH,
+            exposure_contrast="vs_unexposed",
+        )
+        self.assertNotIn("comparator_concepts", sql)
+
+    def test_analytic_cohort_sql_does_not_require_a_comparator_concept(self):
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=self.NO_COMPARATOR, outcome=DEATH,
+            exposure_contrast="vs_unexposed",
+        )
+        self.assertNotIn("comparator_concepts", sql)
+
+    def test_analytic_cohort_sql_has_no_inclusion_filter(self):
+        # Every other mode filters the cohort with a WHERE clause on
+        # has_treatment/has_comparator; "vs_unexposed" keeps everyone
+        # eligible, split into A=1/A=0 by treatment alone.
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=self.NO_COMPARATOR, outcome=DEATH,
+            exposure_contrast="vs_unexposed",
+        )
+        self.assertNotIn("WHERE a.has_comparator", sql)
+        self.assertNotIn("WHERE a.has_treatment != a.has_comparator", sql)
+
+    def test_a_real_comparator_still_works_if_one_happens_to_be_mapped(self):
+        # A reviewer picking "vs_unexposed" is not forced to leave comparator
+        # unmapped -- the mode just does not require it.
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            exposure_contrast="add_on",
+        )
+        self.assertIn("comparator_concepts", sql)
 
 
 DUCKDB_DATASETS = BigQueryDatasets(backend="duckdb", duckdb_path="data/mimiciv_omop.duckdb", duckdb_schema="main")

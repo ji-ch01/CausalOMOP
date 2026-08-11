@@ -23,14 +23,16 @@ from causal.agents import (
     QueryValidationAgent,
     analysis_plan_blockers,
 )
-from causal.agents.dag_identification import assess_identification, review_dag
+from causal.agents.dag_identification import assess_identification, build_study_specification, review_dag
 from causal.agents.hypothesis import DAG_VARIABLE_DOMAINS, DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
 from causal.agents.user_question import GeneratedHypothesis
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
+from causal.roadmap import CausalQuestion, TargetTrialProtocol
 from causal.data_builder import AnalyticCohortBuilder
 from causal.mapping.audit import (
     approved_concepts_missing_from_data_sql,
+    concept_mapping_coverage_sql,
     concept_row_and_person_counts_sql,
     incidence_rate_sql,
     index_event_breakdown_sql,
@@ -61,11 +63,46 @@ from causal.queries import (
 QUERY_ROLES = ("population", "treatment", "comparator", "outcome")
 
 REQUIRED_GATES = {
-    "protocol_review": "protocol",
+    "target_trial_review": "target_trial",
+    "dag_review": "dag_review",
+    "identification_review": "identification_estimand",
     "concept_mapping": "clinical_mapping",
     "analysis_plan": "analysis_plan",
     "results_review": "results",
 }
+
+_ALL_GATE_NAMES = (
+    "target_trial", "dag_review", "identification_estimand", "clinical_mapping", "analysis_plan", "results",
+)
+
+# Runs created before `protocol_review` was split into target_trial_review /
+# dag_review / identification_review (docs/causal_roadmap.md's governance
+# split) have a `state.json` with a single "protocol" gate and a
+# "protocol_review" phase instead of the three names above. Loading one of
+# those runs under the current schema would otherwise KeyError the first
+# time anything indexes `state.gates["target_trial"]` etc.
+_LEGACY_PROTOCOL_GATE = "protocol"
+_LEGACY_PROTOCOL_PHASE = "protocol_review"
+_LEGACY_PROTOCOL_SPLIT_GATES = ("target_trial", "dag_review", "identification_estimand")
+
+
+def _migrate_legacy_protocol_gate(state: RunState) -> None:
+    legacy_gate = state.gates.pop(_LEGACY_PROTOCOL_GATE, None)
+    for name in _LEGACY_PROTOCOL_SPLIT_GATES:
+        if name in state.gates:
+            continue
+        if legacy_gate is not None:
+            state.gates[name] = ApprovalGate(
+                name,
+                status=legacy_gate.status,
+                reviewer=legacy_gate.reviewer,
+                comment=legacy_gate.comment,
+                decided_at=legacy_gate.decided_at,
+            )
+        else:
+            state.gates[name] = ApprovalGate(name)
+    if state.phase == _LEGACY_PROTOCOL_PHASE:
+        state.phase = "target_trial_review"
 
 # How long a stale `.review.lock` file (left behind by a crashed/killed
 # process -- this is advisory, not OS-enforced) is trusted before a new
@@ -177,7 +214,7 @@ _ROLE_FALLBACK_ROLES: dict[str, tuple[str, ...]] = {
 
 
 def _resolve_concept_spec(
-    by_role: dict[str, list[dict]], role: str, *fallback_roles: str
+    by_role: dict[str, list[dict]], role: str, exposure_contrast: str, *fallback_roles: str
 ) -> ConceptSetSpec | None:
     """Resolve one query role's `ConceptSetSpec` from `concept_sets`, by role.
 
@@ -189,6 +226,14 @@ def _resolve_concept_spec(
     role but is not yet approved raises immediately instead of falling
     through to a fallback role or a default -- that would silently bypass
     the approval gate rather than genuinely finding no entry.
+
+    Exception: `role="comparator"` under `exposure_contrast="vs_unexposed"`
+    (see `causal.queries.feasibility.EXPOSURE_CONTRASTS`) never raises here,
+    approved or not -- there is no OMOP concept for "absence of a drug" (e.g.
+    "aspirin vs no aspirin"), so an unapproved/domain-less/`no_standard_
+    concept` entry is that design's correct, final state, not a blocker.
+    `_cohort_ctes` never reads this spec's `domain`/`concept_ids` in that
+    mode, so whatever is (or isn't) recorded is safe to pass through as-is.
     """
     for candidate_role in (role, *fallback_roles):
         entries = by_role.get(candidate_role, [])
@@ -200,13 +245,17 @@ def _resolve_concept_spec(
         if len(entries) == 1:
             entry = entries[0]
             domain = entry.get("domain")
-            if entry.get("status") != "approved" or not isinstance(domain, str) or not domain:
+            domain_str = domain if isinstance(domain, str) else ""
+            if candidate_role == "comparator" and exposure_contrast == "vs_unexposed":
+                concept_ids = tuple(int(value) for value in entry.get("concept_ids", ()))
+                return ConceptSetSpec(domain=domain_str, concept_ids=concept_ids)
+            if entry.get("status") != "approved" or not domain_str:
                 raise RuntimeError(
                     f"concept_sets role '{candidate_role}' must be approved with a domain "
                     "before a query can be generated for it"
                 )
             concept_ids = tuple(int(value) for value in entry.get("concept_ids", ()))
-            return ConceptSetSpec(domain=domain, concept_ids=concept_ids)
+            return ConceptSetSpec(domain=domain_str, concept_ids=concept_ids)
     return None
 
 
@@ -238,10 +287,11 @@ def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
         if isinstance(definition, dict) and isinstance(definition.get("role"), str):
             by_role[definition["role"]].append(definition)
 
+    exposure_contrast = _load_exposure_contrast(protocol)
     specs: dict[str, ConceptSetSpec] = {}
     for role in QUERY_ROLES:
         fallback_roles = _ROLE_FALLBACK_ROLES.get(role, ())
-        spec = _resolve_concept_spec(by_role, role, *fallback_roles)
+        spec = _resolve_concept_spec(by_role, role, exposure_contrast, *fallback_roles)
         if spec is None:
             if role == "outcome":
                 # No role="outcome" concept set declared at all: the same
@@ -251,6 +301,11 @@ def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
                 # sync so both readers of `concept_sets` agree on what an
                 # omitted outcome role means.
                 spec = ConceptSetSpec(domain="death", concept_ids=())
+            elif role == "comparator" and exposure_contrast == "vs_unexposed":
+                # No comparator entry declared at all -- fine under this
+                # design (see `_resolve_concept_spec`'s docstring): there is
+                # nothing to map in the first place.
+                spec = ConceptSetSpec(domain="", concept_ids=())
             else:
                 wanted = f"role {role!r}" + (f" or {fallback_roles[0]!r}" if fallback_roles else "")
                 raise RuntimeError(f"concept_sets requires an approved entry with {wanted}")
@@ -272,8 +327,10 @@ def _load_exposure_contrast(protocol: dict) -> str:
     """Read the human-approved treatment/comparator inclusion semantics for
     the analytic cohort (see `causal.queries.feasibility.EXPOSURE_CONTRASTS`).
     Kept separate from `_load_query_settings` because `feasibility_sql`
-    reports all exposure combinations unfiltered and does not take this
-    parameter -- only `AnalyticCohortBuilder`'s person-level cohort does.
+    reports all exposure combinations unfiltered and takes this only to know
+    whether `comparator` needs to resolve to a real OMOP concept at all
+    (`"vs_unexposed"` does not) -- `AnalyticCohortBuilder`'s person-level
+    cohort is the one that actually filters by it.
     """
     settings = protocol.get("query_settings")
     if not isinstance(settings, dict):
@@ -282,6 +339,80 @@ def _load_exposure_contrast(protocol: dict) -> str:
     if value not in EXPOSURE_CONTRASTS:
         raise RuntimeError(f"query_settings.exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
     return value
+
+
+def _load_censoring_definition_approved(protocol: dict) -> bool:
+    """Whether a reviewer has approved the real per-row `censored` column
+    (see `causal.queries.feasibility.analytic_cohort_sql` and
+    `WorkflowManager.approve_censoring_definition`). Defaults to `False`,
+    same as `analytic_cohort_sql`'s own default -- an unreviewed run keeps
+    `censored` as `NULL`, unchanged from before this flag existed."""
+    settings = protocol.get("query_settings")
+    if not isinstance(settings, dict):
+        return False
+    return bool(settings.get("censoring_definition_approved", False))
+
+
+# A concept whose text plainly appears in this many *unmapped* (concept_id=0)
+# source_value rows, while barely appearing among *mapped* rows, is very
+# likely present in the source data but never mapped by this OMOP build's
+# ETL -- the pattern that first surfaced MIMIC-IV/OMOP's near-total oral-drug
+# gap (RxNorm "Aspirin" matched 3 drug_exposure rows database-wide against
+# ~180K unmapped rows whose drug_source_value read "Aspirin ..."). Below this
+# row-count floor there just isn't enough text evidence either way to
+# conclude anything -- a genuinely rare but well-mapped concept can have very
+# few rows on both sides -- so the gate stays silent.
+_MAPPING_COVERAGE_MIN_EVIDENCE_ROWS = 50
+# Coverage = mapped / (mapped + unmapped_name_matched). Below this floor the
+# vast majority of a concept's real-world occurrences in this dataset are
+# unmapped, so a cohort built on it would silently undercount this role
+# rather than fail loudly -- see `_check_mapping_coverage`.
+_MAPPING_COVERAGE_MIN_RATIO = 0.05
+
+
+def _mapping_coverage_roles(
+    specs: dict[str, ConceptSetSpec], exposure_contrast: str
+) -> list[tuple[str, ConceptSetSpec]]:
+    """Which query roles the mapping-coverage gate should check: every role
+    whose spec actually resolves to a concept-based domain with concept_ids
+    to query. Excludes `outcome` when it defaults to the `death` table (no
+    concept_ids involved) and `comparator` under `"vs_unexposed"` (see
+    `causal.queries.feasibility.EXPOSURE_CONTRASTS`; there is no OMOP concept
+    for "absence of a drug" to check coverage for)."""
+    roles: list[tuple[str, ConceptSetSpec]] = []
+    for role in QUERY_ROLES:
+        if role == "comparator" and exposure_contrast == "vs_unexposed":
+            continue
+        spec = specs.get(role)
+        if spec is not None and spec.domain in DOMAIN_TABLES and spec.concept_ids:
+            roles.append((role, spec))
+    return roles
+
+
+def _check_mapping_coverage(role: str, spec: ConceptSetSpec, counts: dict[str, int]) -> None:
+    """Raise if `role`'s concept set looks unmapped in this OMOP build rather
+    than genuinely rare (see `_MAPPING_COVERAGE_MIN_EVIDENCE_ROWS`/
+    `_MAPPING_COVERAGE_MIN_RATIO` for the thresholds and their rationale).
+    Blocking here, before any cohort SQL runs, turns a silent zero-patient
+    cohort into a clear, actionable error."""
+    mapped = int(counts.get("mapped_row_count") or 0)
+    unmapped = int(counts.get("unmapped_name_matched_row_count") or 0)
+    total_evidence = mapped + unmapped
+    if total_evidence < _MAPPING_COVERAGE_MIN_EVIDENCE_ROWS:
+        return
+    coverage = mapped / total_evidence
+    if coverage >= _MAPPING_COVERAGE_MIN_RATIO:
+        return
+    raise RuntimeError(
+        f"Mapping coverage gate failed for role '{role}' (concept_ids={list(spec.concept_ids)}): "
+        f"only {mapped} row(s) in this OMOP build carry one of this concept's mapped standard "
+        f"concept_ids, versus {unmapped} unmapped row(s) (concept_id=0) whose source_value text "
+        f"still matches this concept's own vocabulary name ({coverage:.2%} coverage, below the "
+        f"{_MAPPING_COVERAGE_MIN_RATIO:.0%} floor). This role is very likely present in the source "
+        "data but not mapped by this dataset's ETL -- a cohort built on it would silently "
+        "undercount rather than correctly report zero. Pick a different, better-mapped concept for "
+        "this role, or a different data source, before continuing."
+    )
 
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -437,12 +568,7 @@ class WorkflowManager:
             study_id=study_id,
             protocol_path=str(snapshot),
             mode=mode,
-            gates={
-                "protocol": ApprovalGate("protocol"),
-                "clinical_mapping": ApprovalGate("clinical_mapping"),
-                "analysis_plan": ApprovalGate("analysis_plan"),
-                "results": ApprovalGate("results"),
-            },
+            gates={name: ApprovalGate(name) for name in _ALL_GATE_NAMES},
             artifacts=["protocol.json"],
         )
         state.record("run_started", f"mode={mode}")
@@ -489,12 +615,7 @@ class WorkflowManager:
             study_id=study_id,
             protocol_path=str(run_dir / "protocol.json"),
             mode=mode,
-            gates={
-                "protocol": ApprovalGate("protocol"),
-                "clinical_mapping": ApprovalGate("clinical_mapping"),
-                "analysis_plan": ApprovalGate("analysis_plan"),
-                "results": ApprovalGate("results"),
-            },
+            gates={name: ApprovalGate(name) for name in _ALL_GATE_NAMES},
             artifacts=["protocol.json", "hypothesis.json", "llm_outputs.json"],
         )
         state.record("run_started", f"mode={mode}; source=llm_draft")
@@ -509,7 +630,9 @@ class WorkflowManager:
         path = self._state_path(run_id)
         if not path.is_file():
             raise FileNotFoundError(f"Unknown run_id: {run_id}")
-        return RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        state = RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        _migrate_legacy_protocol_gate(state)
+        return state
 
     def save(self, state: RunState) -> None:
         path = self._state_path(state.run_id)
@@ -526,13 +649,20 @@ class WorkflowManager:
                 raise ValueError(f"Unknown gate: {gate}")
             if status not in {"approved", "rejected", "provisional"}:
                 raise ValueError("status must be approved, rejected, or provisional")
-            if gate == "protocol" and status == "approved":
+            if gate == "target_trial" and status == "approved":
+                self._block_if_target_trial_incomplete(run_id)
+            if gate == "dag_review" and status == "approved":
                 self._block_if_major_confounders_unresolved(run_id)
+            if gate == "identification_estimand" and status == "approved":
                 self._block_if_not_identified(run_id)
+                self._write_study_specification_if_hypothesis_exists(run_id)
             if gate == "analysis_plan" and status == "approved":
                 self._block_if_analysis_plan_incomplete(run_id)
             state.gates[gate].decide(status, reviewer, comment)  # type: ignore[arg-type]
             state.record("gate_decided", f"{gate}={status} by {reviewer}")
+            if gate == "identification_estimand" and status == "approved":
+                if "study_specification.json" not in state.artifacts:
+                    state.artifacts.append("study_specification.json")
             self.save(state)
         return state
 
@@ -613,8 +743,13 @@ class WorkflowManager:
 
     def run_hypothesis_agent(self, run_id: str) -> RunState:
         state = self.load(run_id)
-        if state.phase not in {"protocol_review", "concept_mapping"}:
-            raise RuntimeError("Hypothesis Agent can only run during protocol_review or concept_mapping")
+        if state.phase not in {
+            "target_trial_review", "dag_review", "identification_review", "concept_mapping",
+        }:
+            raise RuntimeError(
+                "Hypothesis Agent can only run during target_trial_review, dag_review, "
+                "identification_review, or concept_mapping"
+            )
         protocol_path = self.runs_dir / run_id / "protocol.json"
         protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
         self._write_hypothesis(run_id, protocol)
@@ -1279,12 +1414,52 @@ class WorkflowManager:
         self.save(state)
         return state
 
+    def _block_if_target_trial_incomplete(self, run_id: str) -> None:
+        """The `target_trial` gate (roadmap stage 1: question and target
+        trial) cannot be approved unless `protocol["target_trial"]`
+        constructs a valid `roadmap.CausalQuestion`/`TargetTrialProtocol` --
+        works directly off `protocol.json` alone, before the Hypothesis
+        Agent or any DAG stage has necessarily run, since target-trial
+        completeness is scientifically prior to drafting a DAG (see
+        `docs/causal_roadmap.md`'s normative stage order). Reuses those
+        dataclasses' own validation (see `causal.agents.dag_identification.
+        build_study_specification`, which does the same field mapping once
+        `hypothesis.json` exists, for the fuller `CausalStudySpecification`).
+        """
+        protocol_path = self.runs_dir / run_id / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        target = protocol.get("target_trial")
+        if not isinstance(target, dict):
+            raise ValueError("Cannot approve the target_trial gate: protocol.json has no target_trial object")
+        try:
+            CausalQuestion(
+                population=str(target.get("population", "")),
+                treatment=str(target.get("treatment", "")),
+                comparator=str(target.get("comparator", "")),
+                outcome=str(target.get("outcome", "")),
+            )
+            TargetTrialProtocol(
+                eligibility_criteria=tuple(str(item) for item in target.get("eligibility_criteria") or ()),
+                treatment_strategy=str(target.get("treatment", "")),
+                comparator_strategy=str(target.get("comparator", "")),
+                assignment_procedure=str(target.get("assignment_procedure") or ""),
+                time_zero=str(target.get("time_zero", "")),
+                grace_period_hours=target.get("grace_period_hours"),
+                follow_up_days=target.get("follow_up_days"),
+                outcome_definition=str(target.get("outcome", "")),
+                censoring_strategy=str(target.get("censoring_strategy") or ""),
+                analysis_strategy=str(target.get("analysis_strategy") or ""),
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Cannot approve the target_trial gate: {exc}") from exc
+
     def _block_if_major_confounders_unresolved(self, run_id: str) -> None:
-        """The DAG-approval gate ("protocol") cannot be approved while a major
-        confounder is still unresolved: the run may never have called the
-        Hypothesis Agent yet, so absence of hypothesis.json is not itself a
-        blocker here (protocol.json-only workflows never touch this gate's
-        clinical content). Once hypothesis.json exists, its
+        """The `dag_review` gate (roadmap stage 2: causal DAG and clinical
+        completeness) cannot be approved while a major confounder is still
+        unresolved: the run may never have called the Hypothesis Agent yet,
+        so absence of hypothesis.json is not itself a blocker here
+        (protocol.json-only workflows never touch this gate's clinical
+        content). Once hypothesis.json exists, its
         `unresolved_major_confounders` is authoritative.
         """
         hypothesis_path = self.runs_dir / run_id / "hypothesis.json"
@@ -1294,16 +1469,17 @@ class WorkflowManager:
         unresolved_major = hypothesis.get("unresolved_major_confounders") or []
         if unresolved_major:
             raise ValueError(
-                "Cannot approve the protocol/DAG gate while major confounders remain "
+                "Cannot approve the dag_review gate while major confounders remain "
                 f"unresolved: {', '.join(unresolved_major)}. Classify each one with a role and "
                 "rationale, or explicitly reject it with a reviewer and rationale."
             )
 
     def _block_if_not_identified(self, run_id: str) -> None:
-        """The DAG-approval gate ("protocol") cannot be approved while the
-        declared candidate_dag fails backdoor identification: the run may
-        never have called the Hypothesis Agent yet, so absence of
-        hypothesis.json is not itself a blocker here (mirrors
+        """The `identification_estimand` gate (roadmap stage 3:
+        identification and estimand) cannot be approved while the declared
+        candidate_dag fails backdoor identification: the run may never have
+        called the Hypothesis Agent yet, so absence of hypothesis.json is
+        not itself a blocker here (mirrors
         `_block_if_major_confounders_unresolved`). Once hypothesis.json
         exists, `assess_identification` is authoritative. This does not
         replace `_block_if_major_confounders_unresolved`: an empty
@@ -1327,10 +1503,40 @@ class WorkflowManager:
                 "(a classified confounder may be unobserved/latent)"
             )
             raise ValueError(
-                "Cannot approve the protocol/DAG gate: the declared causal DAG is not "
+                "Cannot approve the identification_estimand gate: the declared causal DAG is not "
                 f"identified by backdoor adjustment ({detail}). Run `workflow dag-export` "
                 "to inspect the graph, or reclassify/resolve the blocking variable."
             )
+
+    def _write_study_specification_if_hypothesis_exists(self, run_id: str) -> None:
+        """Build and persist `study_specification.json` (the validated
+        `roadmap.CausalStudySpecification` -- question, target trial,
+        estimand, DAG) when approving the `identification_estimand` gate.
+
+        Also acts as this gate's estimand-completeness check: `_block_if_
+        not_identified` above only checks backdoor identification, not
+        whether `CausalEstimand`/the rest of `TargetTrialProtocol` are
+        internally valid (e.g. `horizon_days == follow_up_days`) -- this is
+        the "wire CausalStudySpecification into the persistent gates"
+        roadmap milestone (docs/causal_roadmap.md), landing at the point
+        both the DAG and the target-trial content are already reviewed.
+        Absence of hypothesis.json is not a blocker here, mirroring
+        `_block_if_not_identified` -- nothing to build yet.
+        """
+        run_dir = self.runs_dir / run_id
+        hypothesis_path = run_dir / "hypothesis.json"
+        if not hypothesis_path.is_file():
+            return
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = HypothesisAgent().run(protocol)
+        try:
+            spec = build_study_specification(protocol, hypothesis)
+        except ValueError as exc:
+            raise ValueError(f"Cannot approve the identification_estimand gate: {exc}") from exc
+        spec_path = run_dir / "study_specification.json"
+        temporary = spec_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(spec.to_dict(), indent=2), encoding="utf-8")
+        temporary.replace(spec_path)
 
     def _write_hypothesis(self, run_id: str, protocol: dict) -> None:
         artifact = HypothesisAgent().run(protocol).to_dict()
@@ -1511,6 +1717,7 @@ class WorkflowManager:
         settings = _load_query_settings(protocol)
         exposure_contrast = _load_exposure_contrast(protocol)
         covariates = _load_covariate_specs(analysis_plan)
+        censoring_definition_approved = _load_censoring_definition_approved(protocol)
         sql, manifest = AnalyticCohortBuilder().build(
             state.study_id,
             datasets or BigQueryDatasets.from_env(),
@@ -1523,6 +1730,7 @@ class WorkflowManager:
             execution_allowed=bool(readiness["analytic_dataset_build_allowed"]),
             exposure_contrast=exposure_contrast,
             covariates=covariates,
+            censoring_definition_approved=censoring_definition_approved,
             **settings,
         )
         validation = QueryValidationAgent().run(sql, purpose="person_level_dataset")
@@ -1686,6 +1894,160 @@ class WorkflowManager:
         if "followup_audit.json" not in state.artifacts:
             state.artifacts.append("followup_audit.json")
         state.record("followup_audit_completed", "aggregate audit via OMCP")
+        self.save(state)
+        return state
+
+    def run_positivity_audit_mcp(
+        self,
+        run_id: str,
+        client: OMCPClient,
+        datasets: BigQueryDatasets,
+    ) -> RunState:
+        """Univariate treatment-arm overlap for every reviewed baseline
+        covariate (see `causal.data_builder.analytic.AnalyticCohortBuilder.
+        positivity_audit_sql` for the metric and its documented limits --
+        one covariate at a time, not the full joint adjustment set).
+        Requires `analysis_plan.json` (covariates come from there, via
+        `_load_covariate_specs`), unlike `run_cohort_profile_mcp`/
+        `run_followup_audit_mcp`, which only need population/treatment/
+        comparator/outcome and so can run earlier, in the `feasibility`
+        phase.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"analysis_plan", "execution"}:
+            raise RuntimeError("Positivity audit requires analysis_plan or execution phase")
+        self.run_execution_readiness(run_id)
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        # `run_execution_readiness` above already requires analysis_plan.json
+        # to exist, so it is guaranteed present here.
+        analysis_plan = json.loads((run_dir / "analysis_plan.json").read_text(encoding="utf-8"))
+        specs = _load_concept_specs(protocol)
+        settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
+        covariates = _load_covariate_specs(analysis_plan)
+        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
+        response = client.causal_select(
+            AnalyticCohortBuilder().positivity_audit_sql(
+                state.study_id,
+                datasets,
+                population=specs["population"],
+                treatment=specs["treatment"],
+                comparator=specs["comparator"],
+                outcome=specs["outcome"],
+                grace_period_hours=hypothesis["grace_period_hours"],
+                follow_up_days=hypothesis["follow_up_days"],
+                exposure_contrast=exposure_contrast,
+                covariates=covariates,
+                **settings,
+            ),
+            "aggregate_feasibility",
+            context,
+        )
+        rows = list(csv.DictReader(io.StringIO(response.text)))
+        if len(rows) != 1:
+            raise RuntimeError("OMCP positivity audit must return one aggregate row")
+        counts = {
+            key: (int(value) if "." not in value else float(value))
+            for key, value in rows[0].items()
+            if key and value not in (None, "")
+        }
+        artifact = {
+            "status": "aggregate_observability_audit_only",
+            "execution_transport": "omcp",
+            "causal_effect_estimated": False,
+            "patient_level_rows_returned": False,
+            "counts": counts,
+            "mcp_metadata": response.metadata,
+            "warnings": [
+                "Univariate overlap only -- does not check the full joint adjustment-set stratification.",
+                "A zero *_treated_present or *_comparator_present count is an unambiguous positivity "
+                "violation for that covariate; a non-zero count does not itself prove positivity holds.",
+                "Value-covariate min/mean/max is a distributional summary, not a stratified overlap check.",
+            ],
+        }
+        (run_dir / "positivity_audit.json").write_text(
+            json.dumps(artifact, indent=2), encoding="utf-8"
+        )
+        if "positivity_audit.json" not in state.artifacts:
+            state.artifacts.append("positivity_audit.json")
+        state.record("positivity_audit_completed", "aggregate audit via OMCP")
+        self.save(state)
+        return state
+
+    def run_covariate_missingness_audit_mcp(
+        self,
+        run_id: str,
+        client: OMCPClient,
+        datasets: BigQueryDatasets,
+    ) -> RunState:
+        """Per-reviewed-covariate missingness (see `causal.data_builder.
+        analytic.AnalyticCohortBuilder.covariate_missingness_sql`),
+        generalizing `run_cohort_profile_mcp`'s hardcoded age/gender/race-only
+        missingness to every covariate `analysis_plan.json` marks ready.
+        Same `analysis_plan.json` precondition as `run_positivity_audit_mcp`.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"analysis_plan", "execution"}:
+            raise RuntimeError("Covariate missingness audit requires analysis_plan or execution phase")
+        self.run_execution_readiness(run_id)
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        # `run_execution_readiness` above already requires analysis_plan.json
+        # to exist, so it is guaranteed present here.
+        analysis_plan = json.loads((run_dir / "analysis_plan.json").read_text(encoding="utf-8"))
+        specs = _load_concept_specs(protocol)
+        settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
+        covariates = _load_covariate_specs(analysis_plan)
+        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
+        response = client.causal_select(
+            AnalyticCohortBuilder().covariate_missingness_sql(
+                state.study_id,
+                datasets,
+                population=specs["population"],
+                treatment=specs["treatment"],
+                comparator=specs["comparator"],
+                outcome=specs["outcome"],
+                grace_period_hours=hypothesis["grace_period_hours"],
+                follow_up_days=hypothesis["follow_up_days"],
+                exposure_contrast=exposure_contrast,
+                covariates=covariates,
+                **settings,
+            ),
+            "aggregate_feasibility",
+            context,
+        )
+        rows = list(csv.DictReader(io.StringIO(response.text)))
+        if len(rows) != 1:
+            raise RuntimeError("OMCP covariate missingness audit must return one aggregate row")
+        counts = {
+            key: int(value) for key, value in rows[0].items()
+            if key and value not in (None, "")
+        }
+        artifact = {
+            "status": "aggregate_observability_audit_only",
+            "execution_transport": "omcp",
+            "causal_effect_estimated": False,
+            "patient_level_rows_returned": False,
+            "counts": counts,
+            "mcp_metadata": response.metadata,
+            "warnings": [
+                "Event-domain (condition/drug/procedure) covariates are coalesced to 0 and can never "
+                "be missing here by construction -- a nonzero *_missing count only applies to "
+                "measurement/observation covariates.",
+            ],
+        }
+        (run_dir / "covariate_missingness.json").write_text(
+            json.dumps(artifact, indent=2), encoding="utf-8"
+        )
+        if "covariate_missingness.json" not in state.artifacts:
+            state.artifacts.append("covariate_missingness.json")
+        state.record("covariate_missingness_audit_completed", "aggregate audit via OMCP")
         self.save(state)
         return state
 
@@ -1936,6 +2298,111 @@ class WorkflowManager:
         self.save(state)
         return report_path
 
+    def set_exposure_contrast(
+        self,
+        run_id: str,
+        exposure_contrast: str,
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's choice of treatment/comparator inclusion semantics
+        for this study's cohort queries (`protocol["query_settings"]
+        ["exposure_contrast"]`; see `causal.queries.feasibility.
+        EXPOSURE_CONTRASTS`).
+
+        This is a real modeling decision, not a query-engine detail --
+        `EXPOSURE_CONTRASTS`'s own comment warns that getting it wrong
+        silently changes who is in the cohort -- so it is explicitly
+        reviewer-set here rather than left to `_load_exposure_contrast`'s
+        `"add_on"` default, which every run got silently until this method
+        existed. Unlike `map_concept_set`/`review_covariate*`, this never
+        touches `hypothesis.json`: `query_settings` only feeds SQL
+        generation, not the DAG/identification artifact.
+        """
+        if exposure_contrast not in EXPOSURE_CONTRASTS:
+            raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            settings = protocol.get("query_settings")
+            settings = dict(settings) if isinstance(settings, dict) else {}
+            before = settings.get("exposure_contrast", "add_on")
+            settings["exposure_contrast"] = exposure_contrast
+            protocol["query_settings"] = settings
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+        detail = f"exposure_contrast: {before} -> {exposure_contrast} by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "exposure_contrast_set", detail,
+            changes={"before": before, "after": exposure_contrast},
+        )
+        self._invalidate_gate(state, "analysis_plan", "exposure_contrast changed")
+        self.save(state)
+        return state
+
+    def approve_censoring_definition(
+        self,
+        run_id: str,
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's approval of the real per-row `censored` column
+        (`protocol["query_settings"]["censoring_definition_approved"]`; see
+        `causal.queries.feasibility.analytic_cohort_sql`'s docstring for the
+        exact administrative-censoring definition this then turns on).
+
+        Requires `followup_audit.json` to already exist -- the same
+        aggregate nominal-completeness numbers this per-row definition
+        reuses -- so a reviewer approves this after having actually seen
+        them, not blind. Same shape as `set_exposure_contrast`: lock, load
+        `protocol.json`, flip the flag, atomic write, record, invalidate the
+        `analysis_plan` gate (a cohort built before this approval has a
+        different `censored` column than one built after).
+        """
+        run_dir = self.runs_dir / run_id
+        if not (run_dir / "followup_audit.json").is_file():
+            raise ValueError(
+                "Cannot approve the censoring definition before running the follow-up audit "
+                "(workflow followup-audit) -- review the nominal completeness numbers first"
+            )
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            settings = protocol.get("query_settings")
+            settings = dict(settings) if isinstance(settings, dict) else {}
+            before = bool(settings.get("censoring_definition_approved", False))
+            settings["censoring_definition_approved"] = True
+            protocol["query_settings"] = settings
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+        detail = f"censoring_definition_approved: {before} -> True by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "censoring_definition_approved", detail,
+            changes={"before": before, "after": True},
+        )
+        self._invalidate_gate(state, "analysis_plan", "censoring_definition_approved changed")
+        self.save(state)
+        return state
+
     def run_feasibility(self, run_id: str, gateway: BigQueryOMOPGateway) -> RunState:
         state = self.load(run_id)
         if state.phase != "feasibility":
@@ -1949,6 +2416,10 @@ class WorkflowManager:
         hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
         specs = _load_concept_specs(protocol)
         settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
+        for role, spec in _mapping_coverage_roles(specs, exposure_contrast):
+            counts = gateway.mapping_coverage(spec, role)
+            _check_mapping_coverage(role, spec, counts)
         result = gateway.feasibility(
             population=specs["population"],
             treatment=specs["treatment"],
@@ -1956,6 +2427,7 @@ class WorkflowManager:
             outcome=specs["outcome"],
             grace_period_hours=hypothesis["grace_period_hours"],
             follow_up_days=hypothesis["follow_up_days"],
+            exposure_contrast=exposure_contrast,
             **settings,
         )
         artifact_path = run_dir / "feasibility.json"
@@ -1990,8 +2462,25 @@ class WorkflowManager:
         hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
         specs = _load_concept_specs(protocol)
         settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
         grace_period_hours = hypothesis["grace_period_hours"]
         follow_up_days = hypothesis["follow_up_days"]
+        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
+        for role, spec in _mapping_coverage_roles(specs, exposure_contrast):
+            coverage_sql = concept_mapping_coverage_sql(datasets, spec, role)
+            coverage_response = client.causal_select(coverage_sql, "aggregate_feasibility", context)
+            coverage_rows = list(csv.DictReader(io.StringIO(coverage_response.text)))
+            if len(coverage_rows) != 1:
+                detail = coverage_response.text.replace("\n", " ")[:500]
+                raise RuntimeError(
+                    f"OMCP mapping-coverage query for role '{role}' must return exactly one "
+                    f"aggregate row; response={detail!r}"
+                )
+            coverage_counts = {
+                key: int(value) for key, value in coverage_rows[0].items()
+                if key and value not in (None, "")
+            }
+            _check_mapping_coverage(role, spec, coverage_counts)
         sql = feasibility_sql(
             datasets,
             population=specs["population"],
@@ -2000,6 +2489,7 @@ class WorkflowManager:
             outcome=specs["outcome"],
             grace_period_hours=grace_period_hours,
             follow_up_days=follow_up_days,
+            exposure_contrast=exposure_contrast,
             **settings,
         )
         validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")
@@ -2007,7 +2497,6 @@ class WorkflowManager:
             raise RuntimeError(
                 f"Feasibility SQL failed governance validation: {', '.join(validation.violations)}"
             )
-        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
         response = client.causal_select(sql, "aggregate_feasibility", context)
         rows = list(csv.DictReader(io.StringIO(response.text)))
         if len(rows) != 1:

@@ -167,6 +167,79 @@ class DataScienceAgentTests(unittest.TestCase):
             DataScienceAgent().run(hypothesis, protocol)
 
 
+class DataScienceAgentVsUnexposedComparatorTests(unittest.TestCase):
+    """A comparator resolved as "no_standard_concept" is the correct, final
+    answer under a "vs_unexposed" design (e.g. "aspirin vs no aspirin") --
+    there is no OMOP concept for "absence of a drug" -- so it must not keep
+    the analysis plan permanently unresolved the way the same status would
+    under every other exposure_contrast."""
+
+    def _hypothesis(self) -> dict:
+        return {
+            "schema_version": "1.0", "study_id": "study", "time_zero": "ICU admission",
+            "grace_period_hours": 24, "follow_up_days": 30, "primary_estimand": "CATE",
+        }
+
+    def _protocol(self, exposure_contrast: str) -> dict:
+        return {
+            "data_source": "project.dataset",
+            "query_settings": {"exposure_contrast": exposure_contrast},
+            "concept_sets": {
+                "ami": {
+                    "role": "population", "domain": "condition",
+                    "status": "approved", "concept_ids": [4329847],
+                },
+                "aspirin": {
+                    "role": "treatment", "domain": "drug",
+                    "status": "approved", "concept_ids": [1112807],
+                },
+                "no_aspirin": {
+                    "role": "comparator", "domain": "drug",
+                    "status": "no_standard_concept", "concept_ids": [],
+                },
+                "in_hospital_mortality": {
+                    "role": "outcome", "domain": "death",
+                    "status": "approved", "concept_ids": [],
+                },
+                # Declared so the auto-scaffolded "index_event" phenotype
+                # (always definition_pending, unrelated to this test) does
+                # not confound the final_execution_allowed assertion below.
+                "icu_admission": {
+                    "role": "time_zero", "domain": "procedure",
+                    "status": "approved", "concept_ids": [4],
+                },
+            },
+        }
+
+    def test_no_standard_concept_comparator_does_not_block_final_execution(self):
+        result = DataScienceAgent().run(self._hypothesis(), self._protocol("vs_unexposed"))
+        self.assertNotIn("phenotype:no_aspirin:no_standard_concept", result.unresolved_issues)
+        self.assertTrue(result.final_execution_allowed)
+
+    def test_comparator_phenotype_does_not_require_approval_under_vs_unexposed(self):
+        """The root-cause fix: `approval_required=False` on the comparator
+        `PhenotypePlan` itself, not just a filter on the resulting
+        `unresolved_issues` strings -- `ExecutionAgent.analysis_plan_blockers`
+        re-derives its own `incomplete_phenotypes` list straight from this
+        field (see `causal.agents.execution`), independently of
+        `unresolved_issues`, so a downstream-only filter would have left
+        `ExecutionAgent` still blocking on `phenotype_not_approved:no_aspirin`.
+        """
+        result = DataScienceAgent().run(self._hypothesis(), self._protocol("vs_unexposed"))
+        comparator = next(item for item in result.phenotypes if item.name == "no_aspirin")
+        self.assertFalse(comparator.approval_required)
+
+    def test_other_roles_still_require_approval_under_vs_unexposed(self):
+        result = DataScienceAgent().run(self._hypothesis(), self._protocol("vs_unexposed"))
+        treatment = next(item for item in result.phenotypes if item.name == "aspirin")
+        self.assertTrue(treatment.approval_required)
+
+    def test_same_status_still_blocks_final_execution_under_add_on(self):
+        result = DataScienceAgent().run(self._hypothesis(), self._protocol("add_on"))
+        self.assertIn("phenotype:no_aspirin:no_standard_concept", result.unresolved_issues)
+        self.assertFalse(result.final_execution_allowed)
+
+
 class DataScienceAgentCovariateTests(unittest.TestCase):
     """Covariates are sourced from `candidate_dag` role classifications (see
     `causal.agents.data_science._covariate` and the module-level role

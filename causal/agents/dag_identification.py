@@ -30,7 +30,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from causal.agents.hypothesis import DAGVariable, HypothesisArtifact
-from causal.roadmap import CausalDAG, CausalEdge, CausalNode
+from causal.roadmap import (
+    CausalDAG,
+    CausalEdge,
+    CausalEstimand,
+    CausalNode,
+    CausalQuestion,
+    CausalStudySpecification,
+    TargetTrialProtocol,
+)
 
 
 _SLUG_INVALID = re.compile(r"[^a-z0-9]+")
@@ -413,6 +421,71 @@ def build_causal_dag(hypothesis: HypothesisArtifact) -> CausalDAG:
         )
 
     return CausalDAG(tuple(nodes), tuple(edges), _EXPOSURE_ID, _OUTCOME_ID, comparator=hypothesis.comparator)
+
+
+def build_study_specification(protocol: dict[str, Any], hypothesis: HypothesisArtifact) -> CausalStudySpecification:
+    """Bridge `protocol.json` + the Hypothesis Agent's output into the
+    typed, validated `roadmap.CausalStudySpecification` contract -- the
+    counterfactual-estimand roadmap stage (see `docs/causal_roadmap.md`
+    stage 3), wired for real instead of merely defined.
+
+    `CausalQuestion`/most of `TargetTrialProtocol` are already fully
+    determined by `hypothesis` (itself already validated by
+    `HypothesisAgent`). The remaining `TargetTrialProtocol` fields
+    (`eligibility_criteria`, `assignment_procedure`, `censoring_strategy`,
+    `analysis_strategy`) and all of `CausalEstimand` except
+    `population_summary`/`outcome`/`horizon_days` (`effect_measure`,
+    `treatment_value`, `comparator_value`) are read directly from
+    `protocol["target_trial"]`, which `HypothesisArtifact` never carries.
+
+    Deliberately does no validation of its own: every field is handed to the
+    dataclasses exactly as found (missing text defaults to `""`, missing
+    `eligibility_criteria` to `()`), so `CausalQuestion.__post_init__`/
+    `TargetTrialProtocol.__post_init__`/`CausalEstimand.__post_init__`/
+    `CausalStudySpecification.__post_init__` raise the one, already-correct
+    `ValueError` for whatever is missing or invalid -- including the
+    horizon/follow-up consistency check. This function only decides *where*
+    each field comes from, never *whether* it is acceptable.
+    """
+    target = protocol.get("target_trial")
+    target = target if isinstance(target, dict) else {}
+
+    question = CausalQuestion(
+        population=hypothesis.population,
+        treatment=hypothesis.treatment,
+        comparator=hypothesis.comparator,
+        outcome=hypothesis.outcome,
+    )
+    target_trial = TargetTrialProtocol(
+        eligibility_criteria=tuple(str(item) for item in target.get("eligibility_criteria") or ()),
+        treatment_strategy=hypothesis.treatment,
+        comparator_strategy=hypothesis.comparator,
+        assignment_procedure=str(target.get("assignment_procedure") or ""),
+        time_zero=hypothesis.time_zero,
+        grace_period_hours=hypothesis.grace_period_hours,
+        follow_up_days=hypothesis.follow_up_days,
+        outcome_definition=hypothesis.outcome,
+        censoring_strategy=str(target.get("censoring_strategy") or ""),
+        analysis_strategy=str(target.get("analysis_strategy") or ""),
+    )
+    estimand = CausalEstimand(
+        population_summary=hypothesis.primary_estimand,
+        effect_measure=str(target.get("effect_measure") or ""),
+        treatment_value=str(target.get("treatment_value") or ""),
+        comparator_value=str(target.get("comparator_value") or ""),
+        outcome=hypothesis.outcome,
+        horizon_days=hypothesis.follow_up_days,
+    )
+    dag = build_causal_dag(hypothesis)
+    return CausalStudySpecification(
+        schema_version="1.0",
+        study_id=hypothesis.study_id,
+        source_question=hypothesis.source_question,
+        question=question,
+        target_trial=target_trial,
+        estimand=estimand,
+        dag=dag,
+    )
 
 
 def assess_identification(hypothesis: HypothesisArtifact, max_candidates: int = 24) -> DAGIdentificationResult:

@@ -4,7 +4,14 @@ from pathlib import Path
 from unittest import mock
 
 from causal.config import BigQueryDatasets
-from causal.mcp_client import OMCPClient, _normalize_tool_response, _omcp_db_overrides, _subprocess_environment
+from causal.mcp_client import (
+    MCPToolResponse,
+    OMCPClient,
+    _normalize_tool_response,
+    _omcp_db_overrides,
+    _sign_causal_context,
+    _subprocess_environment,
+)
 
 BIGQUERY_DATASETS = BigQueryDatasets(project="project", omop="dataset")
 DUCKDB_DATASETS = BigQueryDatasets(backend="duckdb", duckdb_path="data/mimiciv_omop.duckdb", duckdb_schema="main")
@@ -79,6 +86,40 @@ class OMCPClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             client = OMCPClient(DUCKDB_DATASETS, omcp_dir=root)
             self.assertEqual(client.datasets.backend, "duckdb")
+
+    def test_causal_select_signs_context_and_scopes_secret_to_the_subprocess_env(self):
+        """`causal_select` must attach a signature OMCP can verify (see
+        `omcp.governance.verify_causal_context_signature`) and pass the
+        matching secret only to that one subprocess spawn -- never a fixed
+        or globally-set secret, which would let a stale value keep working
+        across calls."""
+        context = {
+            "run_id": "run-1",
+            "study_id": "study-1",
+            "mode": "exploratory",
+            "clinical_mapping_status": "provisional",
+            "analysis_plan_status": "pending",
+            "aggregate_feasibility_allowed": True,
+            "analytic_dataset_build_allowed": False,
+            "causal_estimation_allowed": False,
+        }
+        with tempfile.TemporaryDirectory() as root:
+            client = OMCPClient(BIGQUERY_DATASETS, omcp_dir=root)
+            with mock.patch.object(
+                client, "_call_tool", new=mock.AsyncMock(return_value=MCPToolResponse("", {}))
+            ) as call_tool:
+                client.causal_select("SELECT 1", "aggregate_feasibility", context)
+
+        (tool_name, arguments), kwargs = call_tool.call_args
+        self.assertEqual(tool_name, "Causal_Select_Query")
+        sent_context = arguments["causal_context"]
+        secret = kwargs["env_overrides"]["OMCP_CONTEXT_SECRET"]
+        self.assertEqual(
+            sent_context["signature"], _sign_causal_context(context, secret)
+        )
+        # The signature travels with the context; the original dict passed
+        # in by the caller is untouched.
+        self.assertNotIn("signature", context)
 
 
 if __name__ == "__main__":

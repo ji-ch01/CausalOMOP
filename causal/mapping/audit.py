@@ -154,6 +154,60 @@ def unmapped_source_values_sql(datasets: BigQueryDatasets, domain: str, top_n: i
     """
 
 
+def concept_mapping_coverage_sql(datasets: BigQueryDatasets, spec: ConceptSetSpec, field: str) -> str:
+    """Database-wide check for whether `spec`'s resolved concept(s) actually
+    have usable standard-concept coverage in this OMOP build, versus sitting
+    unmapped (`concept_id = 0`) under a `source_value` that still spells out
+    the concept's own vocabulary name.
+
+    This automates the manual check that first surfaced MIMIC-IV/OMOP's
+    near-total oral-drug mapping gap: RxNorm concept 1112807 ("Aspirin") and
+    its ~10,662 descendants matched only 3 `drug_exposure` rows database-
+    wide, while ~180K unmapped rows had a `drug_source_value` that literally
+    read "Aspirin ...". `causal.orchestrator.workflow` turns the two counts
+    this returns into a hard block in the feasibility gate when coverage is
+    implausibly low -- see `_check_mapping_coverage` there.
+
+    Deliberately database-wide, not restricted to any one study's eligible
+    population: whether this dataset build mapped a concept at all is a
+    property of the OMOP conversion, not of a specific cohort.
+
+    The unmapped side joins on a `LIKE` predicate (no shared key to equate),
+    which BigQuery cannot rewrite as its usual EXISTS/IN semi-join -- "LEFT
+    SEMI JOIN cannot be used without a condition that is an equality of
+    fields from both sides of the join" -- so this uses a real `JOIN` plus
+    `COUNT(DISTINCT <table>_id)` instead of a correlated `EXISTS` subquery.
+    `<table>_id` is the standard OMOP CDM v5.x single-column primary key for
+    every table in `DOMAIN_TABLES`, matching the `<domain>_source_value`
+    derivation already used above and in `unmapped_source_values_sql`; the
+    `DISTINCT` absorbs any row matched by more than one of `spec`'s root
+    concept names.
+    """
+    if spec.domain not in DOMAIN_TABLES:
+        raise ValueError(f"{field} domain must be one of {tuple(DOMAIN_TABLES)}")
+    table, concept_col, _ = DOMAIN_TABLES[spec.domain]
+    source_value_col = f"{spec.domain}_source_value"
+    row_id_col = f"{table}_id"
+    included_cte = expanded_concepts_cte("included_concepts", spec, field, datasets)
+    root_ids = concept_ids_literal(spec, field)
+    return f"""
+    WITH {included_cte},
+    root_names AS (
+      SELECT DISTINCT LOWER(concept_name) AS name
+      FROM {datasets.table('omop', 'concept')}
+      WHERE concept_id IN ({root_ids}) AND concept_name IS NOT NULL
+    )
+    SELECT
+      (SELECT COUNT(*)
+       FROM {datasets.table('omop', table)} t
+       JOIN included_concepts c ON t.{concept_col} = c.concept_id) AS mapped_row_count,
+      (SELECT COUNT(DISTINCT t.{row_id_col})
+       FROM {datasets.table('omop', table)} t
+       JOIN root_names n ON LOWER(t.{source_value_col}) LIKE CONCAT('%', n.name, '%')
+       WHERE t.{concept_col} = 0) AS unmapped_name_matched_row_count
+    """
+
+
 def invalid_or_nonstandard_concepts_sql(datasets: BigQueryDatasets, plan: ExtractionPlan) -> str:
     """Included concepts (root + descendants, minus exclusions) that are not
     a standard, valid concept -- `standard_concept != 'S'` or a non-null

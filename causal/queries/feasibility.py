@@ -40,7 +40,12 @@ OUTCOME_DOMAINS = tuple(DOMAIN_TABLES) + ("death",)
 #     vs drug B). Cohort = only persons who received exactly one of
 #     treatment/comparator within the grace period; persons who received
 #     both (ambiguous/contaminated exposure) or neither are excluded.
-EXPOSURE_CONTRASTS = ("add_on", "mutually_exclusive")
+#   "vs_unexposed": standard drug-vs-no-treatment design (e.g. "aspirin vs
+#     no aspirin"). `comparator` is not queried at all -- there is no OMOP
+#     concept for "absence of a drug", so mapping one is neither possible
+#     nor required. Cohort = the whole eligible population; A=1 marks
+#     `treatment`, A=0 everyone else.
+EXPOSURE_CONTRASTS = ("add_on", "mutually_exclusive", "vs_unexposed")
 
 # Which aggregation rules make sense for a covariate's OMOP domain. Event
 # domains (condition/drug/procedure) carry no numeric value -- only
@@ -302,6 +307,7 @@ def _cohort_ctes(
     follow_up_days: int,
     min_age_years: int | None,
     care_site_names: tuple[str, ...],
+    exposure_contrast: str,
 ) -> str:
     if population.domain not in DOMAIN_TABLES:
         raise ValueError(f"population domain must be one of {tuple(DOMAIN_TABLES)}")
@@ -314,12 +320,17 @@ def _cohort_ctes(
 
     if treatment.domain not in DOMAIN_TABLES:
         raise ValueError(f"treatment domain must be one of {tuple(DOMAIN_TABLES)}")
-    if comparator.domain not in DOMAIN_TABLES:
+    # "vs_unexposed" (see EXPOSURE_CONTRASTS) has no real comparator exposure
+    # to query, so `comparator` is not required to resolve to anything --
+    # every other mode needs it exactly like population/treatment/outcome.
+    has_real_comparator = exposure_contrast != "vs_unexposed"
+    if has_real_comparator and comparator.domain not in DOMAIN_TABLES:
         raise ValueError(f"comparator domain must be one of {tuple(DOMAIN_TABLES)}")
 
     pop_table, pop_concept_col, pop_dt_col = DOMAIN_TABLES[population.domain]
     trt_table, trt_concept_col, trt_dt_col = DOMAIN_TABLES[treatment.domain]
-    cmp_table, cmp_concept_col, cmp_dt_col = DOMAIN_TABLES[comparator.domain]
+    if has_real_comparator:
+        cmp_table, cmp_concept_col, cmp_dt_col = DOMAIN_TABLES[comparator.domain]
 
     site_join = ""
     site_filter = ""
@@ -366,26 +377,34 @@ def _cohort_ctes(
       {age_filter}
     )""",
         _expanded_concepts_cte("treatment_concepts", treatment, "treatment", datasets),
-        _expanded_concepts_cte("comparator_concepts", comparator, "comparator", datasets),
-        f"""exposure AS (
+    ]
+    if has_real_comparator:
+        ctes.append(_expanded_concepts_cte("comparator_concepts", comparator, "comparator", datasets))
+        comparator_select = "COUNTIF(cc.concept_id IS NOT NULL) > 0 AS has_comparator"
+        comparator_from = f"""
+      LEFT JOIN {datasets.table('omop', cmp_table)} c
+        ON c.person_id = e.person_id
+       AND c.{cmp_dt_col} >= e.index_datetime
+       AND c.{cmp_dt_col} < {_dt_add(datasets, 'e.index_datetime', grace_period_hours)}
+      LEFT JOIN comparator_concepts cc ON c.{cmp_concept_col} = cc.concept_id"""
+    else:
+        # No comparator exposure exists to query -- "the comparator arm" is
+        # simply everyone the treatment wasn't matched for.
+        comparator_select = "NOT (COUNTIF(tc.concept_id IS NOT NULL) > 0) AS has_comparator"
+        comparator_from = ""
+    ctes.append(f"""exposure AS (
       SELECT
         e.person_id,
         COUNTIF(tc.concept_id IS NOT NULL) > 0 AS has_treatment,
-        COUNTIF(cc.concept_id IS NOT NULL) > 0 AS has_comparator
+        {comparator_select}
       FROM eligible e
       LEFT JOIN {datasets.table('omop', trt_table)} t
         ON t.person_id = e.person_id
        AND t.{trt_dt_col} >= e.index_datetime
        AND t.{trt_dt_col} < {_dt_add(datasets, 'e.index_datetime', grace_period_hours)}
-      LEFT JOIN treatment_concepts tc ON t.{trt_concept_col} = tc.concept_id
-      LEFT JOIN {datasets.table('omop', cmp_table)} c
-        ON c.person_id = e.person_id
-       AND c.{cmp_dt_col} >= e.index_datetime
-       AND c.{cmp_dt_col} < {_dt_add(datasets, 'e.index_datetime', grace_period_hours)}
-      LEFT JOIN comparator_concepts cc ON c.{cmp_concept_col} = cc.concept_id
+      LEFT JOIN treatment_concepts tc ON t.{trt_concept_col} = tc.concept_id{comparator_from}
       GROUP BY e.person_id
-    )""",
-    ]
+    )""")
 
     # Follow-up (outcome ascertainment) starts at the same index_datetime as
     # exposure ascertainment, by design: this is what a grace-period target
@@ -460,8 +479,18 @@ def feasibility_sql(
     follow_up_days: int = 28,
     min_age_years: int | None = 18,
     care_site_names: tuple[str, ...] = (),
+    exposure_contrast: str = "add_on",
 ) -> str:
-    """Aggregate-only feasibility counts for an arbitrary target-trial question."""
+    """Aggregate-only feasibility counts for an arbitrary target-trial question.
+
+    Reports every has_treatment/has_comparator combination unfiltered,
+    regardless of `exposure_contrast` -- that parameter is used only to
+    decide whether `comparator` needs to resolve to a real OMOP concept at
+    all (see `EXPOSURE_CONTRASTS`'s `"vs_unexposed"`), not to filter these
+    counts the way `analytic_cohort_sql`'s inclusion filter does.
+    """
+    if exposure_contrast not in EXPOSURE_CONTRASTS:
+        raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
     ctes = _cohort_ctes(
         datasets,
         population=population,
@@ -472,6 +501,7 @@ def feasibility_sql(
         follow_up_days=follow_up_days,
         min_age_years=min_age_years,
         care_site_names=care_site_names,
+        exposure_contrast=exposure_contrast,
     )
     return f"""
     WITH {ctes}
@@ -504,6 +534,7 @@ def analytic_cohort_sql(
     care_site_names: tuple[str, ...] = (),
     exposure_contrast: str = "add_on",
     covariates: tuple[CovariateSpec, ...] = (),
+    censoring_definition_approved: bool = False,
 ) -> str:
     """Person-level analytic cohort (A/Y columns) for the same target trial.
 
@@ -518,6 +549,18 @@ def analytic_cohort_sql(
     (see `_covariate_ctes_columns_and_joins` for aggregation/missingness
     semantics). Demographics (age/gender/race) are unaffected -- they keep
     using the fixed columns below, never this path.
+
+    `censoring_definition_approved` (default `False`, unchanged behavior:
+    `censored` stays `NULL` for every row) gates a real per-row
+    administrative-censoring indicator -- the exact same nominal-completeness
+    definition `causal.data_builder.analytic.AnalyticCohortBuilder.
+    followup_audit_sql` already computes in aggregate (death within
+    follow-up, or observation-period coverage through the follow-up horizon
+    -> not censored; neither -> censored), now emitted per person instead of
+    only counted. See `causal.orchestrator.workflow.
+    WorkflowManager.approve_censoring_definition` for the human-review gate
+    that flips this on -- a reviewer must have already seen the aggregate
+    followup_audit.json numbers first.
     """
     if exposure_contrast not in EXPOSURE_CONTRASTS:
         raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
@@ -531,17 +574,36 @@ def analytic_cohort_sql(
         follow_up_days=follow_up_days,
         min_age_years=min_age_years,
         care_site_names=care_site_names,
+        exposure_contrast=exposure_contrast,
     )
-    where_clause = (
-        "WHERE a.has_comparator" if exposure_contrast == "add_on"
-        else "WHERE a.has_treatment != a.has_comparator"
-    )
+    where_clause = {
+        "add_on": "WHERE a.has_comparator",
+        "mutually_exclusive": "WHERE a.has_treatment != a.has_comparator",
+        # Everyone eligible is kept -- no comparator exposure to filter on.
+        "vs_unexposed": "",
+    }[exposure_contrast]
     covariate_ctes, covariate_columns, covariate_joins = _covariate_ctes_columns_and_joins(
         datasets, covariates
     )
     all_ctes = ctes + "".join(f",\n    {cte}" for cte in covariate_ctes)
     extra_columns = "".join(f",\n      {column}" for column in covariate_columns)
     extra_joins = "".join(f"\n    {join}" for join in covariate_joins)
+    if censoring_definition_approved:
+        horizon = f"DATE_ADD(DATE(e.index_datetime), INTERVAL {int(follow_up_days)} DAY)"
+        censored_expr = f"""IF(
+        (SELECT MIN(d.death_date) FROM {datasets.table('omop', 'death')} d WHERE d.person_id = a.person_id)
+          BETWEEN DATE(e.index_datetime) AND {horizon}
+        OR (
+          SELECT MAX(op.observation_period_end_date)
+          FROM {datasets.table('omop', 'observation_period')} op
+          WHERE op.person_id = a.person_id
+            AND DATE(e.index_datetime) BETWEEN op.observation_period_start_date AND op.observation_period_end_date
+        ) >= {horizon},
+        0,
+        1
+      )"""
+    else:
+        censored_expr = "CAST(NULL AS INT64)"
     return f"""
     WITH {all_ctes}
     SELECT
@@ -550,7 +612,7 @@ def analytic_cohort_sql(
       CASE WHEN a.outcome_event THEN 1 ELSE 0 END AS Y,
       e.index_datetime,
       {int(follow_up_days)} AS follow_up_days,
-      CAST(NULL AS INT64) AS censored,
+      {censored_expr} AS censored,
       EXTRACT(YEAR FROM DATE(e.index_datetime)) - p.year_of_birth AS age,
       p.gender_concept_id,
       p.race_concept_id{extra_columns}

@@ -13,18 +13,21 @@ flowchart TB
     QG -->|clarify| USER[Return a clarification request]
     QG -->|causal| DRAFT[Target-trial draft]
 
+    DRAFT --> TTG{Target-trial human review}
     LIT[PubMed + OpenAlex] --> DAG[Evidence-grounded candidate DAG]
     KG[OptimusKG optional] --> DAG
-    DRAFT --> DAG
+    TTG --> DAG
     DAG --> CRIT[Bounded critique and revision]
     CRIT --> ID[Deterministic DAG and backdoor checks]
-    ID --> PG{Protocol / DAG human review}
+    ID --> DG{DAG / clinical-completeness gate}
+    DG --> IEG{Identification / estimand gate}
+    IEG --> SPEC[CausalStudySpecification persisted]
 
-    PG --> MAP[Concept sets + covariate review]
+    SPEC --> MAP[Concept sets + covariate review]
     OMCP[OMCP vocabulary and governed SQL] --> MAP
     MAP --> REG[OMOP variable registry]
     REG --> MG{Clinical mapping gate}
-    MG --> FEAS[Feasibility, mapping, cohort, follow-up audits]
+    MG --> FEAS[Feasibility, mapping, cohort, follow-up, positivity, missingness audits]
     FEAS --> PLAN[Analysis plan + execution readiness]
     PLAN --> APG{Analysis-plan gate}
     APG --> SQL[Person-level analytic-cohort SQL plan]
@@ -41,8 +44,8 @@ flowchart TB
     classDef gate fill:#fff2cc,stroke:#bf9000,color:#1b1b1b;
     classDef external fill:#cfe2f3,stroke:#3d85c6,color:#1b1b1b;
     classDef planned fill:#eeeeee,stroke:#777,color:#333,stroke-dasharray:5 5;
-    class Q,QG,USER,DRAFT,DAG,CRIT,ID,MAP,REG,FEAS,PLAN,SQL done;
-    class PG,MG,APG gate;
+    class Q,QG,USER,DRAFT,DAG,CRIT,ID,SPEC,MAP,REG,FEAS,PLAN,SQL done;
+    class TTG,DG,IEG,MG,APG gate;
     class FAST,LIT,KG,OMCP,MIMIC external;
     class EST,DIAG,REPORT planned;
 ```
@@ -55,8 +58,12 @@ FastOMOP process.
 
 ```mermaid
 flowchart LR
-    PR[protocol_review] --> P{protocol gate}
-    P --> CM[concept_mapping]
+    TR[target_trial_review] --> TG{target_trial gate}
+    TG --> DR[dag_review]
+    DR --> DG{dag_review gate}
+    DG --> IR[identification_review]
+    IR --> IG{identification_estimand gate}
+    IG --> CM[concept_mapping]
     CM --> C{clinical_mapping gate}
     C --> F[feasibility]
     F --> AP[analysis_plan]
@@ -67,20 +74,23 @@ flowchart LR
     RR --> R{results gate}
     R --> RP[report]
 
+    IG -. approved .-> SPEC[study_specification.json persisted]
     C -. provisional exploratory .-> AGG[Aggregate audits only]
     A -. blocked .-> NOPERSON[No authorized person-level execution]
 
     classDef phase fill:#d9ead3,stroke:#38761d,color:#1b1b1b;
     classDef gate fill:#fff2cc,stroke:#bf9000,color:#1b1b1b;
     classDef block fill:#f4cccc,stroke:#cc0000,color:#1b1b1b;
-    class PR,CM,F,AP,E,D,RR,RP,AGG phase;
-    class P,C,A,R gate;
+    class TR,DR,IR,CM,F,AP,E,D,RR,RP,AGG,SPEC phase;
+    class TG,DG,IG,C,A,R gate;
     class NOPERSON block;
 ```
 
-The four current gates are implementation facts, not the final scientific
-design. The roadmap calls for separate review of the target trial, DAG,
-identification/estimand, and operationalization.
+The six current gates implement the governance split docs/causal_roadmap.md
+used to propose as future work: separate review of the target trial
+(`target_trial`), the DAG (`dag_review`), identification/estimand
+(`identification_estimand`), and OMOP operationalization (`clinical_mapping`),
+plus the pre-existing `analysis_plan`/`results` gates.
 
 ## Trust and data boundary
 

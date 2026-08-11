@@ -3,13 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from causal.config import BigQueryDatasets
+
+# Mirrors `omcp.governance.SIGNED_CONTEXT_FIELDS`/`sign_causal_context`.
+# Deliberately duplicated rather than imported: `causal` treats OMCP as an
+# out-of-process service (see `_INHERITED_ENV_NAMES` below), never an
+# in-process library, so the two packages share this tiny contract by
+# convention instead of a Python import across the process boundary.
+_SIGNED_CONTEXT_FIELDS = (
+    "run_id",
+    "study_id",
+    "mode",
+    "clinical_mapping_status",
+    "analysis_plan_status",
+    "aggregate_feasibility_allowed",
+    "analytic_dataset_build_allowed",
+    "causal_estimation_allowed",
+)
+
+
+def _sign_causal_context(causal_context: dict[str, Any], secret: str) -> str:
+    ordered = {name: causal_context[name] for name in _SIGNED_CONTEXT_FIELDS}
+    payload = json.dumps(ordered, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -120,19 +145,32 @@ class OMCPClient:
         operation: str,
         causal_context: dict[str, Any],
     ) -> MCPToolResponse:
+        # A fresh secret per subprocess spawn: this stdio server is only
+        # ever reachable over its own stdin/stdout pipe, so there is no one
+        # else to share it with, but it still stops OMCP from accepting a
+        # `causal_context` that wasn't produced by this exact call -- see
+        # `omcp.governance.verify_causal_context_signature`.
+        secret = secrets.token_hex(32)
+        signed_context = {
+            **causal_context,
+            "signature": _sign_causal_context(causal_context, secret),
+        }
         return await self._call_tool(
             "Causal_Select_Query",
             {
                 "query": query,
                 "operation": operation,
-                "causal_context": causal_context,
+                "causal_context": signed_context,
             },
+            env_overrides={"OMCP_CONTEXT_SECRET": secret},
         )
 
     async def _call_tool(
         self,
         tool_name: str,
         arguments: dict[str, Any],
+        *,
+        env_overrides: dict[str, str] | None = None,
     ) -> MCPToolResponse:
         try:
             from mcp import ClientSession, StdioServerParameters
@@ -143,6 +181,8 @@ class OMCPClient:
             ) from exc
 
         overrides, extra = _omcp_db_overrides(self.datasets)
+        if env_overrides:
+            overrides = {**overrides, **env_overrides}
         environment = _subprocess_environment(overrides)
         parameters = StdioServerParameters(
             command="uv",

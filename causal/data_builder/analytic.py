@@ -77,6 +77,7 @@ class AnalyticCohortBuilder:
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
         covariates: tuple[CovariateSpec, ...] = (),
+        censoring_definition_approved: bool = False,
         execution_allowed: bool,
     ) -> tuple[str, CohortBuildManifest]:
         """`covariates` are reviewed, human-approved baseline covariates (see
@@ -85,6 +86,12 @@ class AnalyticCohortBuilder:
         already reviewed; see `causal.orchestrator.workflow.build_cohort_plan`).
         Demographics (age/gender/race) are unaffected -- they always come
         from the fixed columns below, never from this parameter.
+
+        `censoring_definition_approved` (default `False`) gates the real
+        `censored` column -- see `causal.queries.feasibility.
+        analytic_cohort_sql`'s own docstring for the exact definition and
+        `causal.orchestrator.workflow.WorkflowManager.
+        approve_censoring_definition` for the human-review gate.
         """
         if not study_id.strip():
             raise ValueError("study_id is required")
@@ -102,6 +109,7 @@ class AnalyticCohortBuilder:
             care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
             covariates=covariates,
+            censoring_definition_approved=censoring_definition_approved,
         )
         covariate_columns = tuple(
             AnalyticColumn(
@@ -112,6 +120,9 @@ class AnalyticCohortBuilder:
             )
             for covariate in covariates
         )
+        unresolved_issues = ["effect modifiers are not implemented in this cohort query"]
+        if not censoring_definition_approved:
+            unresolved_issues.insert(0, "censoring and observation-window completeness are not implemented")
         manifest = CohortBuildManifest(
             schema_version="1.0",
             study_id=study_id.strip(),
@@ -122,10 +133,7 @@ class AnalyticCohortBuilder:
             execution_allowed=execution_allowed,
             exposure_contrast=exposure_contrast,
             columns=self.COLUMNS + covariate_columns,
-            unresolved_issues=(
-                "censoring and observation-window completeness are not implemented",
-                "effect modifiers are not implemented in this cohort query",
-            ),
+            unresolved_issues=tuple(unresolved_issues),
         )
         return sql, manifest
 
@@ -242,4 +250,126 @@ class AnalyticCohortBuilder:
             )
           ) AS nominal_followup_incomplete
         FROM followup
+        """
+
+    def positivity_audit_sql(
+        self,
+        study_id: str,
+        datasets: BigQueryDatasets,
+        *,
+        population: ConceptSetSpec,
+        treatment: ConceptSetSpec,
+        comparator: ConceptSetSpec,
+        outcome: ConceptSetSpec,
+        grace_period_hours: int = 24,
+        follow_up_days: int = 28,
+        min_age_years: int | None = 18,
+        care_site_names: tuple[str, ...] = (),
+        exposure_contrast: str = "add_on",
+        covariates: tuple[CovariateSpec, ...] = (),
+    ) -> str:
+        """Univariate treatment-arm overlap, one reviewed baseline covariate at
+        a time -- a practical proxy for positivity (Hernan & Robins, *Causal
+        Inference: What If*, ch. 3: a positivity violation is an empty
+        covariate-stratum cell for one treatment arm), not a check of the
+        full joint adjustment-set stratification, which would be
+        combinatorially sparse for more than a couple of covariates over a
+        modest cohort -- documented as exactly that limitation, not oversold
+        as joint positivity.
+
+        For presence/count covariates (condition/drug/procedure), reports
+        how many persons in each arm have the covariate present at all -- a
+        zero here is an unambiguous violation. For value covariates
+        (measurement/observation), reports each arm's min/mean/max instead
+        of inventing bin edges to stratify by: no established, citable
+        binning rule exists for an arbitrary clinical covariate, and this
+        project has already rejected one invented-heuristic metric before
+        (see the GRADE-confidence-grading removal in
+        docs/dag_generation_audit.md SS0e).
+        """
+        cohort_sql, _ = self.build(
+            study_id, datasets,
+            population=population, treatment=treatment, comparator=comparator, outcome=outcome,
+            grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
+            min_age_years=min_age_years, care_site_names=care_site_names,
+            exposure_contrast=exposure_contrast, covariates=covariates,
+            execution_allowed=False,
+        )
+        columns = [
+            "COUNT(*) AS cohort_persons",
+            "COUNTIF(A = 1) AS treated_persons",
+            "COUNTIF(A = 0) AS comparator_persons",
+        ]
+        for covariate in covariates:
+            name = covariate.column_name
+            if covariate.aggregation in _VALUE_AGGREGATIONS:
+                columns.extend([
+                    f"MIN(IF(A = 1, {name}, NULL)) AS {name}_treated_min",
+                    f"ROUND(AVG(IF(A = 1, {name}, NULL)), 2) AS {name}_treated_mean",
+                    f"MAX(IF(A = 1, {name}, NULL)) AS {name}_treated_max",
+                    f"MIN(IF(A = 0, {name}, NULL)) AS {name}_comparator_min",
+                    f"ROUND(AVG(IF(A = 0, {name}, NULL)), 2) AS {name}_comparator_mean",
+                    f"MAX(IF(A = 0, {name}, NULL)) AS {name}_comparator_max",
+                ])
+            else:
+                columns.extend([
+                    f"COUNTIF(A = 1 AND {name} > 0) AS {name}_treated_present",
+                    f"COUNTIF(A = 0 AND {name} > 0) AS {name}_comparator_present",
+                ])
+        select_list = ",\n          ".join(columns)
+        return f"""
+        WITH analytic_cohort AS (
+          {cohort_sql}
+        )
+        SELECT
+          {select_list}
+        FROM analytic_cohort
+        """
+
+    def covariate_missingness_sql(
+        self,
+        study_id: str,
+        datasets: BigQueryDatasets,
+        *,
+        population: ConceptSetSpec,
+        treatment: ConceptSetSpec,
+        comparator: ConceptSetSpec,
+        outcome: ConceptSetSpec,
+        grace_period_hours: int = 24,
+        follow_up_days: int = 28,
+        min_age_years: int | None = 18,
+        care_site_names: tuple[str, ...] = (),
+        exposure_contrast: str = "add_on",
+        covariates: tuple[CovariateSpec, ...] = (),
+    ) -> str:
+        """Per-covariate missingness across the full analytic cohort,
+        generalizing `profile_sql`'s hardcoded age/gender/race-only pattern
+        (see its `missing_age`/`missing_gender`/`missing_race` columns) to
+        every reviewed baseline covariate, not just the three demographics.
+
+        Event-domain covariates (condition/drug/procedure) are COALESCEd to
+        0 by `_covariate_ctes_columns_and_joins` and so can never be NULL --
+        included here anyway so a reviewer sees the full covariate list and
+        a genuine zero-missing result for them, not silent omission.
+        """
+        cohort_sql, _ = self.build(
+            study_id, datasets,
+            population=population, treatment=treatment, comparator=comparator, outcome=outcome,
+            grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
+            min_age_years=min_age_years, care_site_names=care_site_names,
+            exposure_contrast=exposure_contrast, covariates=covariates,
+            execution_allowed=False,
+        )
+        columns = ["COUNT(*) AS cohort_persons"]
+        for covariate in covariates:
+            name = covariate.column_name
+            columns.append(f"COUNTIF({name} IS NULL) AS {name}_missing")
+        select_list = ",\n          ".join(columns)
+        return f"""
+        WITH analytic_cohort AS (
+          {cohort_sql}
+        )
+        SELECT
+          {select_list}
+        FROM analytic_cohort
         """

@@ -19,7 +19,14 @@ Required JSON shape:
     "outcome": "...",
     "follow_up_days": 1,
     "primary_estimand": "CATE",
-    "secondary_estimands": []
+    "secondary_estimands": [],
+    "eligibility_criteria": ["one short inclusion/exclusion rule per item, at least 1"],
+    "assignment_procedure": "how treatment vs. comparator status is determined (e.g. observational: by treating clinician; not randomized)",
+    "censoring_strategy": "when and why a person's follow-up ends before the outcome or horizon",
+    "analysis_strategy": "the intended analysis population (e.g. intention-to-treat analog, per-protocol)",
+    "effect_measure": "one of risk_difference, risk_ratio, odds_ratio, mean_difference, survival_difference",
+    "treatment_value": "the specific treatment-arm exposure value being contrasted",
+    "comparator_value": "the specific comparator-arm exposure value being contrasted"
   },
   "literature_search": {
     "population_terms": ["1 to 3 short clinical terms"],
@@ -60,6 +67,14 @@ Rules:
 - Literature search terms must be concise clinical noun phrases, not sentences,
   Boolean expressions, PubMed field tags, eligibility criteria, or assumptions.
 - Include common clinical synonyms when useful, with at most 3 terms per role.
+- eligibility_criteria, assignment_procedure, censoring_strategy, analysis_strategy,
+  effect_measure, treatment_value, and comparator_value are all REQUIRED, not optional.
+  treatment_value/comparator_value must name the specific exposure values the
+  effect_measure contrasts (e.g. "crystalloids plus albumin" vs. "crystalloids alone"),
+  not restate the free-text treatment/comparator descriptions verbatim if a more precise
+  value exists. If the question is underspecified, choose conservative draft values here
+  too and list the assumption in assumptions_requiring_review rather than leaving a field
+  blank.
 - The output is always a draft and cannot authorize causal execution.
 
 USER QUESTION:

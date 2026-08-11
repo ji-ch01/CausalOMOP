@@ -129,6 +129,15 @@ EXCLUDED_FROM_ADJUSTMENT_ROLES = {"mediator", "collider", "selection", "instrume
 
 _DEMOGRAPHIC_COVARIATES = {"age", "sex", "race"}
 
+#: Stand-in for "no real limit, can be measured any time before treatment"
+#: (100 years back from index, in hours) -- window bounds are plain
+#: hour-integers with no explicit unbounded sentinel, so a low-risk/
+#: demographic-like covariate gets this concrete-but-effectively-unbounded
+#: value instead. Public (not module-private) so callers displaying a
+#: reviewed window (see `causal.ui.streamlit_app`) can recognize this exact
+#: value and render it in plain language instead of the raw hour count.
+LIFETIME_LOOKBACK_HOURS = -876000
+
 
 class DataScienceAgent:
     """Turn a normalized hypothesis into a reviewable, non-executing plan.
@@ -162,9 +171,10 @@ class DataScienceAgent:
         concept_sets = protocol.get("concept_sets")
         if not isinstance(concept_sets, dict):
             raise ValueError("Protocol requires concept_sets")
+        exposure_contrast = self._exposure_contrast(protocol)
 
         phenotypes = tuple(
-            self._phenotype_from_concept_set(name, definition)
+            self._phenotype_from_concept_set(name, definition, exposure_contrast)
             for name, definition in concept_sets.items()
         )
         declared_roles = {phenotype.role for phenotype in phenotypes}
@@ -227,7 +237,6 @@ class DataScienceAgent:
             if item.role in _REQUIRED_PHENOTYPE_ROLES
         )
 
-        exposure_contrast = self._exposure_contrast(protocol)
         treatment_name = self._phenotype_name_for_role(phenotypes, "treatment", "treatment_and_comparator")
         comparator_name = self._phenotype_name_for_role(phenotypes, "comparator", "treatment_and_comparator")
         follow_up_days = self._required_int(hypothesis, "follow_up_days", 1)
@@ -377,7 +386,7 @@ class DataScienceAgent:
         return tuple(candidates)
 
     @staticmethod
-    def _phenotype_from_concept_set(name: str, definition: Any) -> PhenotypePlan:
+    def _phenotype_from_concept_set(name: str, definition: Any, exposure_contrast: str) -> PhenotypePlan:
         """Build one reviewable phenotype from a protocol-declared concept set.
 
         `role` and `domain` are asserted by the protocol author (human or
@@ -391,6 +400,14 @@ class DataScienceAgent:
         term sent to `concept_lookup` (see `_attach_concept_candidates`) when
         the set's own name is not a good vocabulary search term (e.g. a
         `crystalloids` class name searched as "sodium chloride" instead).
+
+        `approval_required` is `False` only for a `role="comparator"` entry
+        under `exposure_contrast="vs_unexposed"` (e.g. "aspirin vs no
+        aspirin", see `causal.queries.feasibility.EXPOSURE_CONTRASTS`) --
+        there is no OMOP concept for "absence of a drug", so this role never
+        needs approval under that design, regardless of its recorded
+        `status`. Every other role/design combination keeps requiring one
+        (the dataclass default).
         """
         if not isinstance(definition, dict):
             raise ValueError(f"concept_sets['{name}'] must be an object")
@@ -424,11 +441,12 @@ class DataScienceAgent:
         ids = tuple(int(value) for value in definition.get("concept_ids", ()))
         status = str(definition.get("status", "missing"))
         mode = "source_value_provisional" if status != "approved" and source_value_rule else "standard"
+        approval_required = not (role == "comparator" and exposure_contrast == "vs_unexposed")
         return PhenotypePlan(
             name=name, role=role, status=status, mode=mode, domain=domain,
             omop_tables=omop_tables, concept_ids=ids,
             source_value_rule=source_value_rule if mode == "source_value_provisional" else None,
-            lookup_term=lookup_term,
+            lookup_term=lookup_term, approval_required=approval_required,
         )
 
     @staticmethod
@@ -495,7 +513,7 @@ class DataScienceAgent:
         window_start_hours = variable.get("window_start_hours")
         window_end_hours = variable.get("window_end_hours")
         if window_start_hours is None or window_end_hours is None:
-            window_start_hours = -876000 if low_risk_window else -24
+            window_start_hours = LIFETIME_LOOKBACK_HOURS if low_risk_window else -24
             window_end_hours = 0
         return CovariatePlan(
             name=label,

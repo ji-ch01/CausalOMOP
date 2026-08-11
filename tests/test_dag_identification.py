@@ -7,6 +7,7 @@ from causal.agents.dag_identification import (
     assess_clinical_completeness,
     assess_identification,
     build_causal_dag,
+    build_study_specification,
     evidence_summary,
     grounding_caveat,
     review_dag,
@@ -35,6 +36,13 @@ def protocol(
             "follow_up_days": 28,
             "primary_estimand": "ATE",
             "secondary_estimands": [],
+            "eligibility_criteria": ["adult", "ICU admission", "sepsis at baseline"],
+            "assignment_procedure": "Emulated baseline assignment",
+            "censoring_strategy": "Censor only at verified loss of mortality follow-up",
+            "analysis_strategy": "Intention-to-treat analogue",
+            "effect_measure": "risk_difference",
+            "treatment_value": "albumin_plus_crystalloids",
+            "comparator_value": "crystalloids_alone",
         },
         "first_pass_covariates": list(first_pass_covariates),
         "concept_sets": {
@@ -711,6 +719,46 @@ class ReviewDagIncludesMetricsTests(unittest.TestCase):
         self.assertIn("adjustment", review.to_dict())
         self.assertEqual(review.caveat, grounding_caveat(review.evidence))
         self.assertIn("caveat", review.to_dict())
+
+
+class BuildStudySpecificationTests(unittest.TestCase):
+    def test_builds_full_specification_from_protocol_and_hypothesis(self):
+        raw_protocol = protocol([confounder("SOFA score")])
+        hypothesis = HypothesisAgent().run(raw_protocol)
+
+        spec = build_study_specification(raw_protocol, hypothesis)
+
+        self.assertEqual(spec.study_id, "albumin_sepsis")
+        self.assertEqual(spec.question.treatment, "Albumin plus crystalloids")
+        self.assertEqual(spec.target_trial.eligibility_criteria, ("adult", "ICU admission", "sepsis at baseline"))
+        self.assertEqual(spec.estimand.effect_measure, "risk_difference")
+        self.assertEqual(spec.estimand.population_summary, "ATE")
+        self.assertEqual(spec.estimand.horizon_days, spec.target_trial.follow_up_days)
+        self.assertTrue(spec.identified_by_backdoor_adjustment)
+
+    def test_raises_on_missing_eligibility_criteria(self):
+        raw_protocol = protocol([confounder("SOFA score")])
+        del raw_protocol["target_trial"]["eligibility_criteria"]
+        hypothesis = HypothesisAgent().run(raw_protocol)
+
+        with self.assertRaisesRegex(ValueError, "eligibility criteria"):
+            build_study_specification(raw_protocol, hypothesis)
+
+    def test_raises_on_missing_effect_measure(self):
+        raw_protocol = protocol([confounder("SOFA score")])
+        raw_protocol["target_trial"]["effect_measure"] = ""
+        hypothesis = HypothesisAgent().run(raw_protocol)
+
+        with self.assertRaisesRegex(ValueError, "effect measure"):
+            build_study_specification(raw_protocol, hypothesis)
+
+    def test_raises_on_missing_target_trial_object(self):
+        raw_protocol = protocol([confounder("SOFA score")])
+        hypothesis = HypothesisAgent().run(raw_protocol)
+        raw_protocol["target_trial"] = {}
+
+        with self.assertRaises(ValueError):
+            build_study_specification(raw_protocol, hypothesis)
 
 
 if __name__ == "__main__":

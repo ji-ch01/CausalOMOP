@@ -275,7 +275,12 @@ class HypothesisAgent:
         modifiers = tuple(str(value) for value in target.get("secondary_estimands", ()))
         covariates = tuple(str(value) for value in protocol.get("first_pass_covariates", ()))
         constraints = tuple(str(value) for value in protocol.get("design_constraints", ()))
-        unresolved = self._unresolved_concept_sets(protocol.get("concept_sets", {}))
+        exposure_contrast_settings = protocol.get("query_settings")
+        exposure_contrast = (
+            exposure_contrast_settings.get("exposure_contrast", "add_on")
+            if isinstance(exposure_contrast_settings, dict) else "add_on"
+        )
+        unresolved = self._unresolved_concept_sets(protocol.get("concept_sets", {}), exposure_contrast)
         dag_variables = self._candidate_dag(protocol.get("candidate_dag", ()))
         known_labels = {variable.label for variable in dag_variables}
         covariate_relations = self._covariate_relations(protocol.get("covariate_relations", ()), known_labels)
@@ -577,12 +582,23 @@ class HypothesisAgent:
         return tuple(majors)
 
     @staticmethod
-    def _unresolved_concept_sets(concept_sets: Any) -> tuple[str, ...]:
+    def _unresolved_concept_sets(concept_sets: Any, exposure_contrast: str = "add_on") -> tuple[str, ...]:
         if not isinstance(concept_sets, dict):
             return ("concept_sets: missing",)
         issues = []
         for name, definition in concept_sets.items():
             status = definition.get("status") if isinstance(definition, dict) else "invalid"
+            role = definition.get("role") if isinstance(definition, dict) else None
+            # "vs_unexposed" (see causal.queries.feasibility.EXPOSURE_CONTRASTS,
+            # e.g. "aspirin vs no aspirin") has no real comparator exposure to
+            # map -- there is no OMOP concept for "absence of a drug" -- so a
+            # comparator-role entry resolved as "no_standard_concept" is this
+            # design's correct, final answer, not an unresolved issue.
+            if (
+                role == "comparator" and exposure_contrast == "vs_unexposed"
+                and status == "no_standard_concept"
+            ):
+                continue
             if status != "approved":
                 issues.append(f"concept_set:{name}:{status}")
         return tuple(issues)

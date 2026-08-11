@@ -12,10 +12,34 @@ from causal.orchestrator import WorkflowManager
 from causal.orchestrator.workflow import (
     _LOCK_STALE_SECONDS,
     _RunLock,
+    _check_mapping_coverage,
     _load_concept_specs,
+    _mapping_coverage_roles,
     _mismatched_concept_domains,
 )
 from causal.queries import ConceptSetSpec
+
+
+def _approve_pre_mapping_gates(manager, run_id, reviewer="tester"):
+    """Approve the three gates that replaced the old combined "protocol"
+    gate (see docs/causal_roadmap.md's governance split: question/target
+    trial, causal DAG, identification/estimand) -- the boilerplate every
+    test that just needs to reach the concept_mapping phase now needs,
+    instead of one `decide_gate(..., "protocol", "approved", ...)` call."""
+    manager.decide_gate(run_id, "target_trial", "approved", reviewer)
+    manager.decide_gate(run_id, "dag_review", "approved", reviewer)
+    manager.decide_gate(run_id, "identification_estimand", "approved", reviewer)
+
+
+_FULL_TARGET_TRIAL_FIELDS = {
+    "eligibility_criteria": ["adult"],
+    "assignment_procedure": "Emulated baseline assignment",
+    "censoring_strategy": "Administrative censoring at end of follow-up",
+    "analysis_strategy": "Intention-to-treat analogue",
+    "effect_measure": "risk_difference",
+    "treatment_value": "treatment_value",
+    "comparator_value": "comparator_value",
+}
 
 
 class WorkflowTests(unittest.TestCase):
@@ -31,7 +55,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_start_snapshots_protocol(self):
         state = self.manager.start(self.protocol)
-        self.assertEqual(state.phase, "protocol_review")
+        self.assertEqual(state.phase, "target_trial_review")
         self.assertTrue((Path(self.temp.name) / "runs" / state.run_id / "protocol.json").is_file())
 
     def test_start_rejects_a_study_id_with_characters_omcp_would_later_reject(self):
@@ -52,24 +76,42 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.manager.start(self.protocol)
 
+    def _full_protocol_path(self):
+        path = Path(self.temp.name) / "full_protocol.json"
+        path.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
+            },
+        }), encoding="utf-8")
+        return path
+
     def test_gate_required_to_advance(self):
-        state = self.manager.start(self.protocol)
+        state = self.manager.start(self._full_protocol_path())
         with self.assertRaises(RuntimeError):
             self.manager.advance(state.run_id)
-        self.manager.decide_gate(state.run_id, "protocol", "approved", "tester")
-        state = self.manager.advance(state.run_id)
+        _approve_pre_mapping_gates(self.manager, state.run_id)
+        for _ in range(3):
+            state = self.manager.advance(state.run_id)
         self.assertEqual(state.phase, "concept_mapping")
 
     def test_provisional_mapping_only_allows_exploration(self):
-        exploratory = self.manager.start(self.protocol, "exploratory")
-        self.manager.decide_gate(exploratory.run_id, "protocol", "approved", "tester")
-        self.manager.advance(exploratory.run_id)
+        exploratory = self.manager.start(self._full_protocol_path(), "exploratory")
+        _approve_pre_mapping_gates(self.manager, exploratory.run_id)
+        for _ in range(3):
+            self.manager.advance(exploratory.run_id)
         self.manager.decide_gate(exploratory.run_id, "clinical_mapping", "provisional", "tester")
         self.assertEqual(self.manager.advance(exploratory.run_id).phase, "feasibility")
 
-        final = self.manager.start(self.protocol, "final")
-        self.manager.decide_gate(final.run_id, "protocol", "approved", "tester")
-        self.manager.advance(final.run_id)
+        final = self.manager.start(self._full_protocol_path(), "final")
+        _approve_pre_mapping_gates(self.manager, final.run_id)
+        for _ in range(3):
+            self.manager.advance(final.run_id)
         self.manager.decide_gate(final.run_id, "clinical_mapping", "provisional", "tester")
         with self.assertRaises(RuntimeError):
             self.manager.advance(final.run_id)
@@ -1042,6 +1084,71 @@ class LoadConceptSpecsTests(unittest.TestCase):
             _load_concept_specs({})
 
 
+class LoadConceptSpecsVsUnexposedComparatorTests(unittest.TestCase):
+    """`exposure_contrast="vs_unexposed"` (e.g. "aspirin vs no aspirin") is
+    the one case where an unapproved, domain-less, or entirely absent
+    comparator is not a blocker: there is no OMOP concept for "absence of a
+    drug", so nothing can ever be approved for it. Every other
+    exposure_contrast keeps requiring a real, approved comparator concept
+    (see `LoadConceptSpecsTests` above)."""
+
+    @staticmethod
+    def _approved(role: str, domain: str, concept_ids: list[int]) -> dict:
+        return {
+            "role": role, "status": "approved", "domain": domain, "concept_ids": concept_ids,
+        }
+
+    def _base_concept_sets(self) -> dict:
+        return {
+            "sepsis": self._approved("population", "condition", [1]),
+            "albumin": self._approved("treatment", "drug", [2]),
+        }
+
+    def test_no_standard_concept_comparator_resolves_without_raising(self):
+        concept_sets = self._base_concept_sets()
+        concept_sets["no_albumin"] = {
+            "role": "comparator", "status": "no_standard_concept", "domain": "", "concept_ids": [],
+        }
+        specs = _load_concept_specs({
+            "query_settings": {"exposure_contrast": "vs_unexposed"},
+            "concept_sets": concept_sets,
+        })
+        self.assertEqual(specs["comparator"], ConceptSetSpec(domain="", concept_ids=()))
+
+    def test_no_comparator_entry_at_all_resolves_without_raising(self):
+        specs = _load_concept_specs({
+            "query_settings": {"exposure_contrast": "vs_unexposed"},
+            "concept_sets": self._base_concept_sets(),
+        })
+        self.assertEqual(specs["comparator"], ConceptSetSpec(domain="", concept_ids=()))
+
+    def test_a_real_comparator_concept_still_resolves_normally(self):
+        """Choosing "vs_unexposed" does not force the comparator empty --
+        a reviewer who happens to have mapped one is not blocked either."""
+        concept_sets = self._base_concept_sets()
+        concept_sets["clopidogrel"] = self._approved("comparator", "drug", [3])
+        specs = _load_concept_specs({
+            "query_settings": {"exposure_contrast": "vs_unexposed"},
+            "concept_sets": concept_sets,
+        })
+        self.assertEqual(specs["comparator"], ConceptSetSpec(domain="drug", concept_ids=(3,)))
+
+    def test_same_no_standard_concept_comparator_still_raises_under_add_on(self):
+        concept_sets = self._base_concept_sets()
+        concept_sets["no_albumin"] = {
+            "role": "comparator", "status": "no_standard_concept", "domain": "", "concept_ids": [],
+        }
+        with self.assertRaises(RuntimeError):
+            _load_concept_specs({
+                "query_settings": {"exposure_contrast": "add_on"},
+                "concept_sets": concept_sets,
+            })
+
+    def test_missing_comparator_still_raises_under_the_default_exposure_contrast(self):
+        with self.assertRaises(RuntimeError):
+            _load_concept_specs({"concept_sets": self._base_concept_sets()})
+
+
 class WorkflowReviewCovariateDomainTests(unittest.TestCase):
     """`review_covariate_domain` lets a reviewer confirm or correct a
     covariate's OMOP domain -- either one the DAG-drafting LLM proposed, or
@@ -1310,6 +1417,62 @@ class WorkflowReviewCovariateWindowTests(unittest.TestCase):
         self.assertEqual(event["changes"]["after"]["window_end_hours"], 0)
 
 
+class WorkflowSetExposureContrastTests(unittest.TestCase):
+    """`set_exposure_contrast` records a reviewer's choice of
+    treatment/comparator inclusion semantics (see
+    `causal.queries.feasibility.EXPOSURE_CONTRASTS`) -- previously only
+    settable by hand-editing protocol.json, with every run silently
+    defaulting to "add_on" otherwise."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE"
+            },
+            "concept_sets": {"treatment": {"status": "approved"}},
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        self.state = self.manager.start(self.protocol)
+        self.run_dir = root / "runs" / self.state.run_id
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _protocol(self) -> dict:
+        return json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+
+    def test_saves_the_choice_to_protocol_json(self):
+        self.manager.set_exposure_contrast(self.state.run_id, "vs_unexposed", "Dr. Lee")
+        self.assertEqual(self._protocol()["query_settings"]["exposure_contrast"], "vs_unexposed")
+
+    def test_rejects_an_unknown_value(self):
+        with self.assertRaises(ValueError):
+            self.manager.set_exposure_contrast(self.state.run_id, "not_a_real_mode", "Dr. Lee")
+
+    def test_requires_a_reviewer(self):
+        with self.assertRaises(ValueError):
+            self.manager.set_exposure_contrast(self.state.run_id, "vs_unexposed", "  ")
+
+    def test_records_structured_history_event(self):
+        state = self.manager.set_exposure_contrast(self.state.run_id, "mutually_exclusive", "Dr. Lee")
+        event = next(event for event in state.history if event["event"] == "exposure_contrast_set")
+        self.assertEqual(event["changes"]["before"], "add_on")
+        self.assertEqual(event["changes"]["after"], "mutually_exclusive")
+
+    def test_invalidates_the_analysis_plan_gate(self):
+        self.manager.decide_gate(self.state.run_id, "analysis_plan", "provisional", "Dr. Lee")
+        state = self.manager.set_exposure_contrast(self.state.run_id, "vs_unexposed", "Dr. Lee")
+        self.assertEqual(state.gates["analysis_plan"].status, "pending")
+
+
 class RunLockTests(unittest.TestCase):
     """`_RunLock` is what turns two reviewers editing the same run's
     `protocol.json` at the same time from a silent last-write-wins race into
@@ -1501,7 +1664,8 @@ class WorkflowConceptCandidatePersistenceTests(unittest.TestCase):
                 "population": "population", "treatment": "treatment",
                 "comparator": "comparator", "time_zero": "index",
                 "grace_period_hours": 24, "outcome": "outcome",
-                "follow_up_days": 28, "primary_estimand": "ATE"
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
             },
             "data_source": "project.dataset",
             "first_pass_covariates": ["SOFA score"],
@@ -1517,8 +1681,9 @@ class WorkflowConceptCandidatePersistenceTests(unittest.TestCase):
             role="confounder", temporal_classification="pre_treatment",
             domain="measurement",
         )
-        self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
-        self.state = self.manager.advance(self.state.run_id)
+        _approve_pre_mapping_gates(self.manager, self.state.run_id)
+        for _ in range(3):
+            self.state = self.manager.advance(self.state.run_id)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -1583,13 +1748,13 @@ class WorkflowMajorConfounderGateTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_protocol_gate_cannot_be_approved_while_major_confounder_unresolved(self):
+    def test_dag_review_gate_cannot_be_approved_while_major_confounder_unresolved(self):
         with self.assertRaises(ValueError):
-            self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+            self.manager.decide_gate(self.state.run_id, "dag_review", "approved", "tester")
 
-    def test_protocol_gate_can_still_be_rejected_or_made_provisional(self):
-        self.manager.decide_gate(self.state.run_id, "protocol", "provisional", "tester")
-        self.manager.decide_gate(self.state.run_id, "protocol", "rejected", "tester")
+    def test_dag_review_gate_can_still_be_rejected_or_made_provisional(self):
+        self.manager.decide_gate(self.state.run_id, "dag_review", "provisional", "tester")
+        self.manager.decide_gate(self.state.run_id, "dag_review", "rejected", "tester")
 
     def test_classifying_the_major_confounder_unblocks_approval(self):
         self.manager.review_covariate(
@@ -1597,23 +1762,28 @@ class WorkflowMajorConfounderGateTests(unittest.TestCase):
             "Baseline age affects both treatment choice and outcome.",
             role="confounder", temporal_classification="pre_treatment",
         )
-        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
-        self.assertEqual(state.gates["protocol"].status, "approved")
+        state = self.manager.decide_gate(self.state.run_id, "dag_review", "approved", "tester")
+        self.assertEqual(state.gates["dag_review"].status, "approved")
 
     def test_rejecting_the_major_confounder_unblocks_approval(self):
         self.manager.review_covariate(
             self.state.run_id, "age", "reject", "Dr. Chen",
             "Cohort is age-restricted at enrollment.",
         )
-        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
-        self.assertEqual(state.gates["protocol"].status, "approved")
+        state = self.manager.decide_gate(self.state.run_id, "dag_review", "approved", "tester")
+        self.assertEqual(state.gates["dag_review"].status, "approved")
 
 
 class WorkflowIdentificationGateTests(unittest.TestCase):
-    """The protocol/DAG gate must also refuse approval when the declared DAG
-    is not identified by backdoor adjustment -- e.g. a confounder was
-    classified but marked latent/unobserved, so no baseline set can block
-    the backdoor path it opens. See `_block_if_not_identified`."""
+    """The identification_estimand gate must refuse approval when the
+    declared DAG is not identified by backdoor adjustment -- e.g. a
+    confounder was classified but marked latent/unobserved, so no baseline
+    set can block the backdoor path it opens. See `_block_if_not_identified`.
+    The fixture's `target_trial` carries the full estimand-contract fields
+    (see `causal.agents.dag_identification.build_study_specification`) so
+    this gate's *other* new check -- building the full
+    `CausalStudySpecification` -- passes whenever identification does,
+    keeping these tests isolated to identification behavior specifically."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1626,7 +1796,14 @@ class WorkflowIdentificationGateTests(unittest.TestCase):
                 "population": "population", "treatment": "treatment",
                 "comparator": "comparator", "time_zero": "index",
                 "grace_period_hours": 24, "outcome": "outcome",
-                "follow_up_days": 28, "primary_estimand": "ATE"
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                "eligibility_criteria": ["adult"],
+                "assignment_procedure": "Emulated baseline assignment",
+                "censoring_strategy": "Administrative censoring at end of follow-up",
+                "analysis_strategy": "Intention-to-treat analogue",
+                "effect_measure": "risk_difference",
+                "treatment_value": "treatment_value",
+                "comparator_value": "comparator_value",
             },
             "first_pass_covariates": ["age"],
             "concept_sets": {"treatment": {"status": "approved"}},
@@ -1638,7 +1815,7 @@ class WorkflowIdentificationGateTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_protocol_gate_cannot_be_approved_when_the_only_confounder_is_unobserved(self):
+    def test_identification_estimand_gate_cannot_be_approved_when_the_only_confounder_is_unobserved(self):
         self.manager.review_covariate(
             self.state.run_id, "age", "accept", "Dr. Chen",
             "Baseline age affects both treatment choice and outcome.",
@@ -1646,33 +1823,36 @@ class WorkflowIdentificationGateTests(unittest.TestCase):
             observed=False,
         )
         with self.assertRaises(ValueError):
-            self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
+            self.manager.decide_gate(self.state.run_id, "identification_estimand", "approved", "tester")
 
-    def test_protocol_gate_approves_when_the_confounder_is_observed(self):
+    def test_identification_estimand_gate_approves_when_the_confounder_is_observed(self):
         self.manager.review_covariate(
             self.state.run_id, "age", "accept", "Dr. Chen",
             "Baseline age affects both treatment choice and outcome.",
             role="confounder", temporal_classification="pre_treatment",
         )
-        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
-        self.assertEqual(state.gates["protocol"].status, "approved")
+        state = self.manager.decide_gate(self.state.run_id, "identification_estimand", "approved", "tester")
+        self.assertEqual(state.gates["identification_estimand"].status, "approved")
+        spec_path = self.manager.runs_dir / self.state.run_id / "study_specification.json"
+        self.assertTrue(spec_path.is_file())
+        self.assertIn("study_specification.json", state.artifacts)
 
-    def test_protocol_gate_can_still_be_rejected_while_unidentified(self):
+    def test_identification_estimand_gate_can_still_be_rejected_while_unidentified(self):
         self.manager.review_covariate(
             self.state.run_id, "age", "accept", "Dr. Chen",
             "Baseline age affects both treatment choice and outcome.",
             role="confounder", temporal_classification="pre_treatment",
             observed=False,
         )
-        self.manager.decide_gate(self.state.run_id, "protocol", "provisional", "tester")
-        self.manager.decide_gate(self.state.run_id, "protocol", "rejected", "tester")
+        self.manager.decide_gate(self.state.run_id, "identification_estimand", "provisional", "tester")
+        self.manager.decide_gate(self.state.run_id, "identification_estimand", "rejected", "tester")
 
     def test_empty_dag_is_trivially_identified_and_not_blocked_here(self):
         """An empty candidate_dag is trivially backdoor-identified (no path
         to block); this gate must not be the thing that catches that --
         `_block_if_major_confounders_unresolved` is."""
-        state = self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
-        self.assertEqual(state.gates["protocol"].status, "approved")
+        state = self.manager.decide_gate(self.state.run_id, "identification_estimand", "approved", "tester")
+        self.assertEqual(state.gates["identification_estimand"].status, "approved")
 
 
 class WorkflowDataScienceAgentTests(unittest.TestCase):
@@ -1694,7 +1874,8 @@ class WorkflowDataScienceAgentTests(unittest.TestCase):
                 "population": "population", "treatment": "treatment",
                 "comparator": "comparator", "time_zero": "index",
                 "grace_period_hours": 24, "outcome": "outcome",
-                "follow_up_days": 28, "primary_estimand": "ATE"
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
             },
             "data_source": "project.dataset",
             "first_pass_covariates": ["age"],
@@ -1714,8 +1895,9 @@ class WorkflowDataScienceAgentTests(unittest.TestCase):
             "Baseline age affects both treatment choice and outcome.",
             role="confounder", temporal_classification="pre_treatment",
         )
-        self.manager.decide_gate(self.state.run_id, "protocol", "approved", "tester")
-        state = self.manager.advance(self.state.run_id)
+        _approve_pre_mapping_gates(self.manager, self.state.run_id)
+        for _ in range(3):
+            state = self.manager.advance(self.state.run_id)
         self.assertEqual(state.phase, "concept_mapping")
 
         state = self.manager.run_data_science_agent(state.run_id)
@@ -1750,7 +1932,8 @@ class WorkflowBuildCohortPlanCovariateTests(unittest.TestCase):
                 "population": "population", "treatment": "treatment",
                 "comparator": "comparator", "time_zero": "index",
                 "grace_period_hours": 24, "outcome": "outcome",
-                "follow_up_days": 28, "primary_estimand": "ATE"
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
             },
             "data_source": "project.dataset",
             "first_pass_covariates": ["SOFA score"],
@@ -1791,8 +1974,9 @@ class WorkflowBuildCohortPlanCovariateTests(unittest.TestCase):
         self.manager.review_covariate_aggregation(
             self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
         )
-        self.manager.decide_gate(self.run_id, "protocol", "approved", "tester")
-        state = self.manager.advance(self.run_id)
+        _approve_pre_mapping_gates(self.manager, self.run_id)
+        for _ in range(3):
+            state = self.manager.advance(self.run_id)
         state = self.manager.run_data_science_agent(self.run_id)
         state.phase = "analysis_plan"
         self.manager.save(state)
@@ -2056,6 +2240,362 @@ class WorkflowMappingAuditMcpTests(unittest.TestCase):
         _, _, context = client.calls[0]
         self.assertEqual(context["run_id"], self.run_id)
         self.assertEqual(context["variable_id"], "sofa_score")
+
+
+class WorkflowDataSupportAuditTests(unittest.TestCase):
+    """`run_positivity_audit_mcp`/`run_covariate_missingness_audit_mcp`
+    (data-support roadmap stage 7) and `approve_censoring_definition`
+    (stage 7's censoring piece) -- same fixture shape as
+    `WorkflowBuildCohortPlanCovariateTests`, a full pipeline through one
+    reviewed, mapped, aggregation-reviewed covariate."""
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
+            },
+            "data_source": "project.dataset",
+            "first_pass_covariates": ["SOFA score"],
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "approved",
+                    "domain": "condition", "concept_ids": [132797],
+                },
+                "treatment": {
+                    "role": "treatment", "status": "approved",
+                    "domain": "drug", "concept_ids": [1],
+                },
+                "comparator": {
+                    "role": "comparator", "status": "approved",
+                    "domain": "drug", "concept_ids": [2],
+                },
+                "outcome": {
+                    "role": "outcome", "status": "approved",
+                    "domain": "condition", "concept_ids": [316866],
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        state = self.manager.run_hypothesis_agent(state.run_id)
+        self.run_id = state.run_id
+        self.run_dir = root / "runs" / self.run_id
+
+        self.manager.review_covariate(
+            self.run_id, "SOFA score", "accept", "Dr. Chen",
+            "Higher SOFA is associated with treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            domain="measurement",
+        )
+        self.manager.map_covariate_concepts(
+            self.run_id, "SOFA score", [4301868], "Dr. Lee",
+        )
+        self.manager.review_covariate_aggregation(
+            self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
+        )
+        _approve_pre_mapping_gates(self.manager, self.run_id)
+        for _ in range(3):
+            state = self.manager.advance(self.run_id)
+        state = self.manager.run_data_science_agent(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_positivity_audit_writes_an_artifact(self):
+        client = _FakeCausalSelectClient()
+        state = self.manager.run_positivity_audit_mcp(self.run_id, client, self.datasets)
+        self.assertEqual(len(client.calls), 1)
+        query, operation, _ = client.calls[0]
+        self.assertIn("cov_sofa_score_treated_min", query)
+        self.assertEqual(operation, "aggregate_feasibility")
+        artifact_path = self.run_dir / "positivity_audit.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["status"], "aggregate_observability_audit_only")
+        self.assertFalse(artifact["causal_effect_estimated"])
+        self.assertIn("positivity_audit.json", state.artifacts)
+        self.assertTrue(any(entry["event"] == "positivity_audit_completed" for entry in state.history))
+
+    def test_positivity_audit_requires_analysis_plan_json(self):
+        (self.run_dir / "analysis_plan.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_positivity_audit_mcp(self.run_id, _FakeCausalSelectClient(), self.datasets)
+
+    def test_covariate_missingness_audit_writes_an_artifact(self):
+        client = _FakeCausalSelectClient()
+        state = self.manager.run_covariate_missingness_audit_mcp(self.run_id, client, self.datasets)
+        self.assertEqual(len(client.calls), 1)
+        query, _, _ = client.calls[0]
+        self.assertIn("cov_sofa_score_missing", query)
+        artifact_path = self.run_dir / "covariate_missingness.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["status"], "aggregate_observability_audit_only")
+        self.assertIn("covariate_missingness.json", state.artifacts)
+        self.assertTrue(
+            any(entry["event"] == "covariate_missingness_audit_completed" for entry in state.history)
+        )
+
+    def test_covariate_missingness_audit_requires_analysis_plan_json(self):
+        (self.run_dir / "analysis_plan.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_covariate_missingness_audit_mcp(
+                self.run_id, _FakeCausalSelectClient(), self.datasets
+            )
+
+    def test_approve_censoring_definition_requires_followup_audit_first(self):
+        with self.assertRaises(ValueError):
+            self.manager.approve_censoring_definition(self.run_id, "Dr. Lee")
+
+    def test_approve_censoring_definition_flips_the_flag(self):
+        (self.run_dir / "followup_audit.json").write_text(
+            json.dumps({"status": "aggregate_observability_audit_only"}), encoding="utf-8"
+        )
+        state = self.manager.approve_censoring_definition(self.run_id, "Dr. Lee", "reviewed nominal counts")
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.assertTrue(protocol["query_settings"]["censoring_definition_approved"])
+        event = next(entry for entry in state.history if entry["event"] == "censoring_definition_approved")
+        self.assertEqual(event["changes"]["after"], True)
+
+    def test_approve_censoring_definition_invalidates_analysis_plan_gate(self):
+        (self.run_dir / "followup_audit.json").write_text(
+            json.dumps({"status": "aggregate_observability_audit_only"}), encoding="utf-8"
+        )
+        self.manager.decide_gate(self.run_id, "analysis_plan", "provisional", "Dr. Lee")
+        state = self.manager.approve_censoring_definition(self.run_id, "Dr. Lee")
+        self.assertEqual(state.gates["analysis_plan"].status, "pending")
+
+    def test_approved_censoring_definition_produces_a_real_censored_column(self):
+        (self.run_dir / "followup_audit.json").write_text(
+            json.dumps({"status": "aggregate_observability_audit_only"}), encoding="utf-8"
+        )
+        self.manager.approve_censoring_definition(self.run_id, "Dr. Lee")
+        self.manager.build_cohort_plan(self.run_id, self.datasets)
+        sql = (self.run_dir / "cohort.sql").read_text(encoding="utf-8")
+        self.assertNotIn("CAST(NULL AS INT64) AS censored", sql)
+        manifest = json.loads((self.run_dir / "cohort_manifest.json").read_text(encoding="utf-8"))
+        self.assertNotIn(
+            "censoring and observation-window completeness are not implemented",
+            manifest["unresolved_issues"],
+        )
+
+
+class MappingCoverageRolesTests(unittest.TestCase):
+    """`_mapping_coverage_roles` decides which query roles the feasibility
+    gate's mapping-coverage check runs against -- must line up exactly with
+    which roles `causal.queries.feasibility._cohort_ctes` actually resolves
+    to a real OMOP concept set (see `EXPOSURE_CONTRASTS`/the `death`-outcome
+    default), or the gate would either miss a role it should check or query
+    a concept set that was never meant to be queried."""
+
+    def _specs(self, **overrides):
+        specs = {
+            "population": ConceptSetSpec(domain="condition", concept_ids=(1,)),
+            "treatment": ConceptSetSpec(domain="drug", concept_ids=(2,)),
+            "comparator": ConceptSetSpec(domain="drug", concept_ids=(3,)),
+            "outcome": ConceptSetSpec(domain="condition", concept_ids=(4,)),
+        }
+        specs.update(overrides)
+        return specs
+
+    def test_checks_all_four_roles_by_default(self):
+        roles = _mapping_coverage_roles(self._specs(), "add_on")
+        self.assertEqual([role for role, _ in roles], ["population", "treatment", "comparator", "outcome"])
+
+    def test_skips_comparator_under_vs_unexposed(self):
+        roles = _mapping_coverage_roles(self._specs(), "vs_unexposed")
+        self.assertEqual([role for role, _ in roles], ["population", "treatment", "outcome"])
+
+    def test_skips_a_death_table_outcome(self):
+        specs = self._specs(outcome=ConceptSetSpec(domain="death", concept_ids=()))
+        roles = _mapping_coverage_roles(specs, "add_on")
+        self.assertEqual([role for role, _ in roles], ["population", "treatment", "comparator"])
+
+    def test_skips_a_role_with_no_concept_ids(self):
+        specs = self._specs(comparator=ConceptSetSpec(domain="", concept_ids=()))
+        roles = _mapping_coverage_roles(specs, "add_on")
+        self.assertEqual([role for role, _ in roles], ["population", "treatment", "outcome"])
+
+
+class CheckMappingCoverageTests(unittest.TestCase):
+    """`_check_mapping_coverage` is the actual guardrail decision: the
+    thresholds it is judged against (`_MAPPING_COVERAGE_MIN_EVIDENCE_ROWS`/
+    `_MAPPING_COVERAGE_MIN_RATIO`) exist to reproduce, without a live
+    database, the exact real-world finding that motivated this gate --
+    RxNorm "Aspirin" (concept 1112807) matched only 3 `drug_exposure` rows
+    database-wide in mimic22_omop531, against ~180K unmapped rows whose
+    `drug_source_value` still read "Aspirin ..."."""
+
+    def setUp(self):
+        self.spec = ConceptSetSpec(domain="drug", concept_ids=(1112807,))
+
+    def test_blocks_the_aspirin_shaped_finding(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            _check_mapping_coverage(
+                "treatment", self.spec,
+                {"mapped_row_count": 3, "unmapped_name_matched_row_count": 180000},
+            )
+        message = str(ctx.exception)
+        self.assertIn("treatment", message)
+        self.assertIn("1112807", message)
+
+    def test_passes_when_coverage_is_high(self):
+        _check_mapping_coverage(
+            "treatment", self.spec,
+            {"mapped_row_count": 100000, "unmapped_name_matched_row_count": 50},
+        )
+
+    def test_passes_when_there_is_too_little_evidence_to_judge(self):
+        """A genuinely rare but well-mapped concept can have very few rows on
+        both sides -- below the evidence floor the gate must stay silent
+        rather than block on noise."""
+        _check_mapping_coverage(
+            "treatment", self.spec,
+            {"mapped_row_count": 1, "unmapped_name_matched_row_count": 2},
+        )
+
+    def test_treats_missing_counts_as_zero(self):
+        _check_mapping_coverage("treatment", self.spec, {})
+
+
+class _FakeSequentialCausalSelectClient:
+    """Duck-typed OMCP client returning one queued CSV response per
+    `causal_select` call, in call order. Lets a test assert exactly how many/
+    which queries `run_feasibility_mcp`'s mapping-coverage pre-check issues,
+    and confirms it short-circuits (raises) before consuming any later
+    queued response it never reaches."""
+
+    def __init__(self, responses: list[str]):
+        self._responses = list(responses)
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def causal_select(self, query: str, operation: str, causal_context: dict) -> MCPToolResponse:
+        self.calls.append((query, operation, causal_context))
+        text = self._responses.pop(0)
+        return MCPToolResponse(text=text, metadata={"rows": 1})
+
+
+_GOOD_COVERAGE_ROW = "mapped_row_count,unmapped_name_matched_row_count\n1000,0\n"
+_BAD_COVERAGE_ROW = "mapped_row_count,unmapped_name_matched_row_count\n3,180000\n"
+_FEASIBILITY_ROW = (
+    "eligible_persons,any_treatment,any_comparator,treatment_and_comparator,"
+    "treatment_only,comparator_only,neither_exposure,outcome_events,"
+    "outcome_events_treatment,outcome_events_comparator_only,"
+    "outcome_events_during_grace_period\n"
+    "500,0,120,0,0,120,380,40,0,40,2\n"
+)
+
+
+class WorkflowFeasibilityMappingGateTests(unittest.TestCase):
+    """`run_feasibility_mcp` must run the mapping-coverage check for every
+    applicable role *before* the real feasibility query -- turning a would-be
+    silent zero-patient cohort (see `causal.mapping.audit.
+    concept_mapping_coverage_sql`'s docstring for the MIMIC-IV/OMOP aspirin
+    finding that motivated this) into a hard, actionable error instead."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol_path = root / "protocol.json"
+        self.protocol_path.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
+            },
+            "data_source": "project.dataset",
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "approved",
+                    "domain": "condition", "concept_ids": [132797],
+                },
+                "treatment": {
+                    "role": "treatment", "status": "approved",
+                    "domain": "drug", "concept_ids": [1112807],
+                },
+                "comparator": {
+                    "role": "comparator", "status": "approved",
+                    "domain": "drug", "concept_ids": [2],
+                },
+                "outcome": {
+                    "role": "outcome", "status": "approved",
+                    "domain": "condition", "concept_ids": [316866],
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol_path, "exploratory")
+        self.run_id = state.run_id
+        self.run_dir = root / "runs" / self.run_id
+        self.manager.run_hypothesis_agent(self.run_id)
+        _approve_pre_mapping_gates(self.manager, self.run_id)
+        for _ in range(3):
+            self.manager.advance(self.run_id)
+        self.manager.decide_gate(self.run_id, "clinical_mapping", "provisional", "tester")
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "feasibility")
+        (self.run_dir / "analysis_plan.json").write_text(json.dumps({
+            "schema_version": "1.0",
+            "study_id": "test_study",
+            "data_source": "project.dataset",
+            "design": "target_trial_emulation",
+            "exploratory_execution_allowed": False,
+            "final_execution_allowed": False,
+            "unresolved_issues": ["mapping pending"],
+            "phenotypes": [],
+            "covariates": [],
+            "feasibility_checks": [],
+        }), encoding="utf-8")
+        self.datasets = BigQueryDatasets()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_blocks_on_a_critically_unmapped_treatment_concept(self):
+        client = _FakeSequentialCausalSelectClient([
+            _GOOD_COVERAGE_ROW,  # population
+            _BAD_COVERAGE_ROW,   # treatment -- the aspirin-shaped finding
+            _GOOD_COVERAGE_ROW,  # comparator (never reached)
+            _GOOD_COVERAGE_ROW,  # outcome (never reached)
+            _FEASIBILITY_ROW,    # main feasibility query (never reached)
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            self.manager.run_feasibility_mcp(self.run_id, client, self.datasets)
+        self.assertIn("treatment", str(ctx.exception))
+        # Only population + treatment were checked before the block fired.
+        self.assertEqual(len(client.calls), 2)
+        self.assertFalse((self.run_dir / "feasibility.json").is_file())
+
+    def test_proceeds_to_feasibility_when_coverage_is_fine_for_every_role(self):
+        client = _FakeSequentialCausalSelectClient([
+            _GOOD_COVERAGE_ROW,  # population
+            _GOOD_COVERAGE_ROW,  # treatment
+            _GOOD_COVERAGE_ROW,  # comparator
+            _GOOD_COVERAGE_ROW,  # outcome
+            _FEASIBILITY_ROW,    # main feasibility query
+        ])
+        state = self.manager.run_feasibility_mcp(self.run_id, client, self.datasets)
+        self.assertEqual(len(client.calls), 5)
+        self.assertTrue(all(op == "aggregate_feasibility" for _, op, _ in client.calls))
+        self.assertIn("feasibility.json", state.artifacts)
+        feasibility = json.loads((self.run_dir / "feasibility.json").read_text(encoding="utf-8"))
+        self.assertEqual(feasibility["counts"]["eligible_persons"], 500)
 
 
 if __name__ == "__main__":

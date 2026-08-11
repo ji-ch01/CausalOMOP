@@ -7,6 +7,7 @@ from typing import Any
 
 from causal.agents.query_validation import QueryValidationAgent
 from causal.config import BigQueryDatasets
+from causal.mapping.audit import concept_mapping_coverage_sql
 from causal.queries.feasibility import ConceptSetSpec, feasibility_sql
 
 
@@ -175,6 +176,21 @@ class BigQueryOMOPGateway:
         ])
         return [dict(row.items()) for row in self.client.query(sql, job_config=config).result()]
 
+    def mapping_coverage(self, spec: ConceptSetSpec, field: str) -> dict[str, int]:
+        """Mapped-vs-unmapped-name-matched row counts for one concept set
+        (see `causal.mapping.audit.concept_mapping_coverage_sql`) -- the
+        diagnostic `causal.orchestrator.workflow`'s feasibility gate uses to
+        block on an unmapped exposure/outcome/population before any cohort
+        SQL runs.
+        """
+        try:
+            from google.cloud import bigquery  # noqa: F401  (import-guard only)
+        except ImportError as exc:
+            raise RuntimeError("Install requirements-bigquery.txt") from exc
+        sql = concept_mapping_coverage_sql(self.datasets, spec, field)
+        rows = list(self.client.query(sql).result())
+        return dict(rows[0].items()) if rows else {}
+
     def feasibility(
         self,
         *,
@@ -186,6 +202,7 @@ class BigQueryOMOPGateway:
         follow_up_days: int = 28,
         min_age_years: int | None = 18,
         care_site_names: tuple[str, ...] = (),
+        exposure_contrast: str = "add_on",
     ) -> dict[str, Any]:
         """Run provisional cohort counts for one target-trial question.
 
@@ -206,6 +223,7 @@ class BigQueryOMOPGateway:
             follow_up_days=follow_up_days,
             min_age_years=min_age_years,
             care_site_names=care_site_names,
+            exposure_contrast=exposure_contrast,
         )
         validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")
         if not validation.passed:

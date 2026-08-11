@@ -16,12 +16,25 @@
     "outcome": "All-cause mortality within 28 days",
     "follow_up_days": 28,
     "primary_estimand": "ATE",
-    "secondary_estimands": ["CATE by age", "CATE by sex", "CATE by septic shock"]
+    "secondary_estimands": ["CATE by age", "CATE by sex", "CATE by septic shock"],
+    "eligibility_criteria": [
+      "Adult (>=18 years) at ICU admission",
+      "Sepsis diagnosis at or within a defined window of ICU admission",
+      "First qualifying ICU admission for the hospitalization",
+      "No albumin or crystalloid administration recorded before ICU admission (index event)"
+    ],
+    "assignment_procedure": "Not randomized; treatment arm (crystalloids plus albumin vs. crystalloids alone) is determined by the treating clinician's choice within the 24-hour grace period after ICU admission (observational target-trial emulation, not an RCT).",
+    "censoring_strategy": "Administrative censoring at the earlier of end of the observed data (observation period) or 28 days after time zero, for anyone who has neither died nor been observed for the full follow-up window.",
+    "analysis_strategy": "Intention-to-treat analog: treatment status is fixed by exposure within the 24-hour grace period and not updated afterward; a later crossover between arms is not accounted for.",
+    "effect_measure": "risk_difference",
+    "treatment_value": "Crystalloids plus albumin, initiated within 24 hours of ICU admission",
+    "comparator_value": "Crystalloids alone, no albumin within 24 hours of ICU admission"
   },
   "design_constraints": [
     "Align eligibility, treatment assignment, and start of follow-up to prevent immortal-time bias",
     "Use only covariates measured before or during the predefined baseline window",
-    "Do not promote text-matched concepts to executable concept sets without human validation"
+    "Do not promote text-matched concepts to executable concept sets without human validation",
+    "eligibility_criteria/assignment_procedure/censoring_strategy/analysis_strategy/effect_measure/treatment_value/comparator_value (added 2026-08-07) are inferred from standard target-trial-emulation conventions and this study's own design_constraints/query_settings, not transcribed verbatim from the reference paper's methods section -- verify against the paper directly before treating them as an exact restatement of its published protocol."
   ],
   "concept_sets": {
     "sepsis": {

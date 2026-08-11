@@ -48,6 +48,38 @@ class HypothesisAgentTests(unittest.TestCase):
         self.assertEqual(result.covariate_relations, ())
         self.assertEqual(result.rejected_covariates, ())
 
+
+class HypothesisAgentVsUnexposedComparatorTests(unittest.TestCase):
+    """A comparator concept set resolved as "no_standard_concept" is the
+    correct, final answer under a "vs_unexposed" design (e.g. "aspirin vs no
+    aspirin") -- there is no OMOP concept for "absence of a drug" -- so it
+    must not keep blocking `unresolved_issues`/`executable` the way every
+    other status/exposure_contrast combination does.
+    """
+
+    def _protocol(self, exposure_contrast: str | None) -> dict:
+        value = protocol()
+        value["concept_sets"] = {
+            "sepsis": {"status": "approved", "concept_ids": [132797], "role": "population"},
+            "albumin": {"status": "approved", "concept_ids": [1], "role": "treatment"},
+            "no_albumin": {"status": "no_standard_concept", "concept_ids": [], "role": "comparator"},
+        }
+        if exposure_contrast is not None:
+            value["query_settings"] = {"exposure_contrast": exposure_contrast}
+        return value
+
+    def test_no_standard_concept_comparator_is_not_unresolved_under_vs_unexposed(self):
+        result = HypothesisAgent().run(self._protocol("vs_unexposed"))
+        self.assertNotIn("concept_set:no_albumin:no_standard_concept", result.unresolved_issues)
+
+    def test_same_status_is_still_unresolved_under_add_on(self):
+        result = HypothesisAgent().run(self._protocol("add_on"))
+        self.assertIn("concept_set:no_albumin:no_standard_concept", result.unresolved_issues)
+
+    def test_same_status_is_still_unresolved_with_no_query_settings_at_all(self):
+        result = HypothesisAgent().run(self._protocol(None))
+        self.assertIn("concept_set:no_albumin:no_standard_concept", result.unresolved_issues)
+
     def test_accepts_and_normalizes_valid_dag_variable(self):
         value = protocol()
         value["candidate_dag"] = [

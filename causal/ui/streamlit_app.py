@@ -39,7 +39,13 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from causal.agents.dag_identification import review_dag
+from causal.agents.dag_metrics import (
+    max_structural_hamming_distance,
+    max_structural_intervention_distance,
+    normalized_agreement,
+)
 from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
+from causal.agents.data_science import LIFETIME_LOOKBACK_HOURS
 from causal.agents.hypothesis import (
     DAG_VARIABLE_DOMAINS,
     DAG_VARIABLE_ROLES,
@@ -55,9 +61,9 @@ from causal.config import BigQueryDatasets
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
 from causal.mcp_client import OMCPClient
-from causal.orchestrator.state import PHASES, RunState
+from causal.orchestrator.state import NEXT_PHASE, PHASES, RunState
 from causal.orchestrator.workflow import WorkflowManager
-from causal.queries import COVARIATE_AGGREGATIONS_BY_DOMAIN, OUTCOME_DOMAINS
+from causal.queries import COVARIATE_AGGREGATIONS_BY_DOMAIN, EXPOSURE_CONTRASTS, OUTCOME_DOMAINS
 from causal.roadmap import CausalDAG
 
 
@@ -71,14 +77,32 @@ _GATE_COLORS = {
 }
 
 _GATE_INFO: dict[str, dict[str, str]] = {
-    "protocol": {
-        "title": "Protocol & causal DAG",
-        "phase": "protocol_review",
+    "target_trial": {
+        "title": "Question & target trial",
+        "phase": "target_trial_review",
         "description": (
             "Approves the normalized causal question (population / treatment / comparator / "
-            "outcome) and the causal DAG proposed for it — the assumed confounders, mediators, "
-            "and colliders. Must be approved (major confounders resolved, DAG identified by "
-            "backdoor adjustment) before proceeding."
+            "outcome) and the target-trial protocol around it — eligibility criteria, "
+            "assignment procedure, censoring strategy, analysis strategy, and the counterfactual "
+            "estimand (effect measure, treatment/comparator contrast values)."
+        ),
+    },
+    "dag_review": {
+        "title": "Causal DAG & clinical completeness",
+        "phase": "dag_review",
+        "description": (
+            "Approves the causal DAG proposed for this question — the assumed confounders, "
+            "mediators, and colliders. Must be approved (every major confounder resolved) "
+            "before proceeding."
+        ),
+    },
+    "identification_estimand": {
+        "title": "Identification & estimand",
+        "phase": "identification_review",
+        "description": (
+            "Approves that the declared DAG is identified by backdoor adjustment and that the "
+            "full causal study specification (question, target trial, estimand, DAG) validates "
+            "as one internally consistent contract. Writes `study_specification.json` on approval."
         ),
     },
     "clinical_mapping": {
@@ -122,6 +146,13 @@ _NODE_COLORS = {
     "other": "#B0B0B0",
 }
 
+# Shown above any table that exposes a raw "Vocabulary"/"Domain" column, so a
+# non-expert reviewer doesn't need outside knowledge to read it.
+_VOCABULARY_CAPTION = (
+    "Vocabulary is the coding system a concept comes from -- e.g. RxNorm for medications, "
+    "ICD-10-CM/SNOMED for diagnoses, LOINC for lab tests. Domain is the OMOP table it lives in."
+)
+
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
@@ -130,6 +161,45 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+
+
+def _dag_agreement_score(distance: int, variable_count: int | None, max_distance_fn) -> float | None:
+    """`distance` (a raw SHD/SID count from `dag_tournament.py`) rescaled to
+    a 0.0-1.0 agreement score for display (see `normalized_agreement`).
+
+    `variable_count` is `None` for runs recorded before this field was
+    added -- there is no way to recover it after the fact, so this returns
+    `None` (rendered as a blank cell) rather than a guess.
+    """
+    if variable_count is None:
+        return None
+    return normalized_agreement(distance, max_distance_fn(variable_count))
+
+
+def _prettify_metric_key(key: str) -> str:
+    """`snake_case` key -> sentence-cased label, e.g. `outcome_events_treatment`
+    -> "Outcome events treatment". These keys come straight from SQL column
+    aliases (`causal/queries/feasibility.py`, `AnalyticCohortBuilder.profile_sql`)
+    with no fixed, enumerable set this app can hold its own display names for
+    -- this is a generic fallback, not a per-key mapping."""
+    label = key.replace("_", " ").strip()
+    return label[:1].upper() + label[1:] if label else label
+
+
+def _render_count_metrics(counts: dict[str, Any]) -> None:
+    """KPI-tile view of a flat {key: number} dict (feasibility/cohort-profile/
+    follow-up counts) instead of a raw JSON blob. The exact machine-readable
+    values are always still one click away via the caller's "raw data"
+    expander -- this is a friendlier default view of the same numbers, not a
+    replacement for them.
+    """
+    if not counts:
+        st.caption("No counts returned.")
+        return
+    with st.container(horizontal=True):
+        for key, value in counts.items():
+            display_value = f"{value:.2f}" if isinstance(value, float) else ("—" if value is None else value)
+            st.metric(_prettify_metric_key(key), display_value, border=True)
 
 
 def _badge(status: str) -> str:
@@ -162,6 +232,29 @@ def _reviewer_default() -> str:
     """Sidebar-entered reviewer name, reused so a reviewer stepping through
     several gates/covariates in one sitting doesn't retype it each time."""
     return st.session_state.get("reviewer_name", "")
+
+
+_REVIEWER_FIELD_KEY_PREFIXES = (
+    "reviewer_",
+    "covariate_reviewer_",
+    "concept_set_reviewer_",
+    "exposure_contrast_reviewer_",
+    "covariate_domain_reviewer_",
+    "covariate_window_reviewer_",
+    "covariate_aggregation_reviewer_",
+    "covariate_map_reviewer_",
+)
+
+
+def _sync_reviewer_fields() -> None:
+    """Push the sidebar name into every per-gate/per-covariate Reviewer
+    field already on screen. Needed because `st.text_input(value=...)` only
+    seeds a widget's session_state the first time its key is created --
+    once rendered, later reruns ignore `value=` and keep the stale text."""
+    name = st.session_state.get("reviewer_name", "")
+    for key in list(st.session_state.keys()):
+        if key.startswith(_REVIEWER_FIELD_KEY_PREFIXES):
+            st.session_state[key] = name
 
 
 def _run_option_label(run_id: str) -> str:
@@ -247,14 +340,19 @@ def _dag_to_dot(dag: CausalDAG) -> str:
     lines = [
         "digraph G {",
         "rankdir=LR;",
-        'node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];',
-        'edge [fontname="Helvetica", fontsize=9];',
+        'graph [pad="0.25", nodesep="0.45", ranksep="0.9", bgcolor="transparent"];',
+        'node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, margin="0.16,0.11"];',
+        'edge [fontname="Helvetica", fontsize=10, color="#667085", arrowsize=0.8];',
     ]
     for node in dag.nodes:
         color = _NODE_COLORS.get(node.role, "#B0B0B0")
+        role_label = node.role.replace("_", " ")
+        fontcolor = "#1F2937" if node.role in {"mediator", "other"} else "white"
+        emphasis = ", penwidth=3" if node.node_id in {dag.exposure_id, dag.outcome_id} else ""
         label = node.label.replace('"', "'")
         lines.append(
-            f'"{node.node_id}" [label="{label}\\n({node.role})", fillcolor="{color}", fontcolor="white"];'
+            f'"{node.node_id}" [label="{label}\\n{role_label}", fillcolor="{color}", '
+            f'fontcolor="{fontcolor}"{emphasis}];'
         )
     for edge in dag.edges:
         style = "solid" if edge.status in {"evidence_supported", "expert_approved"} else "dashed"
@@ -265,92 +363,223 @@ def _dag_to_dot(dag: CausalDAG) -> str:
 
 _PHASE_TO_GATE = {info["phase"]: gate_name for gate_name, info in _GATE_INFO.items()}
 
+_PHASE_LABELS: dict[str, str] = {
+    "target_trial_review": "question & target trial review",
+    "dag_review": "causal DAG review",
+    "identification_review": "identification & estimand review",
+    "concept_mapping": "clinical concept mapping",
+    "feasibility": "feasibility check",
+    "analysis_plan": "analysis plan",
+    "execution": "cohort execution",
+    "diagnostics": "diagnostics",
+    "results_review": "results review",
+    "report": "demo report",
+}
 
-def _render_phase_tracker(current_phase: str) -> None:
-    current_index = PHASES.index(current_phase)
-    columns = st.columns(len(PHASES))
-    for index, (column, phase) in enumerate(zip(columns, PHASES)):
-        if index < current_index:
-            marker = "✅"
-        elif index == current_index:
-            marker = "▶️"
-        else:
-            marker = "⬜"
-        label = f"{phase} 🔒" if phase in _PHASE_TO_GATE else phase
-        column.markdown(f"{marker}  \n**{label}**" if index == current_index else f"{marker}  \n{label}")
-    st.caption("🔒 = leaving this phase requires an approval gate decision (see the Gates & Validation tab).")
+# Phases with no approval gate (`_PHASE_TO_GATE` has no entry) have no
+# `advance()`-blocking decision to point to, so the hint instead names the
+# concrete action that produces this phase's artifacts.
+_NO_GATE_NEXT_ACTION: dict[str, str] = {
+    "feasibility": "run the feasibility check (Feasibility & cohort)",
+    "execution": "build the cohort plan and run it (Feasibility & cohort)",
+    "diagnostics": "review the cohort diagnostics (Feasibility & cohort)",
+    "report": "generate the demo report (Report & audit)",
+}
 
 
-def _render_gates_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
-    st.subheader("Approval gates")
-    st.caption(
-        "The pipeline has 4 human sign-off points, each tied to one phase of the run (🔒 in the "
-        "tracker above). A phase can't advance to the next until its gate is `approved` — or, for "
-        "clinical mapping in exploratory mode, `provisional`."
+def _next_action_text(state: RunState) -> str:
+    """One sentence naming the next concrete thing a reviewer should do,
+    kept consistent with the same rule `WorkflowManager.advance` enforces
+    (`REQUIRED_GATES`/`NEXT_PHASE`) so this can never suggest an action the
+    Advance button would then reject.
+    """
+    gate_name = _PHASE_TO_GATE.get(state.phase)
+    if gate_name is None:
+        return _NO_GATE_NEXT_ACTION.get(state.phase, "advance to the next phase") + "."
+    gate = state.gates[gate_name]
+    title = _GATE_INFO[gate_name]["title"]
+    if gate.status == "rejected":
+        return f"resolve the blocking issues, then re-decide the {title} gate (Current task)."
+    accepted = gate.status == "approved" or (
+        gate.status == "provisional" and gate_name == "clinical_mapping" and state.mode == "exploratory"
     )
+    if accepted:
+        next_phase = NEXT_PHASE[state.phase]
+        return f"advance to {_PHASE_LABELS.get(next_phase, next_phase)} (Current task)."
+    return f"decide the {title} gate (Current task)."
 
-    hypothesis = _read_json(run_dir / "hypothesis.json")
-    if hypothesis is not None and state.gates["protocol"].status != "approved":
-        try:
-            artifact = _hypothesis_artifact_from_dict(hypothesis)
-            identification = review_dag(artifact).identification
-            if identification.identified_by_backdoor_adjustment:
-                st.success(
-                    "Causal DAG is identified by backdoor adjustment — the protocol gate "
-                    "is clear to approve on that front. See the Hypothesis & DAG tab for details."
-                )
-            else:
-                st.error(
-                    "Causal DAG is **not** identified by backdoor adjustment — approving the "
-                    "protocol gate will be rejected until this is resolved. See the Hypothesis "
-                    "& DAG tab for the blocking notes."
-                )
-        except (KeyError, ValueError):
-            pass
 
-    for gate_name, gate in state.gates.items():
-        info = _GATE_INFO.get(gate_name, {"title": gate_name, "phase": "—", "description": ""})
-        with st.container(border=True):
-            header_col, badge_col = st.columns([3, 1])
-            header_col.markdown(f"**{info['title']}** &nbsp; `{gate_name}`", unsafe_allow_html=True)
-            badge_col.markdown(_badge(gate.status), unsafe_allow_html=True)
-            st.caption(f"Gates leaving phase `{info['phase']}`. {info['description']}")
-            if gate.reviewer:
-                st.caption(
-                    f"Last decision by {html.escape(gate.reviewer)} at {gate.decided_at}"
-                    + (f" — {html.escape(gate.comment)}" if gate.comment else "")
-                )
-            with st.form(key=f"gate_form_{gate_name}"):
-                reviewer = st.text_input(
-                    "Reviewer", value=_reviewer_default(), key=f"reviewer_{gate_name}"
-                )
-                comment = st.text_area("Comment (optional)", key=f"comment_{gate_name}")
-                status = st.selectbox(
-                    "Decision",
-                    ("approved", "rejected", "provisional"),
-                    key=f"status_{gate_name}",
-                )
-                submitted = st.form_submit_button("Decide")
-                if submitted:
-                    try:
-                        manager.decide_gate(
-                            state.run_id, gate_name, status, reviewer, comment or None
-                        )
-                        st.success(f"{gate_name} set to {status}")
-                        st.rerun()
-                    except ValueError as exc:
-                        st.error(str(exc))
+def _render_phase_tracker(state: RunState) -> None:
+    current_phase = state.phase
+    current_index = PHASES.index(current_phase)
+    current_gate = _PHASE_TO_GATE.get(current_phase)
+    gate_status = state.gates[current_gate].status if current_gate else "action required"
 
-    st.divider()
-    st.subheader("Advance phase")
-    st.caption(f"Current phase: `{state.phase}`")
-    if st.button("Advance to next phase"):
+    phase_col, progress_col, gate_col = st.columns(3)
+    phase_col.metric("Current phase", _PHASE_LABELS.get(current_phase, current_phase), border=True)
+    progress_col.metric("Workflow progress", f"{current_index + 1} of {len(PHASES)}", border=True)
+    gate_col.metric(
+        "Current checkpoint",
+        gate_status.replace("_", " "),
+        border=True,
+    )
+    st.info(f"Next action: {_next_action_text(state)}", icon=":material/arrow_forward:")
+
+    with st.expander("View the complete workflow", icon=":material/account_tree:"):
+        for start in range(0, len(PHASES), 3):
+            columns = st.columns(3)
+            for index, phase in enumerate(PHASES[start : start + 3], start=start):
+                phase_label = _PHASE_LABELS.get(phase, phase)
+                if index < current_index:
+                    status, color, icon = "Completed", "green", ":material/check_circle:"
+                elif index == current_index:
+                    status, color, icon = "Current", "blue", ":material/play_circle:"
+                else:
+                    status, color, icon = "Upcoming", "gray", ":material/lock:"
+                with columns[index - start]:
+                    st.markdown(f"**{phase_label}**")
+                    st.badge(status, color=color, icon=icon)
+        st.caption("A locked step may require an approval decision before the workflow can continue.")
+
+
+def _render_target_trial_summary(run_dir: Path) -> None:
+    """Read-only view of `protocol["target_trial"]` -- what the `target_trial`
+    gate actually approves (see `WorkflowManager._block_if_target_trial_
+    incomplete`). Deliberately read-only: these fields are drafted upfront
+    (by the LLM prompt or a manually authored protocol.json), reviewed and
+    approved/rejected here, not iteratively built through the workflow the
+    way concept mappings are -- so there is no `set_*` review action to pair
+    it with, unlike `_render_exposure_contrast_selector`.
+    """
+    protocol = _read_json(run_dir / "protocol.json")
+    target = (protocol or {}).get("target_trial")
+    if not isinstance(target, dict):
+        st.info("No target_trial object in protocol.json yet.")
+        return
+    with st.expander("Target trial & estimand (target_trial gate content)", expanded=False):
+        col1, col2 = st.columns(2)
+        col1.markdown(f"**Population**  \n{target.get('population', '—')}")
+        col1.markdown(f"**Treatment**  \n{target.get('treatment', '—')}")
+        col1.markdown(f"**Comparator**  \n{target.get('comparator', '—')}")
+        col1.markdown(f"**Outcome**  \n{target.get('outcome', '—')}")
+        col1.markdown(f"**Time zero**  \n{target.get('time_zero', '—')}")
+        col2.markdown(f"**Assignment procedure**  \n{target.get('assignment_procedure', '—')}")
+        col2.markdown(f"**Censoring strategy**  \n{target.get('censoring_strategy', '—')}")
+        col2.markdown(f"**Analysis strategy**  \n{target.get('analysis_strategy', '—')}")
+        col2.markdown(
+            f"**Estimand**  \n{target.get('effect_measure', '—')}: "
+            f"{target.get('treatment_value', '—')} vs {target.get('comparator_value', '—')}"
+        )
+        criteria = target.get("eligibility_criteria") or []
+        st.markdown("**Eligibility criteria**")
+        if criteria:
+            st.markdown("\n".join(f"- {item}" for item in criteria))
+        else:
+            st.caption("None recorded.")
+
+
+def _render_gate_card(manager: WorkflowManager, state: RunState, gate_name: str) -> None:
+    gate = state.gates[gate_name]
+    info = _GATE_INFO.get(gate_name, {"title": gate_name, "phase": "—", "description": ""})
+    with st.container(border=True):
+        header_col, badge_col = st.columns([3, 1])
+        header_col.markdown(f"**{info['title']}**")
+        badge_col.markdown(_badge(gate.status), unsafe_allow_html=True)
+        phase_label = _PHASE_LABELS.get(info["phase"], info["phase"])
+        st.caption(f"Gates leaving the {phase_label} phase. {info['description']}")
+        if gate.reviewer:
+            st.caption(
+                f"Last decision by {html.escape(gate.reviewer)} at {gate.decided_at}"
+                + (f" — {html.escape(gate.comment)}" if gate.comment else "")
+            )
+        with st.form(key=f"gate_form_{state.run_id}_{gate_name}"):
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"reviewer_{state.run_id}_{gate_name}"
+            )
+            comment = st.text_area("Comment (optional)", key=f"comment_{state.run_id}_{gate_name}")
+            status = st.selectbox(
+                "Decision",
+                ("approved", "rejected", "provisional"),
+                key=f"status_{state.run_id}_{gate_name}",
+            )
+            if st.form_submit_button("Save decision", type="primary"):
+                try:
+                    manager.decide_gate(state.run_id, gate_name, status, reviewer, comment or None)
+                    st.success(f"{info['title']} set to {status}")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+
+def _advance_phase_button(manager: WorkflowManager, state: RunState) -> None:
+    if st.button("Advance to next phase", type="primary", icon=":material/arrow_forward:"):
         try:
             manager.advance(state.run_id)
             st.success("Phase advanced")
             st.rerun()
         except RuntimeError as exc:
             st.error(str(exc))
+
+
+def _render_gates_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
+    st.subheader("Current task")
+    st.caption(
+        "Complete the current review decision before advancing. Other gates are shown below in "
+        "workflow order for reference."
+    )
+    _render_target_trial_summary(run_dir)
+
+    current_gate_name = _PHASE_TO_GATE.get(state.phase)
+    if current_gate_name is None:
+        st.info(f"Current action: {_next_action_text(state)}", icon=":material/arrow_forward:")
+        _advance_phase_button(manager, state)
+    else:
+        _render_gate_card(manager, state, current_gate_name)
+        current_gate = state.gates[current_gate_name]
+        may_advance = current_gate.status == "approved" or (
+            current_gate_name == "clinical_mapping"
+            and state.mode == "exploratory"
+            and current_gate.status == "provisional"
+        )
+        if may_advance:
+            st.space("small")
+            _advance_phase_button(manager, state)
+        else:
+            st.caption("Save an approved decision to unlock the next phase.")
+
+    hypothesis = _read_json(run_dir / "hypothesis.json")
+    if (
+        current_gate_name == "identification_estimand"
+        and hypothesis is not None
+        and state.gates["identification_estimand"].status != "approved"
+    ):
+        try:
+            artifact = _hypothesis_artifact_from_dict(hypothesis)
+            identification = review_dag(artifact).identification
+            if identification.identified_by_backdoor_adjustment:
+                st.success(
+                    "Causal DAG is identified by backdoor adjustment — the identification_estimand "
+                    "gate is clear to approve on that front. See Study design for details."
+                )
+            else:
+                st.error(
+                    "Causal DAG is **not** identified by backdoor adjustment — approving the "
+                    "identification_estimand gate will be rejected until this is resolved. See Study "
+                    "design for the blocking notes."
+                )
+        except (KeyError, ValueError):
+            pass
+
+    ordered_gate_names = [
+        _PHASE_TO_GATE[phase]
+        for phase in PHASES
+        if phase in _PHASE_TO_GATE and _PHASE_TO_GATE[phase] in state.gates
+    ]
+    remaining_gate_names = [name for name in state.gates if name not in ordered_gate_names]
+    with st.expander("All approval gates", icon=":material/fact_check:"):
+        for gate_name in ordered_gate_names + remaining_gate_names:
+            if gate_name != current_gate_name:
+                _render_gate_card(manager, state, gate_name)
 
 
 def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
@@ -391,62 +620,82 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
     adjustment = review.adjustment
 
     st.warning(review.caveat)
-    st.caption(f"Active comparator represented on the DAG: **{artifact.comparator or '—'}**")
-
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("Confounders", identification.confounder_count)
-    metric_cols[1].metric(
-        "Identified by backdoor adjustment", "Yes" if identification.identified_by_backdoor_adjustment else "No"
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Variables", len(identification.dag.nodes), border=True)
+    metric_cols[1].metric("Confounders", identification.confounder_count, border=True)
+    metric_cols[2].metric(
+        "Backdoor identified",
+        "Yes" if identification.identified_by_backdoor_adjustment else "No",
+        border=True,
     )
-    metric_cols[2].metric("Candidate adjustment sets", len(identification.minimum_adjustment_sets))
+    metric_cols[3].metric("Adjustment sets", len(identification.minimum_adjustment_sets), border=True)
 
-    if identification.minimum_adjustment_sets:
-        st.markdown("**Minimum adjustment sets**")
-        for adjustment_set in identification.minimum_adjustment_sets:
-            labels = [identification.dag.node_map[node_id].label for node_id in adjustment_set]
-            st.markdown(f"- {', '.join(labels) if labels else '(empty set)'}")
-        if adjustment.core_variable_labels or adjustment.alternative_variable_labels:
-            st.caption(
-                "**Core** (in every minimum set — required, not optional): "
-                f"{', '.join(adjustment.core_variable_labels) or '—'}. "
-                "**Alternative** (in some but not all — interchangeable for backdoor-blocking, "
-                "may still differ clinically): "
-                f"{', '.join(adjustment.alternative_variable_labels) or '—'}."
-            )
+    with st.container(border=True):
+        st.markdown("**Candidate causal DAG**")
+        st.caption(
+            "Read left to right: arrows represent the assumed causal structure. "
+            "Treatment and outcome nodes have a thicker border."
+        )
+        st.graphviz_chart(_dag_to_dot(identification.dag), width="stretch", height=520)
+        st.caption(
+            ":blue-badge[Treatment] :red-badge[Outcome] :green-badge[Confounder] "
+            ":orange-badge[Mediator] :violet-badge[Collider] :gray-badge[Other role] · "
+            "Solid arrows are evidence-supported or expert-approved; dashed arrows remain proposed."
+        )
+
+    adjustment_col, review_col = st.columns([3, 2], vertical_alignment="top")
+    with adjustment_col:
+        st.subheader("Adjustment strategy")
+        if identification.minimum_adjustment_sets:
+            st.caption("Adjust for one complete set below; do not combine partial sets.")
+            for index, adjustment_set in enumerate(identification.minimum_adjustment_sets, start=1):
+                labels = [identification.dag.node_map[node_id].label for node_id in adjustment_set]
+                with st.container(border=True):
+                    st.markdown(f"**Set {index}**")
+                    st.write(", ".join(labels) if labels else "No covariate adjustment required by this DAG.")
+            if adjustment.core_variable_labels or adjustment.alternative_variable_labels:
+                st.caption(
+                    "Core variables: "
+                    f"{', '.join(adjustment.core_variable_labels) or '—'}. "
+                    "Alternatives: "
+                    f"{', '.join(adjustment.alternative_variable_labels) or '—'}."
+                )
+        else:
+            st.info("No minimum adjustment set is available for this DAG.", icon=":material/info:")
         if adjustment.unused_confounder_labels:
             st.warning(
-                "Declared confounder(s) that never appear in any minimum adjustment set — "
-                "either redundant given the rest of the DAG, or worth double-checking the role "
-                "assignment: " + ", ".join(adjustment.unused_confounder_labels)
+                "Review these declared confounders; they do not appear in a minimum adjustment set: "
+                + ", ".join(adjustment.unused_confounder_labels),
+                icon=":material/warning:",
             )
 
+    with review_col:
+        st.subheader("Review status")
+        if clinical.approved_for_dag_gate:
+            st.success("Clinical review is ready for the DAG gate.", icon=":material/check_circle:")
+        else:
+            st.error("Clinical review is blocked.", icon=":material/error:")
+        st.caption(f"Comparator represented in the DAG: {artifact.comparator or '—'}")
+        if clinical.blocking_issues:
+            st.error("\n".join(f"- {issue}" for issue in clinical.blocking_issues))
+        if clinical.advisory_notes:
+            st.warning("\n".join(f"- {note}" for note in clinical.advisory_notes))
+        if identification.technical_notes:
+            with st.expander("Identification notes", icon=":material/functions:"):
+                st.caption("Graph-theoretic checks only; not a clinical judgment.")
+                st.markdown("\n".join(f"- {note}" for note in identification.technical_notes))
+
     if evidence.total_items:
-        evidence_metric_cols = st.columns(4)
-        evidence_metric_cols[0].metric("Evidence: literature only", evidence.literature_only)
-        evidence_metric_cols[1].metric("Evidence: knowledge graph only", evidence.kg_only)
-        evidence_metric_cols[2].metric("Evidence: corroborated (both)", evidence.corroborated)
-        evidence_metric_cols[3].metric("Evidence: uncited", evidence.uncited)
-        st.caption(
-            f"{evidence.cited_fraction:.0%} of DAG items ({evidence.total_items} total) carry at least "
-            f"one citation; {evidence.corroborated_fraction:.0%} are corroborated by two independent "
-            "sources (literature and knowledge graph)."
-        )
-
-    if identification.technical_notes:
-        st.info(
-            "Graph-theoretic notes (identification only — not a clinical judgment):\n"
-            + "\n".join(f"- {note}" for note in identification.technical_notes)
-        )
-
-    st.markdown(
-        f"**Clinical validation: {'approved for DAG gate' if clinical.approved_for_dag_gate else 'blocked'}**"
-    )
-    if clinical.blocking_issues:
-        st.error("\n".join(f"- {issue}" for issue in clinical.blocking_issues))
-    if clinical.advisory_notes:
-        st.warning("\n".join(f"- {note}" for note in clinical.advisory_notes))
-
-    st.graphviz_chart(_dag_to_dot(identification.dag))
+        with st.expander("Evidence coverage", icon=":material/menu_book:"):
+            evidence_metric_cols = st.columns(4)
+            evidence_metric_cols[0].metric("Literature only", evidence.literature_only, border=True)
+            evidence_metric_cols[1].metric("Knowledge graph only", evidence.kg_only, border=True)
+            evidence_metric_cols[2].metric("Corroborated", evidence.corroborated, border=True)
+            evidence_metric_cols[3].metric("Uncited", evidence.uncited, border=True)
+            st.caption(
+                f"{evidence.cited_fraction:.0%} of DAG items ({evidence.total_items} total) carry at least "
+                f"one citation; {evidence.corroborated_fraction:.0%} are corroborated by both sources."
+            )
 
     evidence_rows = [
         {
@@ -454,7 +703,7 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "Role": variable.role.replace("_", " "),
             "Evidence id": variable.pmid or "—",
             "Evidence level": variable.evidence_level.replace("_", " "),
-            "KG-corroborated": "✓" if variable.kg_evidence_id else "",
+            "Knowledge-graph corroborated": "✓" if variable.kg_evidence_id else "",
         }
         for variable in artifact.candidate_dag
     ] + [
@@ -463,7 +712,7 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
             "Role": "covariate relation",
             "Evidence id": relation.pmid or "—",
             "Evidence level": relation.evidence_level.replace("_", " "),
-            "KG-corroborated": "✓" if relation.kg_evidence_id else "",
+            "Knowledge-graph corroborated": "✓" if relation.kg_evidence_id else "",
         }
         for relation in artifact.covariate_relations
     ]
@@ -472,10 +721,10 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         st.caption(
             "Evidence id is a PubMed/OpenAlex citation or a knowledge-graph relation id. "
             "Evidence level is the citation's tier (systematic review > RCT > observational). "
-            "KG-corroborated marks items where the knowledge graph independently confirmed "
-            "a literature-cited relation."
+            "Knowledge-graph corroborated marks items where the knowledge graph independently "
+            "confirmed a literature-cited relation."
         )
-        st.dataframe(evidence_rows, width="stretch")
+        st.dataframe(evidence_rows, hide_index=True, width="stretch")
 
     dag_unresolved = (_read_json(run_dir / "protocol.json") or {}).get("candidate_dag_unresolved") or []
     if dag_unresolved:
@@ -488,61 +737,175 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
 
     tournament = (_read_json(run_dir / "protocol.json") or {}).get("dag_tournament")
     if isinstance(tournament, dict):
-        st.markdown("**Population/tournament DAG drafting**")
+        st.markdown("**Draft DAG comparison**")
         st.caption(
-            f"{tournament.get('candidate_count')} independent candidate(s) drafted; "
-            f"{tournament.get('dropped_duplicate_count')} dropped as SHD-duplicates; "
-            f"{tournament.get('survivor_count')} survivor(s) merged by deterministic edge union "
-            "(see docs/dag_generation_audit.md §9)."
+            f"{tournament.get('candidate_count')} draft DAG(s) were generated independently. "
+            f"{tournament.get('dropped_duplicate_count')} were dropped as near-identical to "
+            f"another draft. The remaining {tournament.get('survivor_count')} were combined into "
+            "the DAG shown above."
         )
         conflicts = tournament.get("conflicts") or []
         if conflicts:
             st.warning(
-                "Merge conflicts require human review (never silently resolved):\n"
+                "These disagreements between drafts need human review (never resolved "
+                "automatically):\n"
                 + "\n".join(f"- [{conflict['kind']}] {conflict['description']}" for conflict in conflicts)
             )
 
         pairwise_distances = tournament.get("pairwise_distances") or []
         merge_fidelity = tournament.get("merge_fidelity") or []
         if pairwise_distances or merge_fidelity:
-            with st.expander("Pairwise SHD/SID and merge fidelity"):
+            with st.expander("Agreement between independently drafted DAGs", icon=":material/compare_arrows:"):
+                agreement_column = st.column_config.ProgressColumn(format="percent", min_value=0.0, max_value=1.0)
                 if pairwise_distances:
+                    comparisons = []
+                    all_structural_scores = []
+                    all_causal_scores = []
+                    expert_rows = []
+                    for entry in pairwise_distances:
+                        structural_score = _dag_agreement_score(
+                            entry["shd"], entry.get("variable_count"), max_structural_hamming_distance
+                        )
+                        causal_a_to_b = _dag_agreement_score(
+                            entry["sid_a_given_b"], entry.get("variable_count"), max_structural_intervention_distance
+                        )
+                        causal_b_to_a = _dag_agreement_score(
+                            entry["sid_b_given_a"], entry.get("variable_count"), max_structural_intervention_distance
+                        )
+                        if structural_score is not None:
+                            all_structural_scores.append(structural_score)
+                        all_causal_scores.extend(
+                            score for score in (causal_a_to_b, causal_b_to_a) if score is not None
+                        )
+                        candidate_a = entry["candidate_a"]
+                        candidate_b = entry["candidate_b"]
+                        causal_text = (
+                            f"{causal_a_to_b:.0%} (draft {candidate_a} reference) · "
+                            f"{causal_b_to_a:.0%} (draft {candidate_b} reference)"
+                            if causal_a_to_b is not None and causal_b_to_a is not None
+                            else "Not available for this historical run"
+                        )
+                        comparisons.append(
+                            {
+                                "Compared drafts": f"Draft {candidate_a} vs draft {candidate_b}",
+                                "Relationship similarity (SHD)": structural_score,
+                                "Causal implication similarity (SID)": causal_text,
+                            }
+                        )
+                        expert_rows.append(
+                            {
+                                "Compared drafts": f"Draft {candidate_a} vs draft {candidate_b}",
+                                "Variables compared": entry.get("variable_count"),
+                                "SHD (raw disagreements)": entry["shd"],
+                                "Relationship similarity (SHD)": structural_score,
+                                f"SID with draft {candidate_a} as reference": entry["sid_a_given_b"],
+                                f"Causal similarity, draft {candidate_a} reference": causal_a_to_b,
+                                f"SID with draft {candidate_b} as reference": entry["sid_b_given_a"],
+                                f"Causal similarity, draft {candidate_b} reference": causal_b_to_a,
+                            }
+                        )
+
+                    summary_cols = st.columns(3)
+                    summary_cols[0].metric("Draft pairs compared", len(comparisons), border=True)
+                    summary_cols[1].metric(
+                        "Lowest relationship similarity",
+                        f"{min(all_structural_scores):.0%}" if all_structural_scores else "Not available",
+                        border=True,
+                        help="The most structurally different pair. 100% means identical arrows and directions.",
+                    )
+                    summary_cols[2].metric(
+                        "Lowest causal implication similarity",
+                        f"{min(all_causal_scores):.0%}" if all_causal_scores else "Not available",
+                        border=True,
+                        help="The most different directional comparison for predicted intervention conclusions.",
+                    )
+                    st.info(
+                        "This is a consistency check across independently generated drafts — it does **not** "
+                        "establish that any DAG is clinically correct.",
+                        icon=":material/info:",
+                    )
+                    st.markdown("**Plain-language comparison**")
                     st.caption(
-                        "SHD counts edge-type disagreements between two candidates; it cannot "
-                        "tell whether any of them would change a computed causal effect. SID "
-                        "(Peters & Bühlmann, 2015) answers that directly and is not symmetric, "
-                        "so both directions are shown -- two candidates can share the same SHD "
-                        "yet have very different SID (see docs/dag_generation_audit.md §9)."
+                        "Relationship similarity asks: *do the drafts draw the same arrows in the same "
+                        "direction?* Causal implication similarity asks: *could the differences alter an "
+                        "interventional conclusion?* Both are shown because a small drawing difference may "
+                        "or may not matter for causal inference."
+                    )
+                    st.dataframe(
+                        comparisons,
+                        column_config={"Relationship similarity (SHD)": agreement_column},
+                        hide_index=True,
+                        width="stretch",
+                    )
+                if merge_fidelity:
+                    st.markdown("**Does the final merged DAG preserve each draft's causal conclusions?**")
+                    st.caption(
+                        "100% means the merged DAG retains the causal implications of that draft. "
+                        "A lower value indicates that a flagged merge conflict excluded some variables "
+                        "or relationships and requires review."
                     )
                     st.dataframe(
                         [
                             {
-                                "Candidate A": entry["candidate_a"],
-                                "Candidate B": entry["candidate_b"],
-                                "SHD": entry["shd"],
-                                "SID(A given B)": entry["sid_a_given_b"],
-                                "SID(B given A)": entry["sid_b_given_a"],
+                                "Candidate": entry["candidate_index"],
+                                "Causal conclusions preserved": _dag_agreement_score(
+                                    entry["sid_to_merged"],
+                                    entry.get("variable_count"),
+                                    max_structural_intervention_distance,
+                                ),
                             }
-                            for entry in pairwise_distances
-                        ],
-                        width="stretch",
-                    )
-                if merge_fidelity:
-                    st.caption(
-                        "SID from each surviving candidate's own DAG to the final merged DAG. "
-                        "Proposition 7 (Peters & Bühlmann, 2015) implies this should be 0 -- a "
-                        "merged DAG is a superset of every survivor's edges by construction -- "
-                        "unless a merge conflict above excluded some of that survivor's own "
-                        "variables or relations, in which case a positive value quantifies how "
-                        "much of that candidate's causal-inference conclusions were not "
-                        "preserved by the merge."
-                    )
-                    st.dataframe(
-                        [
-                            {"Candidate": entry["candidate_index"], "SID to merged DAG": entry["sid_to_merged"]}
                             for entry in merge_fidelity
                         ],
+                        column_config={"Causal conclusions preserved": agreement_column},
+                        hide_index=True,
                         width="stretch",
+                    )
+                if pairwise_distances:
+                    with st.expander("Expert detail: SHD, SID, direction and raw values", icon=":material/school:"):
+                        st.markdown("**How the percentages are calculated**")
+                        st.markdown(
+                            "- **Relationship similarity (SHD)** compares every unordered pair of variable "
+                            "labels: no arrow, arrow A → B, or arrow B → A. The displayed percentage is "
+                            "`1 − SHD / [n(n−1)/2]`, where *n* is the number of unique labels across the pair.\n"
+                            "- **Causal implication similarity (SID)** checks every ordered intervention/outcome "
+                            "pair. The percentage is `1 − SID / [n(n−1)]`. SID is directional: \"draft A as "
+                            "reference\" asks whether draft B preserves causal conclusions implied by draft A.\n"
+                            "- **Important limitation:** variables are matched by their displayed labels. Different "
+                            "wording for the same clinical concept (for example, `age` versus `patient age`) "
+                            "is counted as a difference."
+                        )
+                        st.markdown("**Pairwise values**")
+                        st.dataframe(
+                            expert_rows,
+                            column_config={
+                                "Relationship similarity (SHD)": agreement_column,
+                                **{
+                                    column: agreement_column
+                                    for column in expert_rows[0]
+                                    if column.startswith("Causal similarity")
+                                },
+                            },
+                            hide_index=True,
+                            width="stretch",
+                        )
+                        st.caption(
+                            "Raw SHD/SID counts and the number of compared variables are also retained in "
+                            "protocol.json for reproducibility."
+                        )
+                with st.expander("Further technical notes", icon=":material/menu_book:"):
+                    st.caption(
+                        "Structural agreement is based on Structural Hamming Distance (SHD): the "
+                        "count of relationship disagreements between two drafts, rescaled to a "
+                        "0-100% score. Causal agreement is based on Structural Intervention "
+                        "Distance (SID; Peters & Bühlmann, 2015), which checks whether a "
+                        "disagreement would actually change a computed causal effect -- not "
+                        "symmetric, so both directions are shown separately (see "
+                        "docs/dag_generation_audit.md §9). \"Preserved in final DAG\" applies the "
+                        "same SID-based rescaling to the distance from each draft's own DAG to the "
+                        "merged DAG (Proposition 7 implies it should always read 100% unless a "
+                        "merge conflict excluded something). Runs from before this scoring was "
+                        "added show blank scores here. Raw SHD/SID counts for every pair are always "
+                        "saved in this run's protocol.json (see Artifacts below)."
                     )
 
     if artifact.unresolved_covariates:
@@ -556,31 +919,32 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         major_set = set(artifact.major_confounders)
         for label in artifact.unresolved_covariates:
             is_major = label in major_set
-            with st.container(border=True), st.form(key=f"covariate_form_{label}"):
+            with st.container(border=True), st.form(key=f"covariate_form_{run_id}_{label}"):
                 st.markdown(f"**{label}**" + (" 🔴 major confounder" if is_major else ""))
                 reviewer = st.text_input(
-                    "Reviewer", value=_reviewer_default(), key=f"covariate_reviewer_{label}"
+                    "Reviewer", value=_reviewer_default(), key=f"covariate_reviewer_{run_id}_{label}"
                 )
                 decision_choice = st.selectbox(
                     "Decision",
                     ("reject",) + DAG_VARIABLE_ROLES,
-                    key=f"covariate_decision_{label}",
+                    key=f"covariate_decision_{run_id}_{label}",
                     format_func=lambda value: "Reject" if value == "reject" else value.replace("_", " "),
                 )
                 temporal_choice = st.selectbox(
                     "Temporal classification (relative to treatment)",
                     DAG_VARIABLE_TEMPORAL_CLASSES,
-                    key=f"covariate_temporal_{label}",
+                    key=f"covariate_temporal_{run_id}_{label}",
+                    format_func=_humanize,
                 )
                 domain_choice = st.selectbox(
                     "OMOP domain (optional; enables a concept lookup later)",
                     ("",) + DAG_VARIABLE_DOMAINS,
-                    key=f"covariate_domain_{label}",
+                    key=f"covariate_domain_{run_id}_{label}",
                     format_func=lambda value: "Not yet assessed" if value == "" else value,
                 )
                 comment = st.text_area(
                     "Rationale" if decision_choice != "reject" else "Comment (optional)",
-                    key=f"covariate_comment_{label}",
+                    key=f"covariate_comment_{run_id}_{label}",
                 )
                 submitted = st.form_submit_button("Submit decision")
                 if submitted:
@@ -643,13 +1007,12 @@ def _omcp_lookup(client: OMCPClient, domain: str, term: str) -> Any:
 
 
 def _concept_option_label(candidate: dict[str, Any]) -> str:
-    """Multiselect option label for one search result: name plus, when
-    available, its edit-distance match score -- so a reviewer can tell a
-    near-exact match from a loose fuzzy fallback without opening the
-    candidate table separately."""
-    score = candidate.get("match_score")
-    suffix = f" (edit distance {score:g})" if score is not None else ""
-    return f"{candidate['concept_id']} — {candidate['concept_name']}{suffix}"
+    """Multiselect option label for one search result: name and OMOP concept
+    id. Options are always pre-sorted best-match-first (`_sorted_by_match_score`),
+    so relative match quality is already conveyed by list order without also
+    spelling out the raw edit-distance score here -- see the "Technical
+    detail" table alongside this multiselect for the exact number."""
+    return f"{candidate['concept_name']} — OMOP concept {candidate['concept_id']}"
 
 
 def _sorted_by_match_score(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -659,6 +1022,21 @@ def _sorted_by_match_score(candidates: list[dict[str, Any]]) -> list[dict[str, A
     return sorted(
         candidates,
         key=lambda c: c.get("match_score") if c.get("match_score") is not None else float("inf"),
+    )
+
+
+def _format_concept_ids(concept_ids: Any, candidates: Any) -> str:
+    """Render approved OMOP concept ids as "name (id)" for a clinician
+    reading the summary table, resolving names from `candidates` (this run's
+    already-loaded `concept_candidates`, see `DataScienceAgent._attach_concept_candidates`)
+    -- no extra OMCP lookup needed. Falls back to the bare id when a concept
+    was approved from a search whose results this run's artifact no longer
+    carries (e.g. approved before `concept_candidates` was persisted)."""
+    if not concept_ids:
+        return "—"
+    name_by_id = {c.get("concept_id"): c.get("concept_name") for c in candidates or ()}
+    return ", ".join(
+        f"{name_by_id[cid]} ({cid})" if name_by_id.get(cid) else str(cid) for cid in concept_ids
     )
 
 
@@ -704,11 +1082,11 @@ def _render_omcp_concept_search(*, state_key: str, domain: str, default_term: st
     from the previous one instead of showing a mismatched list.
     """
     term = st.text_input("Search term", value=default_term, key=f"{state_key}_term")
-    if st.button("Search OMCP", key=f"{state_key}_btn"):
+    if st.button("Search", key=f"{state_key}_btn"):
         try:
             datasets = BigQueryDatasets.from_env()
             client = OMCPClient(datasets)
-            with st.spinner(f"Searching OMCP for {term!r} (domain={domain})..."):
+            with st.spinner(f"Searching for '{term}'..."):
                 response = _omcp_lookup(client, domain, term)
             st.session_state[state_key] = _parse_concept_rows(response.text, domain)
         except (ValueError, RuntimeError, OSError) as exc:
@@ -739,7 +1117,9 @@ def _default_domain_index(role: str, current_domain: str, options: tuple[str, ..
     return options.index(guess) if guess in options else 0
 
 
-def _render_concept_set_mapping_forms(manager: WorkflowManager, run_id: str, concept_sets: dict) -> None:
+def _render_concept_set_mapping_forms(
+    manager: WorkflowManager, run_id: str, concept_sets: dict, exposure_contrast: str
+) -> None:
     """One search-and-approve form per `concept_sets` entry.
 
     This is now the only concept-mapping step for population/treatment/
@@ -763,10 +1143,16 @@ def _render_concept_set_mapping_forms(manager: WorkflowManager, run_id: str, con
             f"Map '{name}' (role: {role or '—'})",
             expanded=definition.get("status") != "approved",
         ):
+            if role == "comparator" and exposure_contrast == "vs_unexposed":
+                st.caption(
+                    "Comparator design is set to \"unexposed comparator\" above -- this study's "
+                    "comparator arm is simply everyone who wasn't treated, so no OMOP concept is "
+                    "needed here. Leave unmapped, or set status to \"No standard concept\" below."
+                )
             domain_choice = st.selectbox(
                 "OMOP domain", domain_options,
                 index=_default_domain_index(role, current_domain, domain_options),
-                key=f"concept_set_domain_{name}",
+                key=f"concept_set_domain_{run_id}_{name}",
             )
             if not current_domain:
                 st.caption(
@@ -780,7 +1166,7 @@ def _render_concept_set_mapping_forms(manager: WorkflowManager, run_id: str, con
                 option_ids: list[int] = []
             else:
                 candidates = _sorted_by_match_score(_render_omcp_concept_search(
-                    state_key=f"concept_set_candidates_{name}_{domain_choice}",
+                    state_key=f"concept_set_candidates_{run_id}_{name}_{domain_choice}",
                     domain=domain_choice,
                     default_term=(
                         definition.get("lookup_term") or definition.get("label") or name.replace("_", " ")
@@ -788,21 +1174,22 @@ def _render_concept_set_mapping_forms(manager: WorkflowManager, run_id: str, con
                 ))
                 name_by_id = {c["concept_id"]: _concept_option_label(c) for c in candidates}
                 option_ids = list(dict.fromkeys([c["concept_id"] for c in candidates] + existing_ids))
-            with st.form(key=f"concept_set_map_form_{name}"):
+            with st.form(key=f"concept_set_map_form_{run_id}_{name}"):
                 if domain_choice == "death":
                     chosen_ids: list[int] = []
                 else:
                     chosen_ids = st.multiselect(
-                        "Approve concept_id(s)", options=option_ids, default=existing_ids,
+                        "Approve OMOP concept(s)", options=option_ids, default=existing_ids,
                         format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
-                        key=f"concept_set_map_ids_{name}",
+                        key=f"concept_set_map_ids_{run_id}_{name}",
                     )
                 status_choice = st.selectbox(
                     "Status", ("approved", "no_standard_concept", "pending_omop_mapping"),
-                    key=f"concept_set_status_{name}",
+                    key=f"concept_set_status_{run_id}_{name}",
+                    format_func=_humanize,
                 )
                 reviewer = st.text_input(
-                    "Reviewer", value=_reviewer_default(), key=f"concept_set_reviewer_{name}"
+                    "Reviewer", value=_reviewer_default(), key=f"concept_set_reviewer_{run_id}_{name}"
                 )
                 submitted = st.form_submit_button("Save mapping")
                 if submitted:
@@ -815,6 +1202,73 @@ def _render_concept_set_mapping_forms(manager: WorkflowManager, run_id: str, con
                         st.rerun()
                     except (ValueError, RuntimeError, OSError) as exc:
                         st.error(str(exc))
+
+
+# exposure_contrast value -> (clinician-facing label, plain-language
+# description). See `causal.queries.feasibility.EXPOSURE_CONTRASTS`'s own
+# comment for the full modeling rationale behind each design.
+_EXPOSURE_CONTRAST_INFO: dict[str, tuple[str, str]] = {
+    "add_on": (
+        "Add-on (comparator is a required backbone therapy)",
+        "Everyone gets the comparator; the treatment arm additionally gets the treatment on top "
+        'of it. E.g. "crystalloids plus albumin vs. crystalloids alone".',
+    ),
+    "mutually_exclusive": (
+        "Active comparator (drug vs. drug)",
+        "Keeps only people who received exactly one of treatment/comparator, each mapped to "
+        'its own OMOP concept. E.g. "aspirin vs. clopidogrel".',
+    ),
+    "vs_unexposed": (
+        "Unexposed comparator (drug vs. no drug)",
+        "The comparator arm is simply everyone who did not receive the treatment -- no OMOP "
+        'concept is mapped (or needed) for the comparator. E.g. "aspirin vs. no aspirin".',
+    ),
+}
+
+
+def _render_exposure_contrast_selector(manager: WorkflowManager, run_id: str, protocol: dict) -> str:
+    """Lets a reviewer choose how `treatment`/`comparator` combine into the
+    cohort inclusion filter and the binary arm indicator (see
+    `causal.queries.feasibility.EXPOSURE_CONTRASTS`) -- a real modeling
+    decision, not a query-engine detail: getting it wrong silently changes
+    who ends up in the cohort. Previously only settable by hand-editing
+    protocol.json, with every run silently defaulting to "add_on".
+
+    Returns the currently-saved value (before any unsubmitted form edit), so
+    callers can adapt other widgets (e.g. the comparator mapping form) to it
+    without re-reading protocol.json themselves.
+    """
+    settings = protocol.get("query_settings")
+    current = (settings or {}).get("exposure_contrast", "add_on")
+    st.markdown("**Comparator design**")
+    st.caption(
+        "How the comparator relates to the treatment. Getting this wrong silently changes who "
+        "ends up in the cohort, so pick the one that actually matches this study's question:"
+    )
+    for value in EXPOSURE_CONTRASTS:
+        label, description = _EXPOSURE_CONTRAST_INFO[value]
+        current_marker = " — **current**" if value == current else ""
+        st.caption(f"- **{label}**{current_marker}: {description}")
+    with st.form(key=f"exposure_contrast_form_{run_id}"):
+        choice = st.selectbox(
+            "Comparator design",
+            EXPOSURE_CONTRASTS,
+            index=EXPOSURE_CONTRASTS.index(current) if current in EXPOSURE_CONTRASTS else 0,
+            format_func=lambda value: _EXPOSURE_CONTRAST_INFO[value][0],
+            key=f"exposure_contrast_choice_{run_id}",
+        )
+        reviewer = st.text_input(
+            "Reviewer", value=_reviewer_default(), key=f"exposure_contrast_reviewer_{run_id}"
+        )
+        submitted = st.form_submit_button("Save comparator design")
+        if submitted:
+            try:
+                manager.set_exposure_contrast(run_id, choice, reviewer)
+                st.success("Comparator design saved")
+                st.rerun()
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+    return current
 
 
 def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
@@ -841,26 +1295,35 @@ def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_d
     st.subheader("Concept mapping")
     st.caption(
         "OMOP concept sets used to operationalize this question's population/treatment/"
-        "comparator/outcome (and any other declared phenotype). Feeds both phenotype review "
-        "(the Data Science Agent) and cohort/feasibility SQL generation -- one mapping per role."
+        "comparator/outcome (and any other declared phenotype). Feeds both the analysis plan "
+        "below and cohort/feasibility query generation -- one mapping per role."
     )
 
+    exposure_contrast = _render_exposure_contrast_selector(manager, run_id, protocol or {})
+    st.divider()
+
+    st.caption(
+        "OMOP concept(s) are shown as numeric codes here because their matched clinical names "
+        "aren't saved once approved -- expand a row below to search and see the name before "
+        "approving, or re-run the search there to look one up again."
+    )
     st.dataframe(
         [
             {
-                "name": name,
-                "role": definition.get("role", "—"),
-                "domain": definition.get("domain") or "—",
-                "status": definition.get("status", "—"),
-                "concept_ids": ", ".join(str(c) for c in definition.get("concept_ids", ())) or "none yet",
-                "label": definition.get("label", ""),
+                "Name": name,
+                "Role": _humanize(definition.get("role")),
+                "OMOP domain": definition.get("domain") or "—",
+                "Status": _humanize(definition.get("status")),
+                "OMOP concept(s)": ", ".join(str(c) for c in definition.get("concept_ids", ())) or "none yet",
+                "Description": definition.get("label", ""),
             }
             for name, definition in concept_sets.items()
             if isinstance(definition, dict)
         ],
+        hide_index=True,
         width="stretch",
     )
-    _render_concept_set_mapping_forms(manager, run_id, concept_sets)
+    _render_concept_set_mapping_forms(manager, run_id, concept_sets, exposure_contrast)
 
 
 def _render_regenerate_plan_section(manager: WorkflowManager, run_id: str) -> None:
@@ -876,8 +1339,8 @@ def _render_regenerate_plan_section(manager: WorkflowManager, run_id: str) -> No
     """
     with st.form(key="regenerate_analysis_plan_form"):
         refresh_candidates = st.checkbox(
-            "Also refresh OMOP concept candidates via OMCP (slower -- one lookup per "
-            "phenotype/covariate still pending a mapping)",
+            "Also refresh OMOP concept suggestions (slower -- one lookup per phenotype/"
+            "covariate still pending a mapping)",
             key="regenerate_plan_with_mcp",
         )
         regenerate = st.form_submit_button("Regenerate analysis plan")
@@ -888,12 +1351,296 @@ def _render_regenerate_plan_section(manager: WorkflowManager, run_id: str) -> No
         if refresh_candidates:
             datasets = BigQueryDatasets.from_env()
             lookup = OMCPClient(datasets)
-        with st.spinner("Running the Data Science Agent..."):
+        with st.spinner("Regenerating the analysis plan..."):
             manager.run_data_science_agent(run_id, lookup)
         st.success("Analysis plan regenerated.")
         st.rerun()
     except (ValueError, RuntimeError, OSError) as exc:
         st.error(str(exc))
+
+
+_COVARIATE_STATUS_BADGE: dict[str, tuple[str, str]] = {
+    "ready": ("Ready", "green"),
+    "definition_pending": ("Needs review", "orange"),
+    "unobserved": ("Not observed", "gray"),
+}
+
+_COVARIATE_MAPPING_BADGE: dict[str, tuple[str, str]] = {
+    "approved": ("Mapped", "green"),
+    "no_standard_concept": ("No OMOP concept", "gray"),
+    "unmapped": ("Not mapped", "orange"),
+}
+
+_COVARIATE_LEAKAGE_BADGE: dict[str, tuple[str, str]] = {
+    "low": ("Low leakage risk", "green"),
+    "review_required": ("Review required", "orange"),
+}
+
+
+def _covariate_needs_review(covariate: dict[str, Any]) -> bool:
+    return covariate.get("status") != "ready" or covariate.get("leakage_risk") == "review_required"
+
+
+def _covariate_review_reasons(covariate: dict[str, Any]) -> list[str]:
+    """Why this covariate isn't extraction-ready yet, mirroring the exact fields
+    `DataScienceAgent._covariate_from_variable` checks to compute
+    `extraction_ready` (mapping_status/domain/aggregation) -- surfaced here,
+    not re-derived, so this can never disagree with the actual gating logic.
+    """
+    if covariate.get("status") == "unobserved":
+        return ["Not observed for this study -- no covariate decision needed."]
+    reasons = []
+    if not covariate.get("domain"):
+        reasons.append("OMOP domain not yet confirmed.")
+    if covariate.get("mapping_status", "unmapped") != "approved":
+        reasons.append("Concept mapping not yet approved.")
+    if covariate.get("aggregation", "definition_pending") in ("", "definition_pending"):
+        reasons.append("Aggregation method not yet chosen.")
+    if covariate.get("leakage_risk") == "review_required":
+        reasons.append("Ascertainment window needs clinical review (measured at/after treatment).")
+    return reasons
+
+
+def _humanize(token: Any) -> str:
+    """Turn an internal snake_case enum/status token (e.g. "no_standard_concept")
+    into space-separated words for clinician-facing display. Only ever
+    reformats a code's punctuation, never its meaning -- so a still-unhandled
+    status shows up as readable words instead of a raw underscored code,
+    rather than silently disappearing."""
+    if token in (None, ""):
+        return "—"
+    return str(token).replace("_", " ")
+
+
+def _format_blocker(blocker: str) -> str:
+    """Render one `execution_readiness.json` blocker code (see
+    `causal.agents.execution.ExecutionAgent.run`) as a clinician-readable
+    sentence instead of the raw `prefix:label:status`-shaped string it's
+    stored as. Recognizes the fixed set of prefixes that agent emits;
+    anything else (a future blocker kind, or an opaque hypothesis-level
+    `unresolved_issues` entry) falls back to a generic humanized rendering
+    so it stays readable without needing this function updated in lockstep.
+    """
+    parts = blocker.split(":")
+    head = parts[0]
+    if head == "analysis_plan_gate" and len(parts) == 2:
+        return f"Analysis plan: {_humanize(parts[1])}."
+    if head == "clinical_mapping_gate" and len(parts) == 2:
+        return f"Clinical concept mapping: {_humanize(parts[1])}."
+    if head == "covariate_not_ready" and len(parts) == 2:
+        return f"Covariate '{parts[1]}' is not ready yet (mapping/aggregation still pending)."
+    if head == "phenotype_not_approved" and len(parts) == 2:
+        return f"Phenotype '{parts[1]}' is not yet approved."
+    if head == "unresolved" and len(parts) >= 2:
+        rest = parts[1:]
+        if rest[0] == "concept_set" and len(rest) == 3:
+            return f"Concept set '{rest[1]}': {_humanize(rest[2])}."
+        if rest[0] == "phenotype" and len(rest) == 3:
+            return f"Phenotype '{rest[1]}': {_humanize(rest[2])}."
+        if rest[0] == "covariate" and len(rest) == 3:
+            return f"Covariate '{rest[1]}': {_humanize(rest[2])}."
+        return _humanize(":".join(rest))
+    return _humanize(blocker)
+
+
+def _format_covariate_window(window_start_hours: Any, window_end_hours: Any) -> str:
+    """Render a covariate's ascertainment window in plain language, mapping
+    `LIFETIME_LOOKBACK_HOURS` back to "any time before treatment" instead of
+    its raw (and clinician-meaningless) hour count. Shared by the covariate
+    table and the per-covariate detail card so the two never drift apart."""
+    start_display = (
+        "any time before treatment" if window_start_hours == LIFETIME_LOOKBACK_HOURS
+        else f"{window_start_hours}h"
+    )
+    return f"{start_display} to {window_end_hours}h"
+
+
+def _render_covariate_card(manager: WorkflowManager, run_id: str, c: dict[str, Any]) -> None:
+    """One collapsible card per covariate: current state (badges), why a
+    decision is required (if any), and the four review actions as tabs --
+    domain, window, aggregation, and concept mapping. Replaces what used to
+    be four stacked `st.form`s per covariate so a run with several covariates
+    doesn't turn the tab into one long scroll of near-identical forms.
+    """
+    name = c.get("name")
+    domain = c.get("domain")
+    status = c.get("status", "definition_pending")
+    mapping_status = c.get("mapping_status", "unmapped")
+    leakage_risk = c.get("leakage_risk", "review_required")
+
+    with st.expander(f"{name} — {_humanize(c.get('causal_role'))}", expanded=_covariate_needs_review(c)):
+        with st.container(horizontal=True):
+            status_label, status_color = _COVARIATE_STATUS_BADGE.get(status, (_humanize(status), "gray"))
+            st.badge(status_label, color=status_color)
+            mapping_label, mapping_color = _COVARIATE_MAPPING_BADGE.get(
+                mapping_status, (_humanize(mapping_status), "gray")
+            )
+            st.badge(mapping_label, color=mapping_color)
+            leakage_label, leakage_color = _COVARIATE_LEAKAGE_BADGE.get(
+                leakage_risk, (_humanize(leakage_risk), "gray")
+            )
+            st.badge(leakage_label, color=leakage_color)
+
+        reasons = _covariate_review_reasons(c)
+        if reasons:
+            st.caption("Why a decision is required: " + " ".join(reasons))
+
+        domain_tab, window_tab, aggregation_tab, mapping_tab = st.tabs(
+            ["Domain", "Window", "Aggregation", "Mapping"]
+        )
+
+        with domain_tab, st.form(key=f"covariate_domain_form_{run_id}_{name}"):
+            st.caption(
+                f"Currently {domain or 'not yet assessed'}. The DAG-drafting step proposes one "
+                "from the literature it read, but it is only a starting guess; confirm or "
+                "correct it before concept search/aggregation depend on it. Changing an "
+                "already-set domain resets any concept mapping/aggregation already saved "
+                "for this covariate."
+            )
+            domain_choice = st.selectbox(
+                "OMOP domain", DAG_VARIABLE_DOMAINS,
+                index=DAG_VARIABLE_DOMAINS.index(domain) if domain in DAG_VARIABLE_DOMAINS else 0,
+                key=f"covariate_domain_choice_{run_id}_{name}",
+            )
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"covariate_domain_reviewer_{run_id}_{name}",
+            )
+            submitted = st.form_submit_button("Save domain")
+            if submitted:
+                try:
+                    manager.review_covariate_domain(run_id, name, domain_choice, reviewer)
+                    st.success(f"Domain saved for '{name}'")
+                    st.rerun()
+                except (ValueError, RuntimeError) as exc:
+                    st.error(str(exc))
+
+        with window_tab, st.form(key=f"covariate_window_form_{run_id}_{name}"):
+            window_start_hours = c.get("window_start_hours")
+            window_end_hours = c.get("window_end_hours")
+            st.caption(
+                f"Currently {_format_covariate_window(window_start_hours, window_end_hours)} "
+                "relative to index (auto-derived unless overridden below)."
+            )
+            window_col1, window_col2 = st.columns(2)
+            window_start = window_col1.number_input(
+                "Window start (hours, ≤ 0)", value=int(window_start_hours or 0),
+                max_value=0, step=1, key=f"covariate_window_start_{run_id}_{name}",
+                help=f"{LIFETIME_LOOKBACK_HOURS} means \"any time before treatment\" -- the "
+                "auto-derived default for low-risk covariates, not a typo.",
+            )
+            window_end = window_col2.number_input(
+                "Window end (hours, ≤ 0)", value=int(window_end_hours or 0),
+                max_value=0, step=1, key=f"covariate_window_end_{run_id}_{name}",
+            )
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"covariate_window_reviewer_{run_id}_{name}",
+            )
+            submitted = st.form_submit_button("Save window")
+            if submitted:
+                try:
+                    manager.review_covariate_window(
+                        run_id, name, int(window_start), int(window_end), reviewer,
+                    )
+                    st.success(f"Window saved for '{name}'")
+                    st.rerun()
+                except (ValueError, RuntimeError) as exc:
+                    st.error(str(exc))
+
+        with aggregation_tab:
+            allowed_aggregations = COVARIATE_AGGREGATIONS_BY_DOMAIN.get(domain) if domain else None
+            if not allowed_aggregations:
+                st.caption("Set a domain first — aggregation choices depend on it.")
+            else:
+                with st.form(key=f"covariate_aggregation_form_{run_id}_{name}"):
+                    aggregation_choice = st.selectbox(
+                        f"Aggregation (domain: {domain})",
+                        allowed_aggregations,
+                        key=f"covariate_aggregation_choice_{run_id}_{name}",
+                        format_func=_humanize,
+                    )
+                    reviewer = st.text_input(
+                        "Reviewer", value=_reviewer_default(),
+                        key=f"covariate_aggregation_reviewer_{run_id}_{name}",
+                    )
+                    submitted = st.form_submit_button("Save aggregation")
+                    if submitted:
+                        try:
+                            manager.review_covariate_aggregation(
+                                run_id, name, aggregation_choice, reviewer,
+                            )
+                            st.success(f"Aggregation saved for '{name}'")
+                            st.rerun()
+                        except (ValueError, RuntimeError) as exc:
+                            st.error(str(exc))
+
+        with mapping_tab:
+            candidates = c.get("concept_candidates") or []
+            if not candidates:
+                st.caption(
+                    "No OMOP concept candidates yet — regenerate the analysis plan after "
+                    "setting a domain."
+                )
+            else:
+                ranked_candidates = _sorted_by_match_score(candidates)
+                st.caption("Best matches first. Pick the correct OMOP concept(s) below.")
+                with st.expander("Search results (technical detail)", icon=":material/data_object:"):
+                    st.caption(_VOCABULARY_CAPTION)
+                    st.dataframe(
+                        [
+                            {
+                                "OMOP concept ID": candidate.get("concept_id"),
+                                "Name": candidate.get("concept_name"),
+                                "Vocabulary": candidate.get("vocabulary_id"),
+                                "Domain": candidate.get("domain_id"),
+                                "Match score (lower = closer)": candidate.get("match_score"),
+                            }
+                            for candidate in ranked_candidates
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                    )
+                name_by_id = {
+                    candidate.get("concept_id"): _concept_option_label(candidate)
+                    for candidate in ranked_candidates
+                }
+                with st.form(key=f"covariate_map_form_{run_id}_{name}"):
+                    chosen_ids = st.multiselect(
+                        "Approve OMOP concept(s) for this covariate",
+                        options=[candidate.get("concept_id") for candidate in ranked_candidates],
+                        format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
+                        key=f"covariate_map_ids_{run_id}_{name}",
+                    )
+                    mapping_status_choice = st.selectbox(
+                        "Mapping status",
+                        ("approved", "no_standard_concept"),
+                        key=f"covariate_map_status_{run_id}_{name}",
+                        format_func=_humanize,
+                    )
+                    reviewer = st.text_input(
+                        "Reviewer", value=_reviewer_default(), key=f"covariate_map_reviewer_{run_id}_{name}"
+                    )
+                    submitted = st.form_submit_button("Save concept mapping")
+                    if submitted:
+                        try:
+                            # Only "approved" mappings need OMCP's domain check
+                            # (see `WorkflowManager.map_covariate_concepts`) --
+                            # skip building a client for "no_standard_concept"
+                            # so a submodule/credentials issue can't block that
+                            # (already OMCP-free) reviewer decision.
+                            concept_lookup = None
+                            if mapping_status_choice == "approved":
+                                datasets = BigQueryDatasets.from_env()
+                                concept_lookup = OMCPClient(datasets)
+                            with st.spinner("Verifying concept domain..."):
+                                manager.map_covariate_concepts(
+                                    run_id, name, chosen_ids, reviewer,
+                                    mapping_status=mapping_status_choice,
+                                    concept_lookup=concept_lookup,
+                                )
+                            st.success(f"Concept mapping saved for '{name}'")
+                            st.rerun()
+                        except (ValueError, RuntimeError, OSError) as exc:
+                            st.error(str(exc))
 
 
 def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
@@ -911,9 +1658,11 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
     st.subheader("Analysis plan")
     col1, col2 = st.columns(2)
     col1.markdown(f"**Data source**  \n`{plan.get('data_source', '—')}`")
-    col1.markdown(f"**Design**  \n`{plan.get('design', '—')}`")
-    col2.markdown(f"**Exploratory execution allowed**  \n`{plan.get('exploratory_execution_allowed', '—')}`")
-    col2.markdown(f"**Final execution allowed**  \n`{plan.get('final_execution_allowed', '—')}`")
+    col1.markdown(f"**Design**  \n{_humanize(plan.get('design'))}")
+    col2.markdown(
+        f"**OK to run in exploratory mode**  \n{'Yes' if plan.get('exploratory_execution_allowed') else 'No'}"
+    )
+    col2.markdown(f"**OK to run in final mode**  \n{'Yes' if plan.get('final_execution_allowed') else 'No'}")
 
     phenotypes = plan.get("phenotypes") or []
     if phenotypes:
@@ -921,34 +1670,37 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
         st.dataframe(
             [
                 {
-                    "name": p.get("name"),
-                    "role": p.get("role"),
-                    "domain": p.get("domain"),
-                    "mode": p.get("mode"),
-                    "status": p.get("status"),
-                    "concept_ids": ", ".join(str(c) for c in p.get("concept_ids", ())) or "—",
-                    "source_value_rule": p.get("source_value_rule") or "—",
-                    "omop_tables": ", ".join(p.get("omop_tables", ())),
+                    "Name": p.get("name"),
+                    "Role": _humanize(p.get("role")),
+                    "OMOP domain": p.get("domain"),
+                    "Mode": _humanize(p.get("mode")),
+                    "Status": _humanize(p.get("status")),
+                    "OMOP concept(s)": _format_concept_ids(p.get("concept_ids", ()), p.get("concept_candidates")),
+                    "Matching rule": p.get("source_value_rule") or "—",
+                    "OMOP tables": ", ".join(p.get("omop_tables", ())),
                 }
                 for p in phenotypes
             ],
+            hide_index=True,
             width="stretch",
         )
         for p in phenotypes:
             candidates = p.get("concept_candidates") or []
             if candidates:
                 with st.expander(f"Candidate OMOP concepts for '{p.get('name')}' ({len(candidates)})"):
+                    st.caption(_VOCABULARY_CAPTION)
                     st.dataframe(
                         [
                             {
-                                "concept_id": c.get("concept_id"),
-                                "concept_name": c.get("concept_name"),
-                                "vocabulary_id": c.get("vocabulary_id"),
-                                "domain_id": c.get("domain_id"),
-                                "match_score": c.get("match_score"),
+                                "OMOP concept ID": c.get("concept_id"),
+                                "Name": c.get("concept_name"),
+                                "Vocabulary": c.get("vocabulary_id"),
+                                "Domain": c.get("domain_id"),
+                                "Match score (lower = closer)": c.get("match_score"),
                             }
                             for c in _sorted_by_match_score(candidates)
                         ],
+                        hide_index=True,
                         width="stretch",
                     )
 
@@ -958,159 +1710,26 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
         st.dataframe(
             [
                 {
-                    "name": c.get("name"),
-                    "causal_role": c.get("causal_role"),
-                    "adjustment_role": c.get("adjustment_role") or "—",
-                    "window_hours": f"{c.get('window_start_hours')} to {c.get('window_end_hours')}",
-                    "leakage_risk": c.get("leakage_risk"),
-                    "status": c.get("status"),
-                    "domain": c.get("domain") or "—",
-                    "mapping_status": c.get("mapping_status", "unmapped"),
-                    "concept_ids": ", ".join(str(cid) for cid in c.get("concept_ids", ())) or "—",
-                    "aggregation": c.get("aggregation", "definition_pending"),
+                    "Name": c.get("name"),
+                    "Causal role": _humanize(c.get("causal_role")),
+                    "Adjustment role": _humanize(c.get("adjustment_role")),
+                    "Window": _format_covariate_window(
+                        c.get("window_start_hours"), c.get("window_end_hours")
+                    ),
+                    "Leakage risk": _humanize(c.get("leakage_risk")),
+                    "Status": _humanize(c.get("status")),
+                    "OMOP domain": c.get("domain") or "—",
+                    "Mapping status": _humanize(c.get("mapping_status", "unmapped")),
+                    "OMOP concept(s)": _format_concept_ids(c.get("concept_ids", ()), c.get("concept_candidates")),
+                    "Aggregation": _humanize(c.get("aggregation", "definition_pending")),
                 }
                 for c in covariates
             ],
+            hide_index=True,
             width="stretch",
         )
         for c in covariates:
-            domain = c.get("domain")
-            with st.form(key=f"covariate_domain_form_{c.get('name')}"):
-                st.caption(
-                    f"OMOP domain for '{c.get('name')}' -- currently "
-                    f"{domain or 'not yet assessed'}. The DAG-drafting step proposes one from "
-                    "the literature it read, but it is only a starting guess; confirm or "
-                    "correct it before concept search/aggregation depend on it. Changing an "
-                    "already-set domain resets any concept mapping/aggregation already saved "
-                    "for this covariate."
-                )
-                domain_choice = st.selectbox(
-                    "OMOP domain", DAG_VARIABLE_DOMAINS,
-                    index=DAG_VARIABLE_DOMAINS.index(domain) if domain in DAG_VARIABLE_DOMAINS else 0,
-                    key=f"covariate_domain_choice_{c.get('name')}",
-                )
-                reviewer = st.text_input(
-                    "Reviewer", value=_reviewer_default(), key=f"covariate_domain_reviewer_{c.get('name')}",
-                )
-                submitted = st.form_submit_button("Save domain")
-                if submitted:
-                    try:
-                        manager.review_covariate_domain(run_id, c.get("name"), domain_choice, reviewer)
-                        st.success(f"Domain saved for '{c.get('name')}'")
-                        st.rerun()
-                    except (ValueError, RuntimeError) as exc:
-                        st.error(str(exc))
-
-            allowed_aggregations = COVARIATE_AGGREGATIONS_BY_DOMAIN.get(domain) if domain else None
-            if allowed_aggregations:
-                with st.form(key=f"covariate_aggregation_form_{c.get('name')}"):
-                    aggregation_choice = st.selectbox(
-                        f"Aggregation for '{c.get('name')}' (domain: {domain})",
-                        allowed_aggregations,
-                        key=f"covariate_aggregation_choice_{c.get('name')}",
-                    )
-                    reviewer = st.text_input(
-                        "Reviewer", value=_reviewer_default(),
-                        key=f"covariate_aggregation_reviewer_{c.get('name')}",
-                    )
-                    submitted = st.form_submit_button("Save aggregation")
-                    if submitted:
-                        try:
-                            manager.review_covariate_aggregation(
-                                run_id, c.get("name"), aggregation_choice, reviewer,
-                            )
-                            st.success(f"Aggregation saved for '{c.get('name')}'")
-                            st.rerun()
-                        except (ValueError, RuntimeError) as exc:
-                            st.error(str(exc))
-
-            with st.form(key=f"covariate_window_form_{c.get('name')}"):
-                st.caption(
-                    f"Ascertainment window for '{c.get('name')}' -- currently "
-                    f"{c.get('window_start_hours')}h to {c.get('window_end_hours')}h relative to index "
-                    "(auto-derived unless overridden below)."
-                )
-                col1, col2 = st.columns(2)
-                window_start = col1.number_input(
-                    "Window start (hours, ≤ 0)", value=int(c.get("window_start_hours") or 0),
-                    max_value=0, step=1, key=f"covariate_window_start_{c.get('name')}",
-                )
-                window_end = col2.number_input(
-                    "Window end (hours, ≤ 0)", value=int(c.get("window_end_hours") or 0),
-                    max_value=0, step=1, key=f"covariate_window_end_{c.get('name')}",
-                )
-                reviewer = st.text_input(
-                    "Reviewer", value=_reviewer_default(), key=f"covariate_window_reviewer_{c.get('name')}",
-                )
-                submitted = st.form_submit_button("Save window")
-                if submitted:
-                    try:
-                        manager.review_covariate_window(
-                            run_id, c.get("name"), int(window_start), int(window_end), reviewer,
-                        )
-                        st.success(f"Window saved for '{c.get('name')}'")
-                        st.rerun()
-                    except (ValueError, RuntimeError) as exc:
-                        st.error(str(exc))
-
-            candidates = c.get("concept_candidates") or []
-            if candidates:
-                with st.expander(f"Candidate OMOP concepts for '{c.get('name')}' ({len(candidates)})"):
-                    st.dataframe(
-                        [
-                            {
-                                "concept_id": candidate.get("concept_id"),
-                                "concept_name": candidate.get("concept_name"),
-                                "vocabulary_id": candidate.get("vocabulary_id"),
-                                "domain_id": candidate.get("domain_id"),
-                                "match_score": candidate.get("match_score"),
-                            }
-                            for candidate in _sorted_by_match_score(candidates)
-                        ],
-                        width="stretch",
-                    )
-                    ranked_candidates = _sorted_by_match_score(candidates)
-                    name_by_id = {
-                        candidate.get("concept_id"): _concept_option_label(candidate)
-                        for candidate in ranked_candidates
-                    }
-                    with st.form(key=f"covariate_map_form_{c.get('name')}"):
-                        chosen_ids = st.multiselect(
-                            "Approve concept_id(s) for this covariate",
-                            options=[candidate.get("concept_id") for candidate in ranked_candidates],
-                            format_func=lambda cid: name_by_id.get(cid, str(cid)),
-                            key=f"covariate_map_ids_{c.get('name')}",
-                        )
-                        mapping_status_choice = st.selectbox(
-                            "Mapping status",
-                            ("approved", "no_standard_concept"),
-                            key=f"covariate_map_status_{c.get('name')}",
-                        )
-                        reviewer = st.text_input(
-                            "Reviewer", value=_reviewer_default(), key=f"covariate_map_reviewer_{c.get('name')}"
-                        )
-                        submitted = st.form_submit_button("Save concept mapping")
-                        if submitted:
-                            try:
-                                # Only "approved" mappings need OMCP's domain check
-                                # (see `WorkflowManager.map_covariate_concepts`) --
-                                # skip building a client for "no_standard_concept"
-                                # so a submodule/credentials issue can't block that
-                                # (already OMCP-free) reviewer decision.
-                                concept_lookup = None
-                                if mapping_status_choice == "approved":
-                                    datasets = BigQueryDatasets.from_env()
-                                    concept_lookup = OMCPClient(datasets)
-                                with st.spinner("Verifying concept domain via OMCP..."):
-                                    manager.map_covariate_concepts(
-                                        run_id, c.get("name"), chosen_ids, reviewer,
-                                        mapping_status=mapping_status_choice,
-                                        concept_lookup=concept_lookup,
-                                    )
-                                st.success(f"Concept mapping saved for '{c.get('name')}'")
-                                st.rerun()
-                            except (ValueError, RuntimeError, OSError) as exc:
-                                st.error(str(exc))
+            _render_covariate_card(manager, run_id, c)
 
     excluded_from_adjustment = plan.get("excluded_from_adjustment") or []
     if excluded_from_adjustment:
@@ -1125,14 +1744,122 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
             st.markdown(f"- {check}")
 
 
-def _render_feasibility_tab(run_dir: Path) -> None:
+def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_id: str) -> None:
+    """Trigger the steps that produce this tab's artifacts -- mirrors `workflow
+    feasibility`/`cohort-plan`/`cohort-profile`/`followup-audit` on the CLI.
+    All go through OMCP (the CLI's default `--transport mcp`), consistent with
+    every other OMOP-querying action in this app; the CLI's direct-BigQuery
+    transport is dev/test-only and stays CLI-only.
+    """
+    datasets = BigQueryDatasets.from_env()
+
+    def _run(title: str, label: str, ready: bool, requirement: str, spinner: str, action, icon: str) -> None:
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.badge("Ready" if ready else "Not ready", color="green" if ready else "gray", icon=icon)
+            if st.button(
+                label,
+                disabled=not ready,
+                type="primary" if ready else "secondary",
+                icon=icon,
+                key=f"feasibility_action_{label}",
+                width="stretch",
+            ):
+                try:
+                    with st.spinner(spinner):
+                        action()
+                    st.success(f"{label} completed.")
+                    st.rerun()
+                except (ValueError, RuntimeError, OSError) as exc:
+                    st.error(str(exc))
+            st.caption("Available now." if ready else requirement)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        _run(
+            "1. Check feasibility",
+            "Run feasibility check",
+            state.phase == "feasibility"
+            and state.mode == "exploratory"
+            and state.gates["clinical_mapping"].status == "provisional",
+            "Requires the feasibility phase, exploratory mode, and a provisional clinical-mapping decision.",
+            "Running feasibility query...",
+            lambda: manager.run_feasibility_mcp(run_id, OMCPClient(datasets), datasets),
+            ":material/query_stats:",
+        )
+        _run(
+            "3. Profile the cohort",
+            "Run cohort profile",
+            state.phase in {"feasibility", "analysis_plan"},
+            "Requires the feasibility or analysis-plan phase and an existing analysis plan.",
+            "Profiling the draft cohort...",
+            lambda: manager.run_cohort_profile_mcp(run_id, OMCPClient(datasets), datasets),
+            ":material/groups:",
+        )
+    with col2:
+        _run(
+            "2. Create the cohort plan",
+            "Build cohort plan",
+            state.phase in {"analysis_plan", "execution"},
+            "Requires the analysis-plan or cohort-execution phase and an existing analysis plan.",
+            "Building governed cohort SQL...",
+            lambda: manager.build_cohort_plan(run_id, datasets),
+            ":material/description:",
+        )
+        _run(
+            "4. Audit follow-up",
+            "Run follow-up audit",
+            state.phase in {"feasibility", "analysis_plan"},
+            "Requires the feasibility or analysis-plan phase and an existing analysis plan.",
+            "Checking follow-up completeness...",
+            lambda: manager.run_followup_audit_mcp(run_id, OMCPClient(datasets), datasets),
+            ":material/fact_check:",
+        )
+
+
+def _render_feasibility_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
     feasibility = _read_json(run_dir / "feasibility.json")
     cohort_manifest = _read_json(run_dir / "cohort_manifest.json")
     cohort_profile = _read_json(run_dir / "cohort_profile.json")
     followup_audit = _read_json(run_dir / "followup_audit.json")
     readiness = _read_json(run_dir / "execution_readiness.json")
 
+    st.subheader("Feasibility and cohort readiness")
+    st.caption(
+        "Use aggregate diagnostics to assess whether the reviewed study design can progress. "
+        "These checks do not estimate a treatment effect."
+    )
+
     any_rendered = False
+
+    with st.container(border=True):
+        st.markdown("**Can this study proceed?**")
+        if readiness:
+            any_rendered = True
+            cols = st.columns(3)
+            feasibility_allowed = readiness.get("aggregate_feasibility_allowed", False)
+            cohort_allowed = readiness.get("analytic_dataset_build_allowed", False)
+            estimation_allowed = readiness.get("causal_estimation_allowed", False)
+            cols[0].metric("Feasibility counts", "Allowed" if feasibility_allowed else "Blocked", border=True)
+            cols[1].metric("Cohort build", "Allowed" if cohort_allowed else "Blocked", border=True)
+            cols[2].metric("Causal effect estimation", "Allowed" if estimation_allowed else "Not implemented", border=True)
+            if readiness.get("blockers"):
+                st.warning("What still needs attention:", icon=":material/warning:")
+                st.markdown("\n".join(f"- {_format_blocker(blocker)}" for blocker in readiness["blockers"]))
+            elif feasibility_allowed or cohort_allowed:
+                st.success("No execution blocker is recorded in the current readiness assessment.", icon=":material/check_circle:")
+        else:
+            st.info(
+                "No readiness assessment has been generated yet. Complete the available steps below "
+                "to create one.",
+                icon=":material/pending:",
+            )
+
+    st.subheader("Available actions")
+    st.caption("Actions are enabled only when the workflow phase and required review decisions permit them.")
+    _render_feasibility_actions(manager, state, state.run_id)
+
+    st.subheader("Aggregate results")
 
     if feasibility:
         any_rendered = True
@@ -1141,66 +1868,102 @@ def _render_feasibility_tab(run_dir: Path) -> None:
             "Uses human-approved concept sets for this question's population/treatment/"
             "comparator/outcome — not a causal estimate."
         )
-        st.json(feasibility.get("counts", {}))
+        _render_count_metrics(feasibility.get("counts", {}))
         for warning in feasibility.get("warnings", ()):
             st.warning(warning)
+        with st.expander("Raw data (JSON)", icon=":material/data_object:"):
+            st.json(feasibility.get("counts", {}))
 
     if cohort_manifest:
         any_rendered = True
         st.subheader("Draft analytic cohort contract")
         cols = st.columns(3)
-        cols[0].metric("Status", cohort_manifest.get("status", "unknown"))
-        cols[1].metric("Execution allowed", str(cohort_manifest.get("execution_allowed", False)))
-        cols[2].metric("Delivery to LLM allowed", str(cohort_manifest.get("delivery_to_llm_allowed", False)))
+        cols[0].metric("Status", _humanize(cohort_manifest.get("status", "unknown")))
+        cols[1].metric("Ready to run", "Yes" if cohort_manifest.get("execution_allowed") else "No")
+        cols[2].metric(
+            "Results may be shared with the AI assistant",
+            "Yes" if cohort_manifest.get("delivery_to_llm_allowed") else "No",
+        )
         for issue in cohort_manifest.get("unresolved_issues", ()):
-            st.markdown(f"- `{issue}`")
+            st.markdown(f"- {issue}")
 
     query_validation = _read_json(run_dir / "cohort_query_validation.json")
     if query_validation:
         any_rendered = True
-        st.subheader("Cohort query governance check")
+        st.subheader("Cohort query safety check")
         st.caption(
-            "Deterministic checks only — no unbound parameters, no `SELECT *`, only expected "
-            "OMOP tables. Does not judge clinical correctness of the query."
+            "Automated checks that the underlying database query is safe and only touches the "
+            "expected clinical data tables. Does not judge clinical correctness of the query."
         )
-        cols = st.columns(2)
-        cols[0].metric("Status", query_validation.get("status", "unknown"))
-        estimated_bytes = query_validation.get("estimated_bytes_processed")
-        cols[1].metric(
-            "Estimated bytes scanned",
-            f"{estimated_bytes:,}" if isinstance(estimated_bytes, int) else "not dry-run",
-        )
+        status = query_validation.get("status", "unknown")
+        (st.success if status == "passed" else st.error)(f"Status: {status}")
         for violation in query_validation.get("violations", ()):
-            st.error(f"`{violation}`")
+            st.error(f"- {violation}")
+        with st.expander("Technical detail", icon=":material/terminal:"):
+            st.caption(
+                "Checks performed: no unbound parameters, no `SELECT *`, only expected OMOP "
+                "tables."
+            )
+            estimated_bytes = query_validation.get("estimated_bytes_processed")
+            st.caption(
+                "Estimated data scanned: "
+                + (f"{estimated_bytes:,} bytes" if isinstance(estimated_bytes, int) else "not available (not a dry run)")
+            )
 
     if cohort_profile:
         any_rendered = True
         st.subheader("Aggregate cohort profile")
         st.caption("Validates cohort-building mechanics only; contains no patient-level rows.")
-        st.json(cohort_profile.get("profile", {}))
+        _render_count_metrics(cohort_profile.get("profile", {}))
         for warning in cohort_profile.get("warnings", ()):
             st.warning(warning)
+        with st.expander("Raw data (JSON)", icon=":material/data_object:"):
+            st.json(cohort_profile.get("profile", {}))
 
     if followup_audit:
         any_rendered = True
-        st.subheader("Nominal follow-up audit")
+        st.subheader("Follow-up completeness check")
         st.caption("Aggregate observability diagnostic; censoring definition is not clinically approved.")
-        st.json(followup_audit.get("counts", {}))
+        _render_count_metrics(followup_audit.get("counts", {}))
         for warning in followup_audit.get("warnings", ()):
             st.warning(warning)
-
-    if readiness:
-        any_rendered = True
-        st.subheader("Execution Agent decision")
-        cols = st.columns(3)
-        cols[0].metric("Aggregate feasibility allowed", str(readiness.get("aggregate_feasibility_allowed", False)))
-        cols[1].metric("Analytic dataset build allowed", str(readiness.get("analytic_dataset_build_allowed", False)))
-        cols[2].metric("Causal estimation allowed", str(readiness.get("causal_estimation_allowed", False)))
-        for blocker in readiness.get("blockers", ()):
-            st.markdown(f"- `{blocker}`")
+        with st.expander("Raw data (JSON)", icon=":material/data_object:"):
+            st.json(followup_audit.get("counts", {}))
 
     if not any_rendered:
-        st.info("No feasibility, cohort, or execution-readiness artifacts for this run yet.")
+        st.info("No aggregate feasibility, cohort, or execution-readiness result is available yet.")
+
+
+# `RunState.record`'s first argument (see `causal/orchestrator/state.py` and
+# every `state.record(...)` call site in `causal/orchestrator/workflow.py`)
+# -- a fixed, human-curated label per event kind. An event not in this dict
+# (future addition, or an older run) falls back to `_humanize` so it still
+# reads as words instead of a raw snake_case code.
+_EVENT_LABELS: dict[str, str] = {
+    "run_started": "Run started",
+    "gate_decided": "Approval gate decided",
+    "gate_invalidated": "Approval gate reset (upstream change)",
+    "phase_advanced": "Phase advanced",
+    "agent_completed": "Automated step completed",
+    "concept_set_mapped": "Concept mapping saved",
+    "covariate_reviewed": "Covariate reviewed",
+    "covariate_domain_reviewed": "Covariate OMOP domain saved",
+    "covariate_concepts_mapped": "Covariate concept mapping saved",
+    "covariate_aggregation_reviewed": "Covariate aggregation saved",
+    "covariate_window_reviewed": "Covariate window saved",
+    "registry_built": "Concept mapping registry built",
+    "cohort_plan_generated": "Cohort plan generated",
+    "cohort_profile_completed": "Cohort profile completed",
+    "followup_audit_completed": "Follow-up audit completed",
+    "mapping_audit_completed": "Concept mapping audit completed",
+    "report_generated": "Demo report generated",
+    "exposure_contrast_set": "Comparator design saved",
+    "feasibility_completed": "Feasibility check completed",
+}
+
+
+def _format_history_event(event: str) -> str:
+    return _EVENT_LABELS.get(event, _humanize(event))
 
 
 def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
@@ -1221,7 +1984,11 @@ def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path)
     st.subheader("History")
     if state.history:
         st.dataframe(
-            [{"at": h["at"], "event": h["event"], "detail": h["detail"]} for h in reversed(state.history)],
+            [
+                {"When": h["at"], "Event": _format_history_event(h["event"]), "Detail": h["detail"]}
+                for h in reversed(state.history)
+            ],
+            hide_index=True,
             width="stretch",
         )
     else:
@@ -1240,12 +2007,12 @@ def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path)
             )
 
 
-def _render_new_question_section(manager: WorkflowManager) -> None:
-    with st.expander("➕ New run from a clinical question"):
+def _render_new_question_section(manager: WorkflowManager, *, expanded: bool = False) -> None:
+    with st.expander("New causal study", icon=":material/add_circle:", expanded=expanded):
         st.caption(
             "Calls the configured LLM provider (and PubMed/OpenAlex unless skipped) "
             "and may incur API costs. Can take up to a couple of minutes — longer with "
-            "more critique rounds or a tournament size above 1."
+            "more review rounds or more than one candidate DAG."
         )
         with st.form(key="new_question_form"):
             question = st.text_area("Clinical question", key="new_question_text")
@@ -1261,28 +2028,27 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
                 "Skip literature grounding (PubMed/OpenAlex)", key="new_question_skip_lit"
             )
             skip_critique = st.checkbox(
-                "Skip DAG critique/revision round", key="new_question_skip_critique"
+                "Skip automated DAG review", key="new_question_skip_critique"
             )
             critique_col, tournament_col = st.columns(2)
             max_critique_rounds = critique_col.number_input(
-                "Max critique rounds",
+                "Review rounds",
                 min_value=1,
                 max_value=5,
                 value=2,
                 disabled=skip_critique,
                 key="new_question_max_critique_rounds",
-                help="Bound on critique → revision → re-critique rounds after the DAG draft.",
+                help="How many rounds of automated review and revision the draft DAG goes through.",
             )
             tournament_size = tournament_col.number_input(
-                "Tournament size",
+                "Candidate DAGs to draft",
                 min_value=1,
                 max_value=MAX_TOURNAMENT_SIZE,
                 value=1,
                 key="new_question_tournament_size",
                 help=(
-                    "Draft N independent candidate DAGs and merge them via SHD dedup, "
-                    "lexicographic ranking, and deterministic edge union (1 = today's "
-                    "single-draft behavior, opt-in above that)."
+                    "Draft this many DAGs independently, then automatically combine them into "
+                    "one (1 = today's default, a single draft)."
                 ),
             )
             submitted = st.form_submit_button("Generate hypothesis draft")
@@ -1355,8 +2121,11 @@ def _render_new_question_section(manager: WorkflowManager) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="CausalOMOP — workflow review", layout="wide")
-    st.title("CausalOMOP — workflow review")
+    st.set_page_config(
+        page_title="CausalOMOP",
+        page_icon=":material/account_tree:",
+        layout="wide",
+    )
 
     manager = WorkflowManager(runs_dir=RUNS_DIR)
 
@@ -1365,17 +2134,20 @@ def main() -> None:
         st.session_state["run_selector"] = pending_selection
 
     with st.sidebar:
+        st.title("CausalOMOP")
+        st.caption("Causal study design and review")
         st.text_input(
-            "Your name",
+            "Reviewer name",
             key="reviewer_name",
+            on_change=_sync_reviewer_fields,
             help="Pre-fills the reviewer field on every gate and covariate decision below.",
         )
         st.divider()
-        st.header("Runs")
+        st.header("Study runs")
         run_ids = _list_runs()
         run_id = (
             st.selectbox(
-                "Select a run",
+                "Open a study",
                 run_ids,
                 key="run_selector",
                 format_func=_run_option_label,
@@ -1383,37 +2155,59 @@ def main() -> None:
             if run_ids
             else None
         )
-        st.divider()
-        _render_new_question_section(manager)
+
+    title_col, action_col = st.columns([4, 1], vertical_alignment="center")
+    with title_col:
+        st.title("Causal workflow review")
+        st.caption("Draft, review, and audit a causal study. Each important decision remains human-reviewed.")
+    with action_col:
+        with st.popover("New causal study", type="primary", icon=":material/add:", width="stretch"):
+            _render_new_question_section(manager, expanded=True)
 
     if run_id is None:
-        st.warning(f"No runs found under `{RUNS_DIR}`. Create one from the sidebar.")
+        with st.container(border=True):
+            st.subheader("Start your first causal study")
+            st.write(
+                "Create a study from a clinical question, then review the target trial, causal DAG, "
+                "and OMOP concept mappings step by step."
+            )
+            st.info("Use **New causal study** in the top-right corner to begin.", icon=":material/arrow_upward:")
         return
 
     state = manager.load(run_id)
     run_dir = RUNS_DIR / run_id
 
-    st.caption(
-        f"`{state.run_id}` · mode `{state.mode}` · created {state.created_at} · updated {state.updated_at}"
-    )
+    st.caption(f"Study `{state.run_id}` · {state.mode} mode · updated {state.updated_at}")
     source_question = _source_question(run_dir)
     if source_question:
-        st.markdown(f"> {source_question}")
-    _render_phase_tracker(state.phase)
-    st.divider()
-
-    tabs = st.tabs(
-        ["Gates & Validation", "Hypothesis & DAG", "Analysis Plan", "Feasibility & Cohort", "Demo Report & History"]
+        with st.container(border=True):
+            st.caption("Clinical question")
+            st.write(source_question)
+    _render_phase_tracker(state)
+    workspace = st.radio(
+        "Study workspace",
+        (
+            "Current task",
+            "Study design",
+            "Mapping & plan",
+            "Feasibility & cohort",
+            "Report & audit",
+        ),
+        key=f"workspace_{run_id}",
+        horizontal=True,
+        label_visibility="collapsed",
+        width="stretch",
     )
-    with tabs[0]:
+
+    if workspace == "Current task":
         _render_gates_tab(manager, state, run_dir)
-    with tabs[1]:
+    elif workspace == "Study design":
         _render_hypothesis_tab(manager, run_id, run_dir)
-    with tabs[2]:
+    elif workspace == "Mapping & plan":
         _render_analysis_plan_tab(manager, run_id, run_dir)
-    with tabs[3]:
-        _render_feasibility_tab(run_dir)
-    with tabs[4]:
+    elif workspace == "Feasibility & cohort":
+        _render_feasibility_tab(manager, state, run_dir)
+    else:
         _render_report_tab(manager, state, run_dir)
 
 
