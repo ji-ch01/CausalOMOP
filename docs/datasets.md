@@ -123,14 +123,19 @@ licences.
 
 ## Validation study
 
-Dataset selection is complete; the active work is validation of the
-albumin/sepsis target trial against the converted MIMIC-IV data. The study still
-requires a reproducible Sepsis-3 phenotype, approved albumin and crystalloid
-mappings, validated ICU time zero, baseline covariate coverage, censoring and
-follow-up rules, and positivity assessment.
+Dataset selection is complete. CausalOMOP itself is not scoped to any one
+condition; the active work is running the pipeline end-to-end on one
+literature-comparison case -- the albumin/sepsis target trial -- against the
+converted MIMIC-IV data, so its output can be checked against that published
+study's design and results. The study still requires a reproducible Sepsis-3
+phenotype, approved albumin and crystalloid mappings, validated ICU time zero,
+baseline covariate coverage, censoring and follow-up rules, and positivity
+assessment.
 
-See [studies/albumin_sepsis_28d](../studies/albumin_sepsis_28d/README.md) and
-the [causal roadmap](causal_roadmap.md).
+See [studies/albumin_sepsis_28d](../studies/albumin_sepsis_28d/README.md), the
+[causal roadmap](causal_roadmap.md)'s Validation strategy, and
+[README.md's References](../README.md#references) for the full set of
+literature this pipeline is grounded in and compared against.
 
 ## Handling rules
 

@@ -1,9 +1,17 @@
 # Causal Package
 
-Governed causal-inference workflow over MIMIC-IV OMOP CDM data (see
-`docs/datasets.md`). The early SNUH-era prototype (`data_builder/cohort.py`,
-string-matching cohort definitions) has been removed; it was superseded by
-the pipeline below and was never on any live code path.
+Governed, protocol-driven causal-inference workflow over any longitudinal
+OMOP CDM dataset. Nothing in this package hardcodes a disease, drug, or
+outcome; every population/treatment/comparator/outcome/covariate is resolved
+from the reviewed protocol at run time (`causal/queries/feasibility.py`,
+`causal/data_builder/analytic.py`). The current validation environment is a
+credentialed MIMIC-IV conversion to OMOP CDM 5.3.1 (see `docs/datasets.md`),
+used to compare pipeline output against published, literature-grounded case
+studies -- see `README.md`'s References section -- not because the pipeline
+is scoped to MIMIC-IV or to those studies' clinical questions. The early
+SNUH-era prototype (`data_builder/cohort.py`, string-matching cohort
+definitions) has been removed; it was superseded by the pipeline below and
+was never on any live code path.
 
 ## Architecture
 
@@ -28,12 +36,16 @@ call it.
 ## Current Capabilities
 
 - literature-grounded causal DAG drafting and backdoor identification;
+- a validated `CausalStudySpecification` (question, target trial, estimand,
+  DAG) built and persisted on `identification_estimand` gate approval;
 - human-in-the-loop concept mapping and analysis-plan review, with gates
   that cannot be approved while the plan is incomplete and that reset once
   approved content is later changed;
-- aggregate-only feasibility counts and mapping-audit diagnostics;
+- aggregate-only feasibility counts, mapping-audit diagnostics, univariate
+  positivity screening, and per-covariate missingness audits;
 - person-level analytic cohort SQL generation (`A`, `Y`, `index_datetime`,
-  covariates) for OMOP CDM, portable across BigQuery and DuckDB;
+  covariates, and an optional reviewer-approved `censored` column) for OMOP
+  CDM, portable across BigQuery and DuckDB;
 - governed, read-only query execution via OMCP, with SQL-safety validation
   before anything reaches a database.
 
@@ -42,6 +54,11 @@ call it.
 - no TMLE, SuperLearner-style nuisance modeling, g-computation, or CATE
   estimator is implemented yet -- this package stops at cohort construction
   and readiness gating, deliberately, before causal estimation.
+- source OMOP vocabulary mapping completeness is checked and enforced per
+  concept set before a cohort query runs, but not guaranteed by this
+  package -- an unmapped concept blocks with an explicit error rather than
+  being silently undercounted; see
+  [docs/vocabulary_mapping_coverage.md](../docs/vocabulary_mapping_coverage.md).
 
 ## Planned Direction
 
@@ -66,14 +83,17 @@ testing; it is not a replacement for human protocol review.
 
 ## Important implementation boundary
 
-`causal.roadmap.CausalStudySpecification` defines the intended question,
-target-trial, estimand, and DAG contracts. The general DAG and backdoor checks
-are wired into the workflow, but the protocol and estimand contracts are not
-yet the persistent orchestrator's single validated state. The current
-`protocol` gate therefore combines several scientific review decisions that
-should eventually be separated.
+`causal.roadmap.CausalStudySpecification` defines the question, target-trial,
+estimand, and DAG contracts. `causal.agents.dag_identification.
+build_study_specification` wires them into the persistent orchestrator: the
+`identification_estimand` gate cannot be approved unless it constructs
+without error, and the result is persisted as `study_specification.json`.
+The scientific review decisions are split across three gates
+(`target_trial`, `dag_review`, `identification_estimand`) instead of one
+combined `protocol` gate. `causal.mapping.registry.OMOPVariableRegistry` is
+still not the sole source every query builder resolves population/treatment/
+comparator/outcome concepts from -- only covariates are registry-backed
+today.
 
 For maintained documentation, see `docs/index.md`,
-`docs/causal_roadmap.md`, and `docs/fastomop_integration.md`. The old
-`document_design.md` and `docs/causal_architecture.md` files are historical
-records only.
+`docs/causal_roadmap.md`, and `docs/fastomop_integration.md`.

@@ -1,7 +1,12 @@
 # Responsible Demonstration Guide (English)
 
 Present CausalOMOP as a governed study-design and feasibility prototype, not as
-a causal-effect engine or clinical decision system.
+a causal-effect engine or clinical decision system. This guide uses the
+albumin/sepsis study as its running example because it is the pipeline's
+worked literature-comparison case; make clear to any audience that CausalOMOP
+itself is general-purpose and disease-agnostic, and that the study is a
+validation example, not the tool's scope (see
+[README.md's References](../README.md#references)).
 
 ## Opening statement
 

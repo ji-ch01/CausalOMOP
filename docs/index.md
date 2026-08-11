@@ -3,6 +3,14 @@
 This page is the entry point for CausalOMOP documentation. It distinguishes
 maintained specifications from historical notes and generated artifacts.
 
+CausalOMOP is a general-purpose, protocol-driven causal-inference tool, not a
+system built around one disease or drug. Where a document below discusses a
+specific clinical question (albumin/sepsis, a MIMIC-IV table's vocabulary
+coverage, ...), that question is a worked example used to validate and
+compare pipeline output against published literature -- see
+[README.md's References](../README.md#references) -- not a description of
+the tool's scope.
+
 ## Maintained documentation
 
 | Document | Purpose |
@@ -12,24 +20,13 @@ maintained specifications from historical notes and generated artifacts.
 | [Causal roadmap](causal_roadmap.md) | normative scientific order and current implementation gap |
 | [Architecture diagrams](project_architecture_diagrams.md) | current end-to-end and gate diagrams |
 | [Datasets](datasets.md) | MIMIC-IV, DuckDB export, SYN-SNUH, and data policy |
+| [Vocabulary mapping coverage](vocabulary_mapping_coverage.md) | source-data limitation note: OMOP concept mapping completeness, quantified over time |
 | [FastOMOP integration](fastomop_integration.md) | component ownership, OMCP contract, and submodules |
 | [LLM hypothesis integration](llm_hypothesis_integration.md) | question gate, evidence retrieval, critique, and provider policy |
 | [DAG audit](dag_generation_audit.md) | dated technical audit and metric history |
 | [Repository map](repo_map.md) | folder ownership and Git policy |
-| [Responsible demo guide](responsible_demo_guide.md) | current French demonstration script |
-| [Responsible demo guide (English)](responsible_demo_guide_en.md) | English presentation companion |
-| [Albumin/sepsis study](../studies/albumin_sepsis_28d/README.md) | first literature-backed validation case |
-
-## Historical records
-
-These files preserve design history but are not implementation references:
-
-- [original design proposal](../document_design.md);
-- [earlier causal architecture](causal_architecture.md);
-- [dataset-selection work package](reproducible_causal_review.md).
-
-If a historical document conflicts with a maintained page, the maintained page
-and the executable CLI help are authoritative.
+| [Responsible demo guide](responsible_demo_guide.md) | current demonstration script |
+| [Albumin/sepsis study](../studies/albumin_sepsis_28d/README.md) | first literature-comparison validation example |
 
 ## External documentation
 

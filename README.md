@@ -18,14 +18,11 @@ are:
 - [causal package and implementation status](causal/README.md);
 - [causal roadmap and remaining scientific gaps](docs/causal_roadmap.md);
 - [datasets and data-handling policy](docs/datasets.md);
+- [vocabulary mapping coverage, a source-data limitation](docs/vocabulary_mapping_coverage.md);
 - [FastOMOP/OMCP integration and trust boundaries](docs/fastomop_integration.md);
 - [LLM, literature, knowledge-graph, and critique workflow](docs/llm_hypothesis_integration.md);
 - [current architecture diagrams](docs/project_architecture_diagrams.md);
 - [responsible demonstration guide](docs/responsible_demo_guide.md).
-
-`document_design.md`, `docs/causal_architecture.md`, and
-`docs/reproducible_causal_review.md` are retained as short historical records;
-they are not current specifications.
 
 ## What is implemented
 
@@ -40,11 +37,101 @@ they are not current specifications.
 | Study construction | Aggregate feasibility and follow-up audits, plus governed person-level analytic-cohort SQL generation |
 | Estimation and final causal report | Not implemented |
 
-The current workflow still uses one combined `protocol` review gate instead of
-separate target-trial, DAG, and identification gates. The general
-`CausalStudySpecification` contracts exist in `causal/roadmap.py`, but the
-protocol and estimand contracts are not yet the persistent workflow's single
-source of truth.
+The workflow now has separate `target_trial`, `dag_review`, and
+`identification_estimand` gates (see [docs/causal_roadmap.md](docs/causal_roadmap.md)'s
+governance boundary) instead of one combined `protocol` gate. Approving
+`identification_estimand` builds and persists the full `CausalStudySpecification`
+contract (`causal/roadmap.py`) as `study_specification.json` -- the persistent
+workflow's single validated source for the question, target trial, estimand,
+and DAG together.
+
+## References
+
+CausalOMOP is a general-purpose causal-inference tool: the pipeline, agents,
+and SQL builders are protocol-driven and are not specific to any one disease,
+drug, or outcome (see [Repository layout](#repository-layout) and
+[`causal/queries/feasibility.py`](causal/queries/feasibility.py), whose
+concept-set-driven builders resolve population/treatment/comparator/outcome
+from whatever protocol they are given). Its design choices are grounded in
+established causal-inference and biomedical-informatics literature rather
+than invented from scratch:
+
+- **Causal DAGs and the backdoor criterion** -- Pearl, J. (1995). Causal
+  diagrams for empirical research. *Biometrika*, 82(4), 669-688.
+  [doi:10.1093/biomet/82.4.669](https://doi.org/10.1093/biomet/82.4.669).
+  Implemented by the d-separation and minimum-adjustment-set logic in
+  `causal/roadmap.py`.
+- **Target trial emulation** -- Hernán, M.A. & Robins, J.M. (2016). Using Big
+  Data to Emulate a Target Trial When a Randomized Trial Is Not Available.
+  *American Journal of Epidemiology*, 183(8), 758-764.
+  [doi:10.1093/aje/kwv254](https://doi.org/10.1093/aje/kwv254). Every study
+  protocol (`protocol.json`) is a target-trial specification in this sense,
+  not a bespoke, hand-tuned query.
+- **The Causal Roadmap** -- Petersen, M.L. & van der Laan, M.J. (2014). Causal
+  Models and Learning from Data: Integrating Causal Modeling and Statistical
+  Estimation. *Epidemiology*, 25(3), 418-426. The 11-step sequence in
+  [docs/causal_roadmap.md](docs/causal_roadmap.md) follows this roadmap's
+  separation of causal model, causal question, identification, statistical
+  estimand, and estimation.
+- **SHD/SID for DAG structural comparison** -- Peters, J. & Bühlmann, P.
+  (2015). Structural Intervention Distance (SID) for Evaluating Causal
+  Graphs. *Neural Computation*, 27(3), 771-799.
+  [arXiv:1306.1043](https://arxiv.org/abs/1306.1043) (SHD cited therein to
+  Acid & de Campos 2003 and Tsamardinos et al. 2006). Implemented in
+  [`causal/agents/dag_metrics.py`](causal/agents/dag_metrics.py) and used
+  both for tournament deduplication/merge and for comparing a generated DAG
+  against a study's reference DAG.
+- **TMLE** -- van der Laan, M.J. & Rubin, D. (2006). Targeted Maximum
+  Likelihood Learning. *The International Journal of Biostatistics*, 2(1),
+  Article 11. Planned estimator for CATE, the primary estimand (see
+  [causal/README.md](causal/README.md)'s Planned Direction), once
+  identification and data-support checks pass.
+- **Grounding an LLM causal co-pilot in verifiable evidence** -- Alaa, A. et
+  al. (2024). [arXiv:2407.19118](https://arxiv.org/abs/2407.19118). Shaped
+  the Hypothesis Agent's evidence-grounded drafting and citation-allow-list
+  design (`causal/agents/hypothesis.py`).
+- **OptimusKG** -- Vittor et al. OptimusKG: Unifying biomedical knowledge in
+  a modern multimodal graph. [arXiv:2604.27269](https://arxiv.org/pdf/2604.27269)
+  (Zitnik Lab, Harvard Medical School;
+  [github.com/mims-harvard/OptimusKG](https://github.com/mims-harvard/OptimusKG)).
+  Optional knowledge-graph evidence source corroborating DAG edges alongside
+  PubMed/OpenAlex (`causal/knowledge_graph/`).
+- **CohortDiagnostics-style mapping and index-event checks** -- Rao GA,
+  Shoaibi A, Makadia R, et al. (2025). CohortDiagnostics: Phenotype
+  evaluation across a network of observational data sources using
+  population-level characterization. *PLOS ONE*, 20(1), e0310634.
+  [doi:10.1371/journal.pone.0310634](https://doi.org/10.1371/journal.pone.0310634).
+  Adapted in `causal/mapping/audit.py` for orphan-concept, index-event, and
+  incidence-rate diagnostics, and in
+  [docs/vocabulary_mapping_coverage.md](docs/vocabulary_mapping_coverage.md)
+  for the source-vocabulary coverage check.
+
+### Validation strategy: comparison, not scope
+
+CausalOMOP does not restrict what it can study, and does not search for a
+matching published study at runtime. Rigor instead comes from picking a
+small number of causal questions that already have a published,
+literature-grounded analysis with a known expert DAG or concept mapping, and
+running the actual pipeline against each one so its output can be compared
+against that published ground truth (SHD/SID for DAG structure, recall@k/MRR
+for concept mapping -- see [docs/causal_roadmap.md](docs/causal_roadmap.md)).
+These studies are worked examples used to evaluate and demonstrate pipeline
+effectiveness, not a constraint on what questions the pipeline supports:
+
+- **Worked validation case** --
+  [studies/albumin_sepsis_28d](studies/albumin_sepsis_28d/README.md)
+  reproduces the albumin-plus-crystalloids-vs-crystalloids, ICU sepsis,
+  28-day-mortality question and its MIMIC-IV OMOP grounding from *Step-by-
+  step causal analysis of EHRs to ground decision-making*,
+  [doi:10.1371/journal.pdig.0000721](https://doi.org/10.1371/journal.pdig.0000721).
+- **Second candidate comparison case** -- Wang, X., Zhang, K., Wu, Y., Zhang,
+  Z., Li, Y., Han, R., & Liang, F. (2026). Target trial emulation of early
+  acetaminophen use and mortality in critically ill stroke patients.
+  *Scientific Reports*.
+  [doi:10.1038/s41598-026-46381-5](https://doi.org/10.1038/s41598-026-46381-5).
+  Also a target-trial emulation on MIMIC-IV/eICU ICU data; identified as a
+  second comparison case for the causal-question and identification process,
+  not yet built into a `studies/` package.
 
 ## Repository layout
 
@@ -52,7 +139,7 @@ source of truth.
 CausalOMOP/
   causal/                         project-owned causal workflow
   docs/                           maintained documentation and audit notes
-  studies/albumin_sepsis_28d/     first literature-backed validation case
+  studies/albumin_sepsis_28d/     first literature-comparison validation example
   scripts/bigquery_etl/           BigQuery-to-DuckDB export utility
   scripts/snuh_etl/               SYN-SNUH preparation and validation
   notebooks/                      exploratory analyses only
@@ -168,7 +255,12 @@ put patient-level information in prompts.
 The CLI exposes explicit review actions. A typical exploratory sequence is:
 
 ```powershell
-python -m causal.cli workflow gate $runId protocol approved --reviewer "reviewer-id"
+python -m causal.cli workflow gate $runId target_trial approved --reviewer "reviewer-id"
+python -m causal.cli workflow advance $runId
+python -m causal.cli workflow hypothesis $runId
+python -m causal.cli workflow gate $runId dag_review approved --reviewer "reviewer-id"
+python -m causal.cli workflow advance $runId
+python -m causal.cli workflow gate $runId identification_estimand approved --reviewer "reviewer-id"
 python -m causal.cli workflow advance $runId
 python -m causal.cli workflow plan $runId --with-mcp
 
@@ -184,6 +276,8 @@ python -m causal.cli workflow execution-readiness $runId
 python -m causal.cli workflow cohort-plan $runId
 python -m causal.cli workflow cohort-profile $runId
 python -m causal.cli workflow followup-audit $runId
+python -m causal.cli workflow positivity-audit $runId
+python -m causal.cli workflow covariate-missingness-audit $runId
 python -m causal.cli workflow mapping-audit $runId <variable_id>
 python -m causal.cli workflow demo-report $runId
 ```
@@ -223,7 +317,8 @@ The export inherits the source dataset's access restrictions. See
 The current outputs support architecture review, protocol review, concept
 mapping, DAG inspection, identification checks, feasibility, and diagnostics.
 They do not support a claim that a treatment causes an outcome. The next major
-scientific work is to wire the complete causal-study contracts into the
-persistent gates, validate study phenotypes and covariates, define the observed
-data estimand, and implement prespecified estimators with diagnostics and
-sensitivity analyses.
+scientific work is to validate study phenotypes and covariates against the
+real dataset, define the observed data estimand and missing-data/censoring
+strategy, and implement prespecified estimators with diagnostics and
+sensitivity analyses -- see [docs/causal_roadmap.md](docs/causal_roadmap.md)'s
+remaining scientific milestones.

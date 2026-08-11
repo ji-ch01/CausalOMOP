@@ -33,17 +33,32 @@ defined. A clinically important but unobserved confounder stays in the DAG and
 becomes an explicit limitation; it must not disappear because no convenient
 OMOP concept exists.
 
+## Validation strategy
+
+CausalOMOP is general-purpose by design: every stage above is driven by the
+reviewed protocol, not by a hardcoded disease, drug, or outcome, and the
+pipeline never searches for a matching published study at run time. Rigor is
+instead demonstrated by hand-picking a small number of causal questions that
+already have a published, literature-grounded analysis with a known expert
+DAG or concept mapping, then running the actual pipeline against each one so
+its output can be compared to that published ground truth -- SHD/SID for DAG
+structure (`causal/agents/dag_metrics.py`), recall@k/MRR for concept mapping.
+The albumin/sepsis case in [studies/albumin_sepsis_28d](../studies/albumin_sepsis_28d/README.md)
+is the first such comparison case, not a description of what the pipeline is
+built to study; see [README.md's References](../README.md#references) for
+the full literature grounding, including a second candidate comparison case.
+
 ## Current implementation map
 
 | Roadmap stage | Implementation |
 |---|---|
 | 1. Question classification | Implemented as an LLM-based `causal`, `descriptive`, or `needs_clarification` gate in CLI and Streamlit. It can be skipped explicitly and does not automatically invoke FastOMOP. |
 | 2. Target-trial draft | Implemented for manual protocols and strictly parsed LLM drafts; human protocol approval is required. |
-| 3. Counterfactual estimand | Represented in protocol fields and general contracts, but the persistent workflow does not yet validate the full `CausalEstimand` contract. |
+| 3. Counterfactual estimand | Implemented: `causal.agents.dag_identification.build_study_specification` constructs and validates the full `CausalQuestion`/`TargetTrialProtocol`/`CausalEstimand` contract from `protocol.json` + `hypothesis.json`, persisted as `study_specification.json` when the `identification_estimand` gate is approved. `protocol["target_trial"]` carries the complete field set (eligibility criteria; assignment, censoring, and analysis strategy; effect measure; treatment/comparator contrast values), required by both the LLM drafting prompt (`causal/prompts/hypothesis.md`) and the `target_trial` gate. |
 | 4. Causal DAG | Implemented: literature/KG drafting, typed roles and timing, bounded critique/revision, optional tournament, human covariate review. |
 | 5. Identification | Implemented for backdoor adjustment: cycle/temporal checks, d-separation, minimum adjustment sets, explicit failure. |
 | 6. OMOP operationalization | Implemented as a first governed version: concept-set and covariate review actions, `OMOPVariableRegistry`, windows, aggregations, and deterministic SQL adapters. |
-| 7. Data support | Partly implemented: aggregate feasibility, mapping audits, cohort profile, and follow-up observability. Full positivity, missing-data, and censoring validation remain incomplete. |
+| 7. Data support | Extended: aggregate feasibility, mapping audits, cohort profile, and follow-up observability, plus univariate treatment-arm overlap (`positivity_audit_sql` -- one covariate at a time, not full joint-adjustment-set stratification), per-covariate missingness (`covariate_missingness_sql`, generalized beyond the three hardcoded demographics), and a reviewer-approvable per-row administrative censoring definition (`WorkflowManager.approve_censoring_definition`, reusing `followup_audit_sql`'s own aggregate logic per person). None of these is a full positivity/missing-data-mechanism/censoring-model validation in the statistical sense -- see each function's own docstring for what it does and does not claim. |
 | 8. Statistical estimand | Not implemented as an executable contract. |
 | 9. Estimation | Not implemented. |
 | 10. Diagnostics and sensitivity | Only pre-estimation data diagnostics exist; estimator diagnostics and causal sensitivity analyses are not implemented. |
@@ -106,18 +121,26 @@ change the mapping; a reviewer must act through `concept-set-map` or the
 
 ## Governance boundary
 
-The persistent workflow currently has four named gates: `protocol`,
-`clinical_mapping`, `analysis_plan`, and `results`. A final-mode run requires
-approval; exploratory provisional mapping can authorize only the limited
-operations encoded by the Execution Agent and OMCP context.
+The persistent workflow has six named gates: `target_trial`, `dag_review`,
+`identification_estimand`, `clinical_mapping`, `analysis_plan`, and
+`results` -- each tied to its own phase (`target_trial_review`,
+`dag_review`, `identification_review`, `concept_mapping`, `analysis_plan`,
+`results_review`). A final-mode run requires approval; exploratory
+provisional mapping can authorize only the limited operations encoded by the
+Execution Agent and OMCP context.
 
-The target architecture should split the combined protocol decision into
-separate reviews for:
+This implements the split an earlier version of this section proposed as
+future work, into separate reviews for:
 
-1. question and target trial;
-2. causal DAG and clinical completeness;
-3. identification and estimand;
-4. OMOP operationalization.
+1. question and target trial (`target_trial` gate: `CausalQuestion`/
+   `TargetTrialProtocol` must construct from `protocol.json` alone);
+2. causal DAG and clinical completeness (`dag_review` gate: every major
+   confounder resolved);
+3. identification and estimand (`identification_estimand` gate: backdoor
+   identification holds *and* the full `CausalStudySpecification` --
+   question, target trial, estimand, DAG -- validates as one internally
+   consistent contract; persists `study_specification.json` on approval);
+4. OMOP operationalization (`clinical_mapping` gate, unchanged).
 
 OMCP is the default governed execution transport. The direct BigQuery
 feasibility path is retained for equivalence testing, not as the preferred
@@ -127,19 +150,25 @@ parser and is not applied uniformly to those aggregate paths.
 
 ## Remaining scientific milestones
 
-1. Make `CausalStudySpecification` the persistent pre-OMOP contract and split
-   the combined protocol gate.
-2. Finish reviewer controls for descendant inclusion/exclusion and make the
-   registry the operational source used consistently by every builder.
-3. Validate the MIMIC-IV Sepsis-3 population, time zero, exposure strategies,
-   censoring, outcome, baseline covariates, missingness, and positivity.
-4. Define the observed-data estimand and missing-data/censoring strategy.
-5. Implement a transparent g-computation baseline, then prespecified TMLE and
+1. Finish reviewer controls for descendant inclusion/exclusion and make the
+   registry the operational source used consistently by every builder --
+   `_load_concept_specs` still reads `concept_sets` directly for population/
+   treatment/comparator/outcome rather than through
+   `OMOPVariableRegistry`, unlike covariates (`_load_covariate_specs`,
+   already registry-backed).
+2. Validate the MIMIC-IV Sepsis-3 population, time zero, exposure strategies,
+   censoring, outcome, baseline covariates, missingness, and positivity --
+   the diagnostics now exist (`positivity_audit_sql`,
+   `covariate_missingness_sql`, `approve_censoring_definition`); running
+   them against the real dataset and acting on the results does not.
+3. Define the observed-data estimand and missing-data/censoring strategy.
+4. Implement a transparent g-computation baseline, then prespecified TMLE and
    CATE analyses with reproducible nuisance-model specifications.
-6. Add balance, overlap, positivity, calibration, and model diagnostics.
-7. Add negative controls and quantitative sensitivity analyses where the study
+5. Add balance, calibration, and estimator model diagnostics beyond the
+   univariate positivity/missingness audits above.
+6. Add negative controls and quantitative sensitivity analyses where the study
    design supports them.
-8. Produce a final report that links estimates to protocol versions, registry
+7. Produce a final report that links estimates to protocol versions, registry
    versions, code versions, diagnostics, assumptions, and human decisions.
 
 Until these milestones are complete, CausalOMOP is a governed design and

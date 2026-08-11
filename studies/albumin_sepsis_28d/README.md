@@ -1,8 +1,13 @@
 # Albumin for sepsis: OMOP replication
 
-This study is the first end-to-end validation case for CausalOMOP. It translates
-the published MIMIC-IV v2.2 analysis (DOI `10.1371/journal.pdig.0000721`) into
-an OMOP CDM workflow.
+This study is the first end-to-end literature-comparison example for
+CausalOMOP, not a description of what CausalOMOP is built to study --
+CausalOMOP is a general-purpose, protocol-driven tool for any causal question
+over OMOP CDM data (see [README.md's References](../../README.md#references)).
+It translates the published MIMIC-IV v2.2 analysis (DOI
+`10.1371/journal.pdig.0000721`) into an OMOP CDM workflow so the pipeline's
+DAG, concept mapping, and feasibility output can be compared against that
+published study's design and results.
 
 The protocol is intentionally marked as a draft. Candidate concepts found by
 name are evidence for review, not executable concept sets. Approve seed concepts
