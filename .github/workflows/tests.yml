@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false
+          submodules: true
 
       - uses: actions/setup-python@v5
         with:
@@ -32,3 +32,39 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+  # `omcp` and `agno_fastomop` are separate repos (git submodules, see
+  # .gitmodules) that each declare `requires-python = ">=3.13"` and manage
+  # their own dependencies via uv -- installing them into the 3.12 `pytest`
+  # job above isn't viable, so they get their own jobs on the same trigger.
+  # Without these, a regression in either submodule (e.g. the OMCP SQL
+  # validator letting a stacked statement through) has no CI to catch it.
+  omcp-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: astral-sh/setup-uv@v9
+
+      - name: Run OMCP test suite
+        working-directory: omcp
+        run: |
+          uv sync --group dev
+          uv run pytest tests/ -q
+
+  fastomop-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: astral-sh/setup-uv@v9
+
+      - name: Run FastOMOP test suite
+        working-directory: agno_fastomop
+        run: |
+          uv sync --extra dev
+          uv run pytest tests/ -q
