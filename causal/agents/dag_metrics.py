@@ -51,6 +51,35 @@ def _edge_types(dag: CausalDAG) -> dict[frozenset[str], str]:
     return types
 
 
+def max_structural_hamming_distance(variable_count: int) -> int:
+    """Theoretical worst-case `structural_hamming_distance` for two graphs
+    sharing `variable_count` node labels: every unordered pair of labels
+    disagreeing on edge type. Used to normalize a raw SHD count into a
+    0.0-1.0 agreement score (see `normalized_agreement`) for display -- the
+    normalization itself, not a judgment about what counts as "close"."""
+    return variable_count * (variable_count - 1) // 2
+
+
+def max_structural_intervention_distance(variable_count: int) -> int:
+    """Theoretical worst-case `structural_intervention_distance` for two
+    graphs sharing `variable_count` node labels: every ordered pair of
+    distinct labels falsely estimated. See `max_structural_hamming_distance`."""
+    return variable_count * (variable_count - 1)
+
+
+def normalized_agreement(distance: int, max_distance: int) -> float:
+    """`distance` (an SHD or SID count) rescaled to a 0.0-1.0 agreement
+    score against its theoretical worst case `max_distance`
+    (`max_structural_hamming_distance`/`max_structural_intervention_distance`):
+    1.0 means identical, 0.0 means maximally disagreeing. `max_distance <= 0`
+    (0 or 1 shared label -- nothing for the two graphs to disagree about) is
+    defined as full agreement.
+    """
+    if max_distance <= 0:
+        return 1.0
+    return max(0.0, 1.0 - (distance / max_distance))
+
+
 def structural_hamming_distance(a: CausalDAG, b: CausalDAG) -> int:
     """Structural Hamming Distance between two candidate DAGs, compared at
     the node-*label* level (see module docstring).

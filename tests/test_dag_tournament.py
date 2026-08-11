@@ -206,6 +206,9 @@ class PairwiseDistancesTests(unittest.TestCase):
         self.assertEqual(entry.shd, 0)
         self.assertEqual(entry.sid_a_given_b, 0)
         self.assertEqual(entry.sid_b_given_a, 0)
+        # Both candidates share the same treatment/outcome nodes (from the
+        # shared `_protocol()`) plus the "age" confounder -- 3 labels total.
+        self.assertEqual(entry.variable_count, 3)
 
     def test_disjoint_candidates_have_positive_shd_and_sid(self):
         candidates_raw = (
@@ -232,6 +235,10 @@ class MergeFidelityTests(unittest.TestCase):
         result = run_tournament(_protocol(), candidates_raw)
         self.assertEqual(len(result.merge_fidelity), 2)
         self.assertTrue(all(entry.sid_to_merged == 0 for entry in result.merge_fidelity))
+        # Merged DAG carries treatment, outcome, "age", and "severity" --
+        # every survivor's variable_count is measured against that full
+        # merged label set.
+        self.assertTrue(all(entry.variable_count == 4 for entry in result.merge_fidelity))
 
     def test_nonzero_when_a_role_conflict_excludes_a_survivors_own_variable(self):
         candidates_raw = (

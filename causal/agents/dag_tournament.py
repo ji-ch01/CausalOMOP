@@ -139,6 +139,12 @@ class PairwiseDistance:
     shd: int
     sid_a_given_b: int
     sid_b_given_a: int
+    #: Size of the union of both candidates' node labels -- the raw counts
+    #: above are only meaningful relative to how many labels were even in
+    #: play. Kept alongside them (not just used internally) so a normalized
+    #: agreement score (`causal.agents.dag_metrics.normalized_agreement`) can
+    #: be recomputed from this stored record alone, e.g. for display.
+    variable_count: int
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -147,6 +153,7 @@ class PairwiseDistance:
             "shd": self.shd,
             "sid_a_given_b": self.sid_a_given_b,
             "sid_b_given_a": self.sid_b_given_a,
+            "variable_count": self.variable_count,
         }
 
 
@@ -169,9 +176,16 @@ class MergeFidelity:
 
     candidate_index: int
     sid_to_merged: int
+    #: Size of the union of the survivor's and the merged DAG's node labels.
+    #: See `PairwiseDistance.variable_count`.
+    variable_count: int
 
     def to_dict(self) -> dict[str, int]:
-        return {"candidate_index": self.candidate_index, "sid_to_merged": self.sid_to_merged}
+        return {
+            "candidate_index": self.candidate_index,
+            "sid_to_merged": self.sid_to_merged,
+            "variable_count": self.variable_count,
+        }
 
 
 def compute_pairwise_distances(ranked: tuple[TournamentCandidate, ...]) -> tuple[PairwiseDistance, ...]:
@@ -180,12 +194,14 @@ def compute_pairwise_distances(ranked: tuple[TournamentCandidate, ...]) -> tuple
     distances = []
     for a, b in combinations(ranked, 2):
         dag_a, dag_b = a.review.identification.dag, b.review.identification.dag
+        variable_count = len({node.label for node in dag_a.nodes} | {node.label for node in dag_b.nodes})
         distances.append(PairwiseDistance(
             candidate_a=a.index,
             candidate_b=b.index,
             shd=structural_hamming_distance(dag_a, dag_b),
             sid_a_given_b=structural_intervention_distance(dag_a, dag_b),
             sid_b_given_a=structural_intervention_distance(dag_b, dag_a),
+            variable_count=variable_count,
         ))
     return tuple(distances)
 
@@ -203,10 +219,12 @@ def compute_merge_fidelity(
     """
     if merged_dag is None:
         return ()
+    merged_labels = {node.label for node in merged_dag.nodes}
     return tuple(
         MergeFidelity(
             candidate_index=survivor.index,
             sid_to_merged=structural_intervention_distance(survivor.review.identification.dag, merged_dag),
+            variable_count=len({node.label for node in survivor.review.identification.dag.nodes} | merged_labels),
         )
         for survivor in survivors
     )
