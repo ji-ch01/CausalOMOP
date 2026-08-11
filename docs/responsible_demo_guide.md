@@ -1,19 +1,16 @@
-# Guide de démonstration responsable
+# Responsible Demonstration Guide (English)
 
-Ce guide présente CausalOMOP comme un prototype de conception, de gouvernance
-et de faisabilité. Il ne faut jamais présenter ses sorties actuelles comme une
-estimation d'effet causal ou une recommandation clinique.
+Present CausalOMOP as a governed study-design and feasibility prototype, not as
+a causal-effect engine or clinical decision system.
 
-## Message d'ouverture
+## Opening statement
 
-> CausalOMOP transforme une question clinique en protocole de target trial, DAG
-> causal documenté, revue d'identification, mappings OMOP et audits de
-> faisabilité traçables. Les sorties LLM restent des propositions, les décisions
-> importantes sont humaines, et aucun estimateur causal n'est encore implémenté.
+> CausalOMOP turns a clinical question into an auditable target-trial draft,
+> evidence-grounded candidate DAG, identification review, OMOP mappings, and
+> feasibility diagnostics. LLM outputs remain proposals, important decisions
+> require human review, and causal estimation is not implemented yet.
 
-## 1. Vérifier l'environnement
-
-Depuis la racine du dépôt :
+## Setup
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
@@ -21,18 +18,18 @@ python -m pytest tests -q
 python -m causal.cli config --json
 ```
 
-Avec BigQuery et les identifiants applicatifs configurés :
+With BigQuery and Application Default Credentials configured:
 
 ```powershell
 python -m causal.cli preflight --count-persons
 ```
 
-Ne pas annoncer un nombre de tests, de tables ou de personnes mémorisé dans ce
-guide : montrer la sortie produite dans l'environnement de démonstration.
+Show the live output. Do not quote a frozen test count, table count, or person
+count from documentation.
 
-## 2. Créer un run
+## Create a governed run
 
-À partir du protocole versionné :
+From the versioned study protocol:
 
 ```powershell
 $state = python -m causal.cli workflow start studies\albumin_sepsis_28d\protocol.json |
@@ -41,69 +38,65 @@ $runId = $state.run_id
 python -m causal.cli workflow hypothesis $runId
 ```
 
-Ou à partir d'une question naturelle :
+Or from a natural-language question:
 
 ```powershell
 python -m causal.cli workflow start-question "Among adult ICU patients with sepsis, what is the effect of albumin plus crystalloids versus crystalloids alone on 28-day mortality?"
 ```
 
-Expliquer le filtre initial : une question descriptive est renvoyée vers
-FastOMOP et une question ambiguë demande une clarification. Le chemin causal
-peut ensuite interroger PubMed et OpenAlex, utiliser OptimusKG s'il est
-disponible, puis exécuter une critique bornée du DAG.
+Explain that the first LLM step classifies the question. Descriptive requests
+are redirected to FastOMOP; ambiguous requests return a clarification question.
+The causal path can retrieve PubMed/OpenAlex evidence, use OptimusKG when
+available, and run a bounded DAG critique/revision loop.
 
-## 3. Montrer les artefacts auditables
+## Show the audit trail
 
-Sous `artifacts/runs/<run_id>/`, montrer :
+Under `artifacts/runs/<run_id>/`, show:
 
-- `protocol.json` : target trial et mappings encore soumis à revue ;
-- `hypothesis.json` : DAG, problèmes non résolus et identification ;
-- `llm_outputs.json` : réponses brutes, tours de critique et révision ;
-- `state.json` : phase, gates, reviewer et historique.
+- `protocol.json` for the target-trial draft;
+- `hypothesis.json` for the candidate DAG and identification result;
+- `llm_outputs.json` for raw drafting, critique, and revision responses;
+- `state.json` for phases, gate decisions, reviewers, and history.
 
-Souligner que `executable: false` est un garde-fou normal tant que les revues
-requises ne sont pas terminées.
+An `executable: false` value is an expected safety state while reviews remain
+incomplete.
 
-Exporter le DAG pour une inspection indépendante :
+Export the DAG for independent inspection:
 
 ```powershell
 python -m causal.cli workflow dag-export <run_id> --highlight-adjustment-set
 ```
 
-Le texte peut être collé dans [dagitty.net](https://dagitty.net). Une
-identification mathématique par backdoor n'établit pas à elle seule la
-complétude clinique du DAG.
+The output can be pasted into [dagitty.net](https://dagitty.net). A graph that
+passes a backdoor test is not automatically clinically complete or correct.
 
-## 4. Faire une vraie revue humaine
-
-Utiliser un identifiant de reviewer réel et un commentaire traçable :
+## Human review and OMOP mapping
 
 ```powershell
 python -m causal.cli workflow gate <run_id> protocol approved `
   --reviewer "reviewer-id" `
-  --comment "Target trial et DAG acceptés pour exploration technique"
+  --comment "Target trial and DAG accepted for technical exploration"
 python -m causal.cli workflow advance <run_id>
 python -m causal.cli workflow plan <run_id> --with-mcp
 ```
 
-Les candidats de vocabulaire renvoyés par OMCP ne sont jamais approuvés
-automatiquement. Les mappings se font via `workflow concept-set-map`, les
-commandes `workflow covariate-*`, ou l'interface Streamlit :
+OMCP lookup results are candidates only. Review mappings through
+`concept-set-map`, the `covariate-*` commands, or the Streamlit interface:
 
 ```powershell
 streamlit run causal/ui/streamlit_app.py
 ```
 
-Ne pas approuver un concept ou un gate uniquement pour faire réussir la démo.
+Never approve a mapping or gate merely to make a live demo proceed.
 
-## 5. Montrer le registre et les audits
+## Registry and aggregate diagnostics
 
-Après les revues nécessaires :
+After the required reviews:
 
 ```powershell
 python -m causal.cli workflow registry-build <run_id>
 python -m causal.cli workflow gate <run_id> clinical_mapping provisional `
-  --reviewer "reviewer-id" --comment "Audits agrégés uniquement"
+  --reviewer "reviewer-id" --comment "Aggregate audits only"
 python -m causal.cli workflow advance <run_id>
 python -m causal.cli workflow feasibility <run_id> --transport mcp
 python -m causal.cli workflow execution-readiness <run_id>
@@ -114,39 +107,36 @@ python -m causal.cli workflow mapping-audit <run_id> <variable_id>
 python -m causal.cli workflow demo-report <run_id>
 ```
 
-Toutes les commandes ne réussiront que si l'état et les gates du run le
-permettent. C'est un comportement attendu à montrer, pas un obstacle à
-contourner.
+Commands correctly fail closed when run state, mappings, or gates are
+incomplete. Demonstrating that refusal is part of the governance story.
 
-## Résultats présentables
+## Safe claims
 
-- un protocole et un DAG candidats, versionnés et auditables ;
-- la provenance des preuves et les limites de la recherche bibliographique ;
-- les décisions humaines et les blocages de gouvernance ;
-- des mappings OMOP proposés ou approuvés, avec leur audit de couverture ;
-- des comptages de faisabilité agrégés et explicitement datés ;
-- un plan SQL de cohorte analytique qui n'implique pas son autorisation
-  d'exécution ou de diffusion.
+- The system creates versioned, reviewable protocol and DAG drafts.
+- Retrieved evidence identifiers are checked against what was actually fetched.
+- Human decisions and execution blockers are persisted.
+- OMOP mappings and aggregate coverage can be audited.
+- Aggregate feasibility results can be reported with their date, query
+  definition, and environment.
+- The system can generate governed analytic-cohort SQL.
 
-## Résultats non présentables
+## Claims to avoid
 
-- un effectif provisoire comme cohorte finale ;
-- le DAG généré comme vérité clinique ;
-- une différence de mortalité comme effet du traitement ;
-- un ATE, ATT ou CATE ;
-- une conclusion clinique sur l'albumine ;
-- une reproduction réussie de l'article de référence.
+- A provisional count is a final cohort.
+- The generated DAG is clinically authoritative.
+- A mortality difference is a treatment effect.
+- CausalOMOP has estimated an ATE, ATT, or CATE.
+- The albumin study has been reproduced.
+- The system is ready for clinical use.
 
-Le [concept audit](../studies/albumin_sepsis_28d/concept_audit.md) contient des
-comptages historiques de faisabilité. Ils doivent être présentés avec leur date,
-leur définition provisoire et leur environnement, jamais comme des résultats
-actuels universels.
+Historical counts in the study's
+[concept audit](../studies/albumin_sepsis_28d/concept_audit.md) are dated
+feasibility snapshots, not portable current results.
 
-## Plan de secours pour une démonstration
+## Live-demo fallback
 
-- Tester la configuration et les services externes avant la séance.
-- Conserver un `run_id` pré-généré pour une lecture hors ligne de `state.json`
-  et `demo_report.md`.
-- Utiliser `--skip-literature` ou `--skip-knowledge-graph` uniquement en
-  annonçant clairement la réduction de preuve.
-- Ne jamais afficher de secret, identifiant cloud privé ou ligne patient.
+- Test configuration and external services in advance.
+- Keep a pre-generated run for offline inspection.
+- Use `--skip-literature` or `--skip-knowledge-graph` only while explicitly
+  stating the reduced evidence path.
+- Never display secrets, private cloud identifiers, or patient-level rows.
