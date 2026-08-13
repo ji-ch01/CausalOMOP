@@ -8,5 +8,16 @@
 #   llm_covariates.py       — LLM Confounder Extractor from note_llm_log
 #   builder.py              — Main pipeline orchestrator
 from causal.data_builder.analytic import AnalyticCohortBuilder, CohortBuildManifest
+from causal.data_builder.materialize import (
+    DatasetManifest,
+    parse_cohort_csv_to_dataframe,
+    write_analytic_dataset,
+)
 
-__all__ = ["AnalyticCohortBuilder", "CohortBuildManifest"]
+__all__ = [
+    "AnalyticCohortBuilder",
+    "CohortBuildManifest",
+    "DatasetManifest",
+    "parse_cohort_csv_to_dataframe",
+    "write_analytic_dataset",
+]
