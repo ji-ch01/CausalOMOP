@@ -337,5 +337,53 @@ class DefaultDomainIndexTests(unittest.TestCase):
         self.assertEqual(app._default_domain_index("some_unknown_role", "", self._OPTIONS), 0)
 
 
+class NarrativeBlocksReportTests(unittest.TestCase):
+    """`_narrative_blocks_report` decides whether "Build causal report" is
+    disabled -- pure logic, no `st.*` calls, matching this file's "helpers
+    only" scope (see module docstring)."""
+
+    def test_no_narrative_never_blocks(self):
+        self.assertFalse(app._narrative_blocks_report(None))
+
+    def test_pending_review_blocks(self):
+        narrative = {"review_status": "pending", "verification": {"status": "not_run", "checks": []}}
+        self.assertTrue(app._narrative_blocks_report(narrative))
+
+    def test_excluded_never_blocks_even_with_failed_checks(self):
+        narrative = {
+            "review_status": "excluded",
+            "verification": {"status": "failed", "checks": [{"status": "failed"}]},
+        }
+        self.assertFalse(app._narrative_blocks_report(narrative))
+
+    def test_approved_with_clean_verification_does_not_block(self):
+        narrative = {
+            "review_status": "approved",
+            "verification": {"status": "passed", "checks": [{"status": "passed"}]},
+        }
+        self.assertFalse(app._narrative_blocks_report(narrative))
+
+    def test_approved_with_warning_only_verification_does_not_block(self):
+        narrative = {
+            "review_status": "approved",
+            "verification": {"status": "warning", "checks": [{"status": "warning"}]},
+        }
+        self.assertFalse(app._narrative_blocks_report(narrative))
+
+    def test_approved_but_a_check_failed_still_blocks(self):
+        """Defensive case: a tampered or legacy artifact marked `approved`
+        whose verification nonetheless contains a `failed` check must still
+        block -- approval alone is never sufficient."""
+        narrative = {
+            "review_status": "approved",
+            "verification": {"status": "passed", "checks": [{"status": "failed"}]},
+        }
+        self.assertTrue(app._narrative_blocks_report(narrative))
+
+    def test_approved_but_verification_never_ran_blocks(self):
+        narrative = {"review_status": "approved", "verification": {"status": "not_run", "checks": []}}
+        self.assertTrue(app._narrative_blocks_report(narrative))
+
+
 if __name__ == "__main__":
     unittest.main()
