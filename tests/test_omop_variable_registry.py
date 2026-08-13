@@ -11,6 +11,8 @@ from causal.mapping.registry import (
     default_missingness_rule,
     extraction_plan_to_concept_set_spec,
     extraction_plan_to_covariate_spec,
+    fixed_domain_to_concept_set_spec,
+    is_fixed_domain,
     is_sql_executable,
     parse_variable,
     variable_from_candidate_dag_entry,
@@ -380,6 +382,157 @@ class MissingnessRuleTests(unittest.TestCase):
 
     def test_definition_pending_has_no_missingness_rule_yet(self):
         self.assertEqual(default_missingness_rule("measurement", "definition_pending"), "")
+
+
+class ResolveRoleTests(unittest.TestCase):
+    """`OMOPVariableRegistry.resolve_role` is the role-indexed lookup
+    `causal.orchestrator.workflow._load_concept_specs` is migrated onto --
+    same contract the removed `_resolve_concept_spec` helper had, but over
+    `OMOPVariableDefinition.causal_role` instead of a raw `concept_sets`
+    dict."""
+
+    def _registry(self, *variables: OMOPVariableDefinition) -> OMOPVariableRegistry:
+        return OMOPVariableRegistry(schema_version="1.0", study_id="test_study", variables=variables)
+
+    def test_resolves_an_exact_role_match(self):
+        population = variable_from_concept_set(
+            "sepsis", {"role": "population", "domain": "condition", "status": "approved", "concept_ids": [1]},
+        )
+        registry = self._registry(population)
+        self.assertEqual(registry.resolve_role("population").variable_id, population.variable_id)
+
+    def test_falls_back_to_the_second_role_when_the_first_is_absent(self):
+        backbone = variable_from_concept_set(
+            "crystalloids",
+            {"role": "treatment_and_comparator", "domain": "drug", "status": "approved", "concept_ids": [2]},
+        )
+        registry = self._registry(backbone)
+        matched = registry.resolve_role("treatment", "treatment_and_comparator")
+        self.assertEqual(matched.variable_id, backbone.variable_id)
+
+    def test_an_exact_role_match_takes_priority_over_a_fallback(self):
+        exact = variable_from_concept_set(
+            "albumin", {"role": "treatment", "domain": "drug", "status": "approved", "concept_ids": [1]},
+        )
+        backbone = variable_from_concept_set(
+            "crystalloids",
+            {"role": "treatment_and_comparator", "domain": "drug", "status": "approved", "concept_ids": [2]},
+        )
+        registry = self._registry(exact, backbone)
+        matched = registry.resolve_role("treatment", "treatment_and_comparator")
+        self.assertEqual(matched.variable_id, exact.variable_id)
+
+    def test_returns_none_when_nothing_declares_any_candidate_role(self):
+        registry = self._registry()
+        self.assertIsNone(registry.resolve_role("population"))
+        self.assertIsNone(registry.resolve_role("treatment", "treatment_and_comparator"))
+
+    def test_raises_on_more_than_one_entry_declaring_the_same_role(self):
+        first = variable_from_concept_set(
+            "sepsis_v1", {"role": "population", "domain": "condition", "status": "approved", "concept_ids": [1]},
+        )
+        second = variable_from_concept_set(
+            "sepsis_v2", {"role": "population", "domain": "condition", "status": "approved", "concept_ids": [2]},
+        )
+        registry = self._registry(first, second)
+        with self.assertRaises(RuntimeError):
+            registry.resolve_role("population")
+
+    def test_resolution_does_not_require_an_approved_mapping(self):
+        """`resolve_role` is a pure lookup, not a gate check -- it returns a
+        pending-approval entry too, leaving the approval decision to the
+        caller (`fixed_domain_to_concept_set_spec`/`build_extraction_plan`,
+        both of which raise on an unapproved mapping)."""
+        pending = variable_from_concept_set(
+            "sepsis",
+            {"role": "population", "domain": "condition", "status": "candidate_pending_human_approval", "concept_ids": [1]},
+        )
+        registry = self._registry(pending)
+        matched = registry.resolve_role("population")
+        self.assertIsNotNone(matched)
+        self.assertNotEqual(matched.mapping_status, MAPPING_STATUS_APPROVED)
+
+
+class FixedDomainConceptSetSpecTests(unittest.TestCase):
+    """`fixed_domain_to_concept_set_spec` is `build_extraction_plan`'s
+    sibling for the two roles with no concept-based domain (`death`,
+    `standard`) -- Gap A from the OMOP-registry-unification plan:
+    `build_extraction_plan` rejects these domains outright (it requires a
+    concept-based domain and `root_concept_ids`), but the default outcome
+    path depends on `domain="death"` being resolvable."""
+
+    def test_is_fixed_domain_identifies_death_and_standard(self):
+        self.assertTrue(is_fixed_domain("death"))
+        self.assertTrue(is_fixed_domain("standard"))
+        self.assertFalse(is_fixed_domain("condition"))
+        self.assertFalse(is_fixed_domain(""))
+
+    def test_converts_an_approved_death_domain_variable_with_no_root_concept_ids(self):
+        definition = OMOPVariableDefinition(
+            variable_id="outcome_death", dag_node_label="outcome", variable_kind="phenotype",
+            causal_role="outcome", observed=True, domain="death", mapping_status=MAPPING_STATUS_APPROVED,
+        )
+        spec = fixed_domain_to_concept_set_spec(definition)
+        self.assertEqual(spec, ConceptSetSpec(domain="death", concept_ids=()))
+
+    def test_rejects_an_unapproved_mapping(self):
+        definition = OMOPVariableDefinition(
+            variable_id="outcome_death", dag_node_label="outcome", variable_kind="phenotype",
+            causal_role="outcome", observed=True, domain="death", mapping_status="unmapped",
+        )
+        with self.assertRaisesRegex(ValueError, "must be approved"):
+            fixed_domain_to_concept_set_spec(definition)
+
+    def test_rejects_an_unobserved_variable(self):
+        definition = OMOPVariableDefinition(
+            variable_id="outcome_death", dag_node_label="outcome", variable_kind="phenotype",
+            causal_role="outcome", observed=False, domain="death", mapping_status=MAPPING_STATUS_APPROVED,
+        )
+        with self.assertRaisesRegex(ValueError, "not observed"):
+            fixed_domain_to_concept_set_spec(definition)
+
+    def test_rejects_a_concept_based_domain(self):
+        """A real concept-based domain must go through `build_extraction_plan`
+        instead -- `fixed_domain_to_concept_set_spec` is only for `death`/
+        `standard`, not a shortcut around root_concept_ids for anything else."""
+        definition = OMOPVariableDefinition(
+            variable_id="sepsis", dag_node_label="sepsis", variable_kind="phenotype",
+            causal_role="population", observed=True, domain="condition",
+            mapping_status=MAPPING_STATUS_APPROVED, root_concept_ids=(132797,),
+        )
+        with self.assertRaisesRegex(ValueError, "fixed_domain_to_concept_set_spec requires"):
+            fixed_domain_to_concept_set_spec(definition)
+
+
+class ComparatorDomainLessCarveOutTests(unittest.TestCase):
+    """Gap B: `variable_from_concept_set` must tolerate `domain == ""` for a
+    `role="comparator"` entry whose `status` is `"no_standard_concept"` or
+    unset -- the `exposure_contrast="vs_unexposed"` design's correct, final
+    state (there is no OMOP concept for "absence of a drug"), not every
+    other role/status combination."""
+
+    def test_accepts_a_domain_less_no_standard_concept_comparator(self):
+        definition = {"role": "comparator", "status": "no_standard_concept", "domain": "", "concept_ids": []}
+        variable = variable_from_concept_set("no_albumin", definition)
+        self.assertEqual(variable.domain, "")
+        self.assertEqual(variable.causal_role, "comparator")
+
+    def test_accepts_a_domain_less_comparator_with_unset_status(self):
+        definition = {"role": "comparator", "domain": "", "concept_ids": []}
+        variable = variable_from_concept_set("no_albumin", definition)
+        self.assertEqual(variable.domain, "")
+
+    def test_still_rejects_a_domain_less_population_entry(self):
+        definition = {"role": "population", "status": "no_standard_concept", "domain": "", "concept_ids": []}
+        with self.assertRaises(ValueError):
+            variable_from_concept_set("sepsis", definition)
+
+    def test_still_rejects_a_domain_less_approved_comparator(self):
+        """The carve-out is only for the two genuinely-domain-less statuses
+        -- an entry claiming approved must still have a real domain."""
+        definition = {"role": "comparator", "status": "approved", "domain": "", "concept_ids": []}
+        with self.assertRaises(ValueError):
+            variable_from_concept_set("no_albumin", definition)
 
 
 if __name__ == "__main__":

@@ -454,17 +454,30 @@ def variable_from_concept_set(name: str, definition: dict[str, Any]) -> OMOPVari
     `presence_in_window`. Their window is left unset (`None`): the relevant
     windows (grace period, follow-up) are protocol-level, not per-variable,
     and are not duplicated here.
+
+    `domain == ""` is otherwise rejected, with one exception: a
+    `role="comparator"` entry whose `status` is `"no_standard_concept"` or
+    unset (`"missing"`) -- the exact states `causal.orchestrator.workflow.
+    _load_concept_specs`'s `vs_unexposed` carve-out tolerates for an
+    `exposure_contrast="vs_unexposed"` design (e.g. "aspirin vs no aspirin"),
+    where there is no OMOP concept for "absence of a drug" and so nothing
+    could ever be mapped for this entry in the first place.
     """
     if not isinstance(definition, dict):
         raise ValueError(f"concept_sets['{name}'] must be an object")
     role = definition.get("role")
     if not isinstance(role, str) or not role.strip():
         raise ValueError(f"concept_sets['{name}'] requires a role")
-    domain = definition.get("domain")
-    if not isinstance(domain, str) or domain not in ALLOWED_DOMAINS:
-        raise ValueError(f"concept_sets['{name}'] requires domain to be one of {ALLOWED_DOMAINS}")
-    concept_ids = definition.get("concept_ids", ())
     status = str(definition.get("status", "missing"))
+    domain = definition.get("domain")
+    domain_str = domain if isinstance(domain, str) else None
+    comparator_domain_less_ok = role == "comparator" and status in {"no_standard_concept", "missing"}
+    if domain_str is None or (
+        domain_str not in ALLOWED_DOMAINS and not (domain_str == "" and comparator_domain_less_ok)
+    ):
+        raise ValueError(f"concept_sets['{name}'] requires domain to be one of {ALLOWED_DOMAINS}")
+    domain = domain_str
+    concept_ids = definition.get("concept_ids", ())
     mapping_status = MAPPING_STATUS_APPROVED if status == "approved" else status
     return parse_variable({
         "variable_id": _slugify(name),
@@ -634,6 +647,33 @@ class OMOPVariableRegistry:
     def get(self, variable_id: str) -> OMOPVariableDefinition | None:
         return next((variable for variable in self.variables if variable.variable_id == variable_id), None)
 
+    def resolve_role(self, role: str, *fallback_roles: str) -> OMOPVariableDefinition | None:
+        """Resolve one query role (population/treatment/comparator/outcome,
+        or a fallback role such as `treatment_and_comparator`) to its
+        registry entry, indexed by `OMOPVariableDefinition.causal_role` --
+        for a phenotype, `causal_role` *is* the query role (see
+        `variable_from_concept_set`), the same value `causal.orchestrator.
+        workflow._load_concept_specs` used to group a raw `concept_sets`
+        dict by before this method existed.
+
+        Tries `role` first, then each of `fallback_roles` in order, so an
+        exact-role entry always takes priority over a shared-backbone
+        fallback. Raises `RuntimeError` if more than one variable declares
+        the same candidate role (a query needs exactly one); returns `None`
+        only when *no* variable declares any of these roles at all -- the
+        caller decides what that means (a hard requirement, or a default).
+        """
+        for candidate_role in (role, *fallback_roles):
+            matches = tuple(variable for variable in self.variables if variable.causal_role == candidate_role)
+            if len(matches) > 1:
+                raise RuntimeError(
+                    f"registry has more than one variable declaring causal_role {candidate_role!r} -- "
+                    "a query needs exactly one"
+                )
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
 
 @dataclass(frozen=True)
 class ExtractionPlan:
@@ -712,6 +752,48 @@ def extraction_plan_to_concept_set_spec(plan: ExtractionPlan) -> ConceptSetSpec:
         include_descendants=plan.include_descendants,
         excluded_concept_ids=plan.excluded_concept_ids,
     )
+
+
+def is_fixed_domain(domain: str) -> bool:
+    """Whether `domain` resolves through a fixed, non-concept-based OMOP
+    table (`death`, `standard`) rather than an approved concept set -- see
+    `fixed_domain_to_concept_set_spec`. Exposed as a function rather than the
+    raw `_FIXED_DOMAIN_TABLES` dict so callers outside this module (e.g.
+    `causal.orchestrator.workflow._load_concept_specs`) branch on the same
+    single source of truth instead of importing a private constant."""
+    return domain in _FIXED_DOMAIN_TABLES
+
+
+def fixed_domain_to_concept_set_spec(definition: OMOPVariableDefinition) -> ConceptSetSpec:
+    """`OMOPVariableDefinition -> causal.queries.feasibility.ConceptSetSpec`
+    for the two roles that resolve through a fixed, non-concept-based OMOP
+    table (`death`, `standard`) rather than an approved concept set.
+
+    A sibling to `build_extraction_plan`, not a widened version of it:
+    `build_extraction_plan` requires a concept-based domain and
+    `root_concept_ids` (see its docstring), neither of which applies to a
+    fixed-domain role, and its `ExtractionPlan` output shape (concept
+    selection, window, aggregation) isn't meaningful here either. Still
+    requires `mapping_status == "approved"` and `observed == True` -- a
+    proposed mapping or a declared-unobservable variable must never reach
+    SQL generation, the same invariant `build_extraction_plan` enforces.
+    """
+    if definition.mapping_status != MAPPING_STATUS_APPROVED:
+        raise ValueError(
+            f"'{definition.variable_id}' has mapping_status={definition.mapping_status!r}; "
+            "a mapping must be approved before generating its concept-set spec"
+        )
+    if not definition.observed:
+        raise ValueError(
+            f"'{definition.variable_id}' is not observed -- an unobservable/latent variable "
+            "cannot be extracted, it remains a modeled identification limitation"
+        )
+    if not is_fixed_domain(definition.domain):
+        raise ValueError(
+            f"'{definition.variable_id}' has domain {definition.domain!r}; "
+            f"fixed_domain_to_concept_set_spec requires one of {tuple(_FIXED_DOMAIN_TABLES)}"
+        )
+    return ConceptSetSpec(domain=definition.domain, concept_ids=())
 
 
 def extraction_plan_to_covariate_spec(definition: OMOPVariableDefinition, plan: ExtractionPlan, column_name: str) -> CovariateSpec:
