@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import tempfile
 import threading
 import time
@@ -2010,6 +2011,1013 @@ class WorkflowBuildCohortPlanCovariateTests(unittest.TestCase):
         self.manager.build_cohort_plan(self.run_id, self.datasets)
         sql = (self.run_dir / "cohort.sql").read_text(encoding="utf-8")
         self.assertNotIn("cov_sofa_score", sql)
+
+
+class _FakeCohortRowsClient:
+    """Duck-typed OMCP stand-in returning a fixed multi-row cohort CSV for
+    every `causal_select` call, regardless of the query -- enough to test
+    materialization's CSV-parsing/writing path without a real OMCP checkout.
+    """
+
+    def __init__(self, csv_text: str):
+        self._csv_text = csv_text
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def causal_select(self, query: str, operation: str, causal_context: dict) -> MCPToolResponse:
+        self.calls.append((query, operation, causal_context))
+        return MCPToolResponse(text=self._csv_text, metadata={"rows": 2})
+
+
+_COHORT_ROWS_CSV = (
+    "person_id,A,Y,index_datetime,follow_up_days,censored,age,gender_concept_id,"
+    "race_concept_id,cov_sofa_score\n"
+    "101,1,1,2024-01-01T00:00:00,28,,60,8507,8527,4.5\n"
+    "102,0,0,2024-01-02T00:00:00,28,,45,8532,8527,\n"
+)
+
+
+class WorkflowMaterializeAnalyticDatasetTests(unittest.TestCase):
+    """`materialize_analytic_dataset` is the one place patient-level rows are
+    ever pulled into memory -- same fixture shape as
+    `WorkflowBuildCohortPlanCovariateTests`, carried all the way to the
+    `execution` phase with `cohort.sql`/`cohort_manifest.json` already built.
+
+    `ESTIMATION_PROCEDURE` is a class attribute (not a `setUp` parameter) so
+    `WorkflowRunEstimationTMLETests` below can subclass and override it to
+    reuse this entire fixture unchanged except for which reviewed estimator
+    the `statistical_estimand` gate records.
+    """
+
+    ESTIMATION_PROCEDURE = "plug_in_standardization"
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
+            },
+            "data_source": "project.dataset",
+            "first_pass_covariates": ["SOFA score"],
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "approved",
+                    "domain": "condition", "concept_ids": [132797],
+                },
+                "treatment": {
+                    "role": "treatment", "status": "approved",
+                    "domain": "drug", "concept_ids": [1],
+                },
+                "comparator": {
+                    "role": "comparator", "status": "approved",
+                    "domain": "drug", "concept_ids": [2],
+                },
+                "outcome": {
+                    "role": "outcome", "status": "approved",
+                    "domain": "condition", "concept_ids": [316866],
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        state = self.manager.run_hypothesis_agent(state.run_id)
+        self.run_id = state.run_id
+        self.run_dir = root / "runs" / self.run_id
+
+        self.manager.review_covariate(
+            self.run_id, "SOFA score", "accept", "Dr. Chen",
+            "Higher SOFA is associated with treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            domain="measurement",
+        )
+        self.manager.map_covariate_concepts(self.run_id, "SOFA score", [4301868], "Dr. Lee")
+        self.manager.review_covariate_aggregation(
+            self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
+        )
+        _approve_pre_mapping_gates(self.manager, self.run_id)
+        for _ in range(3):
+            state = self.manager.advance(self.run_id)
+        self.manager.decide_gate(self.run_id, "clinical_mapping", "approved", "Dr. Lee")
+        self.manager.advance(self.run_id)
+        self.manager.run_data_science_agent(self.run_id)
+        self.manager.advance(self.run_id)
+        plan_path = self.run_dir / "analysis_plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["exploratory_execution_allowed"] = True
+        plan["unresolved_issues"] = []
+        for phenotype in plan["phenotypes"]:
+            phenotype["status"] = "approved"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "Dr. Lee")
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "estimand_review")
+        self.manager.build_cohort_plan(self.run_id, self.datasets)
+        self.manager.set_statistical_estimand_strategy(
+            self.run_id,
+            missing_data_strategy="complete_case_analysis",
+            censoring_strategy="ignore_censoring_administrative_waiver",
+            censoring_rationale="No informative censoring expected in this synthetic fixture.",
+            reviewer="Dr. Lee",
+            estimation_procedure=self.ESTIMATION_PROCEDURE,
+        )
+        self.manager.decide_gate(self.run_id, "statistical_estimand", "approved", "Dr. Lee")
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "execution")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_materializes_the_cohort_and_writes_a_safe_manifest(self):
+        client = _FakeCohortRowsClient(_COHORT_ROWS_CSV)
+        state = self.manager.materialize_analytic_dataset(self.run_id, client)
+        self.assertEqual(len(client.calls), 1)
+        _, operation, _ = client.calls[0]
+        self.assertEqual(operation, "cohort_build")
+        self.assertTrue((self.run_dir / "analytic_dataset.parquet").is_file())
+        manifest = json.loads((self.run_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["row_count"], 2)
+        self.assertIn("analytic_dataset.parquet", state.artifacts)
+        self.assertIn("dataset_manifest.json", state.artifacts)
+        self.assertTrue(
+            any(entry["event"] == "analytic_dataset_materialized" for entry in state.history)
+        )
+
+    def test_audit_history_never_carries_a_raw_covariate_value(self):
+        """The materialization event is the audit trail for the one place
+        patient-level rows are ever pulled into memory -- it must record a
+        row count, never a value from the data itself. Checks only the
+        materialization event's own `event`/`detail` fields, not its `at`
+        timestamp -- an ISO timestamp's fractional-seconds digits are
+        effectively random and will eventually contain any given short
+        digit/decimal needle by pure coincidence (already seen for both
+        "101" and "4.5" in earlier runs of this suite), which would be a
+        false positive, not a real leak: `at` can never structurally carry
+        a patient value in the first place."""
+        client = _FakeCohortRowsClient(_COHORT_ROWS_CSV)
+        state = self.manager.materialize_analytic_dataset(self.run_id, client)
+        materialize_events = [
+            entry for entry in state.history if entry["event"] == "analytic_dataset_materialized"
+        ]
+        self.assertGreaterEqual(len(materialize_events), 1)
+        latest = materialize_events[-1]
+        event_text = json.dumps({"event": latest["event"], "detail": latest["detail"]})
+        for needle in ("101", "102", "4.5", "8507", "8532"):
+            self.assertNotIn(needle, event_text)
+        self.assertIn("2 row(s)", event_text)
+
+    def test_requires_execution_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.materialize_analytic_dataset(self.run_id, _FakeCohortRowsClient(_COHORT_ROWS_CSV))
+
+    def test_requires_cohort_plan_to_already_exist(self):
+        other = self.manager.start(self.protocol)
+        with self.assertRaises(RuntimeError):
+            self.manager.materialize_analytic_dataset(
+                other.run_id, _FakeCohortRowsClient(_COHORT_ROWS_CSV)
+            )
+
+    def test_rejects_when_analytic_dataset_build_is_not_allowed(self):
+        plan_path = self.run_dir / "analysis_plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["exploratory_execution_allowed"] = False
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            self.manager.materialize_analytic_dataset(
+                self.run_id, _FakeCohortRowsClient(_COHORT_ROWS_CSV)
+            )
+
+    def test_rejects_unsupported_estimation_procedure(self):
+        with self.assertRaisesRegex(ValueError, "estimation_procedure"):
+            self.manager.set_statistical_estimand_strategy(
+                self.run_id,
+                missing_data_strategy="complete_case_analysis",
+                censoring_strategy="ignore_censoring_administrative_waiver",
+                censoring_rationale="test",
+                reviewer="Dr. Lee",
+                estimation_procedure="ordinary_least_squares",
+            )
+
+    def test_old_run_missing_estimation_procedure_defaults_to_plug_in(self):
+        """A run whose `statistical_estimand_settings` was persisted before
+        `estimation_procedure` existed (simulated here by deleting the key
+        after `setUp` already wrote it) must still approve the gate and
+        default to `plug_in_standardization` -- `_load_statistical_estimand_
+        settings`' backward-compatibility path, not a forced re-review."""
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        del protocol["statistical_estimand_settings"]["estimation_procedure"]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+        state = self.manager.load(self.run_id)
+        self.manager._invalidate_gate(state, "statistical_estimand", "test setup")
+        self.manager.save(state)
+        self.manager.decide_gate(self.run_id, "statistical_estimand", "approved", "Dr. Lee")
+        statistical_estimand = json.loads(
+            (self.run_dir / "statistical_estimand.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(statistical_estimand["estimation_procedure"], "plug_in_standardization")
+        self.assertEqual(statistical_estimand["outcome_model"], "logistic_regression_unpenalized")
+
+
+def _synthetic_cohort_csv(n: int = 300, seed: int = 11) -> str:
+    """A larger, statistically usable cohort CSV (unlike `_COHORT_ROWS_CSV`,
+    which only has 2 rows for the plumbing-only materialization tests) --
+    enough rows and outcome variance in both arms for `EstimationAgent`'s
+    complete-case + bootstrap requirements to succeed."""
+    rng = random.Random(seed)
+    lines = [
+        "person_id,A,Y,index_datetime,follow_up_days,censored,age,"
+        "gender_concept_id,race_concept_id,cov_sofa_score"
+    ]
+    for i in range(n):
+        treatment = rng.randint(0, 1)
+        age = rng.randint(18, 90)
+        risk = min(max(0.2 + 0.15 * treatment + 0.002 * age, 0.01), 0.99)
+        outcome = 1 if rng.random() < risk else 0
+        gender = rng.choice((8507, 8532))
+        race = rng.choice((8527, 8516))
+        sofa = round(rng.uniform(0, 20), 1)
+        lines.append(
+            f"{100 + i},{treatment},{outcome},2024-01-01T00:00:00,28,,"
+            f"{age},{gender},{race},{sofa}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+class WorkflowRunEstimationTests(WorkflowMaterializeAnalyticDatasetTests):
+    """`run_estimation` is the wiring that makes `EstimationAgent` actually
+    runnable inside a workflow run -- same fixture as
+    `WorkflowMaterializeAnalyticDatasetTests`, carried one step further
+    through a real materialization with a statistically usable cohort."""
+
+    def setUp(self):
+        super().setUp()
+        self.manager.materialize_analytic_dataset(
+            self.run_id, _FakeCohortRowsClient(_synthetic_cohort_csv())
+        )
+
+    def test_writes_an_estimation_artifact(self):
+        state = self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
+        artifact_path = self.run_dir / "estimation.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["status"], "estimated")
+        self.assertEqual(artifact["estimand"]["method"], "g_computation_standardization")
+        self.assertIn("cov_sofa_score", artifact["estimand"]["covariates_adjusted"])
+        self.assertIn("estimation.json", state.artifacts)
+        self.assertTrue(any(entry["event"] == "estimation_completed" for entry in state.history))
+
+    def test_requires_materialized_dataset(self):
+        (self.run_dir / "analytic_dataset.parquet").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_estimation(self.run_id)
+
+    def test_requires_execution_or_diagnostics_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_estimation(self.run_id)
+
+    def test_rejects_when_causal_estimation_is_not_allowed(self):
+        self.manager.decide_gate(self.run_id, "clinical_mapping", "rejected", "Dr. Lee")
+        with self.assertRaises(RuntimeError):
+            self.manager.run_estimation(self.run_id)
+
+
+class WorkflowRunEstimationTMLETests(WorkflowRunEstimationTests):
+    """`run_estimation` must dispatch to `TMLEAgent` -- not `EstimationAgent`
+    -- when the reviewed `statistical_estimand.json` names
+    `estimation_procedure="targeted_minimum_loss_based_estimation"`. Same
+    fixture as `WorkflowRunEstimationTests` (inherited, including its
+    guard-rail tests, which must keep passing unchanged here too), with only
+    `ESTIMATION_PROCEDURE` overridden so `setUp`'s `statistical_estimand`
+    gate records the TMLE procedure instead of the default plug-in one."""
+
+    ESTIMATION_PROCEDURE = "targeted_minimum_loss_based_estimation"
+
+    def test_writes_an_estimation_artifact(self):
+        # Overrides (not just extends) the parent test: `n_bootstrap` is
+        # meaningless for TMLE, and the written artifact's `method`/
+        # `outcome_model` differ from the plug-in baseline's -- the parent
+        # class's version of this same-named test would otherwise also run
+        # here unmodified and assert the wrong method string.
+        state = self.manager.run_estimation(self.run_id, random_seed=1)
+        artifact_path = self.run_dir / "estimation.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["status"], "estimated")
+        self.assertEqual(artifact["estimand"]["method"], "targeted_minimum_loss_based_estimation")
+        self.assertEqual(artifact["estimand"]["outcome_model"], "super_learner_ensemble")
+        self.assertIn("cov_sofa_score", artifact["estimand"]["covariates_adjusted"])
+        self.assertIn("estimation.json", state.artifacts)
+        self.assertTrue(any(entry["event"] == "estimation_completed" for entry in state.history))
+
+    def test_statistical_estimand_records_the_reviewed_procedure(self):
+        statistical_estimand = json.loads(
+            (self.run_dir / "statistical_estimand.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            statistical_estimand["estimation_procedure"], "targeted_minimum_loss_based_estimation"
+        )
+        self.assertEqual(statistical_estimand["outcome_model"], "super_learner_ensemble")
+        self.assertEqual(statistical_estimand["schema_version"], "1.2")
+
+
+class WorkflowCATETests(WorkflowRunEstimationTests):
+    """`run_cate`'s guard logic and `set_cate_cutpoint` -- same fixture as
+    `WorkflowRunEstimationTests`, which declares the default
+    `population_summary="ATE"` (the base protocol's `target_trial.
+    primary_estimand`). Most of what matters here is that CATE is never
+    runnable unless a study explicitly declared it as the primary
+    estimand -- exercising a real `CATEAgent` fit through the full
+    governed pipeline is covered directly and far more cheaply in
+    `tests/test_cate_agent.py`."""
+
+    def test_rejects_when_population_summary_is_not_cate(self):
+        statistical_estimand = json.loads(
+            (self.run_dir / "statistical_estimand.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(statistical_estimand["population_summary"], "ATE")
+        with self.assertRaisesRegex(RuntimeError, "CATE"):
+            self.manager.run_cate(self.run_id)
+
+    def test_requires_materialized_dataset(self):
+        (self.run_dir / "analytic_dataset.parquet").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_cate(self.run_id)
+
+    def test_requires_execution_or_diagnostics_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_cate(self.run_id)
+
+    def test_set_cate_cutpoint_records_the_value_under_the_slugified_column_name(self):
+        state = self.manager.set_cate_cutpoint(self.run_id, "SOFA score", 5.0, "Dr. Lee")
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.assertEqual(protocol["cate_cutpoints"]["cov_sofa_score"], 5.0)
+        self.assertTrue(any(entry["event"] == "cate_cutpoint_set" for entry in state.history))
+
+    def test_set_cate_cutpoint_requires_a_reviewer(self):
+        with self.assertRaises(ValueError):
+            self.manager.set_cate_cutpoint(self.run_id, "SOFA score", 5.0, "  ")
+
+    def test_set_cate_cutpoint_requires_a_covariate_name(self):
+        with self.assertRaises(ValueError):
+            self.manager.set_cate_cutpoint(self.run_id, "  ", 5.0, "Dr. Lee")
+
+
+def _fake_negative_control_llm(prompt: str) -> str:
+    return json.dumps({"candidates": [
+        {
+            "control_type": "negative_control_exposure",
+            "label": "Vitamin D supplementation",
+            "rationale": "No known mechanism affecting the study outcome.",
+        },
+    ]})
+
+
+class WorkflowProposeNegativeControlsTests(WorkflowRunEstimationTests):
+    """Negative-control candidate proposal -- same fixture as
+    `WorkflowRunEstimationTests` (already through execution phase with a
+    materialized dataset and approved statistical_estimand)."""
+
+    def test_proposes_candidates_never_pre_approved(self):
+        state = self.manager.propose_negative_controls(self.run_id, _fake_negative_control_llm)
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        negative_controls = protocol["negative_controls"]
+        self.assertEqual(len(negative_controls), 1)
+        entry = next(iter(negative_controls.values()))
+        self.assertEqual(entry["mapping_status"], "candidate_pending_human_approval")
+        self.assertEqual(entry["provenance"], "llm_proposed")
+        self.assertTrue(any(entry["event"] == "negative_controls_proposed" for entry in state.history))
+
+    def test_re_proposing_does_not_overwrite_an_already_approved_candidate(self):
+        self.manager.propose_negative_controls(self.run_id, _fake_negative_control_llm)
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        control_id = next(iter(protocol["negative_controls"]))
+        self.manager.map_negative_control(self.run_id, control_id, "drug", [999], "Dr. Lee", status="approved")
+
+        self.manager.propose_negative_controls(self.run_id, _fake_negative_control_llm)
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.assertEqual(protocol["negative_controls"][control_id]["mapping_status"], "approved")
+        self.assertEqual(protocol["negative_controls"][control_id]["concept_ids"], [999])
+
+    def test_requires_hypothesis_to_have_run(self):
+        other = self.manager.start(self.protocol)
+        with self.assertRaises(RuntimeError):
+            self.manager.propose_negative_controls(other.run_id, _fake_negative_control_llm)
+
+
+class WorkflowMapNegativeControlTests(WorkflowRunEstimationTests):
+    def setUp(self):
+        super().setUp()
+        self.manager.propose_negative_controls(self.run_id, _fake_negative_control_llm)
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.control_id = next(iter(protocol["negative_controls"]))
+
+    def test_approves_a_candidate(self):
+        state = self.manager.map_negative_control(
+            self.run_id, self.control_id, "drug", [999], "Dr. Lee", status="approved",
+        )
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        entry = protocol["negative_controls"][self.control_id]
+        self.assertEqual(entry["mapping_status"], "approved")
+        self.assertEqual(entry["concept_ids"], [999])
+        self.assertEqual(entry["reviewer"], "Dr. Lee")
+        self.assertTrue(any(entry["event"] == "negative_control_mapped" for entry in state.history))
+
+    def test_rejects_a_candidate(self):
+        self.manager.map_negative_control(
+            self.run_id, self.control_id, "drug", [], "Dr. Lee", status="not_clinically_defensible",
+        )
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            protocol["negative_controls"][self.control_id]["mapping_status"], "not_clinically_defensible"
+        )
+
+    def test_requires_a_known_control_id(self):
+        with self.assertRaises(RuntimeError):
+            self.manager.map_negative_control(self.run_id, "not_a_real_id", "drug", [999], "Dr. Lee")
+
+    def test_approved_status_requires_concept_ids(self):
+        with self.assertRaises(ValueError):
+            self.manager.map_negative_control(
+                self.run_id, self.control_id, "drug", [], "Dr. Lee", status="approved",
+            )
+
+    def test_rejects_unknown_domain(self):
+        with self.assertRaises(ValueError):
+            self.manager.map_negative_control(self.run_id, self.control_id, "not_a_domain", [999], "Dr. Lee")
+
+
+class WorkflowRunNegativeControlEstimationTests(WorkflowRunEstimationTests):
+    def setUp(self):
+        super().setUp()
+        self.manager.propose_negative_controls(self.run_id, _fake_negative_control_llm)
+        protocol = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.control_id = next(iter(protocol["negative_controls"]))
+        self.manager.map_negative_control(
+            self.run_id, self.control_id, "drug", [999], "Dr. Lee", status="approved",
+        )
+
+    def test_writes_a_negative_control_estimation_artifact(self):
+        state = self.manager.run_negative_control_estimation(
+            self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            n_bootstrap=30, random_seed=1,
+        )
+        result_path = self.run_dir / f"negative_control_estimation_{self.control_id}.json"
+        self.assertTrue(result_path.is_file())
+        artifact = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["status"], "estimated")
+        self.assertIn(f"negative_control_estimation_{self.control_id}.json", state.artifacts)
+        sql_path = self.run_dir / f"negative_control_{self.control_id}_cohort.sql"
+        self.assertTrue(sql_path.is_file())
+        self.assertIn("999", sql_path.read_text(encoding="utf-8"))
+        self.assertTrue(
+            any(entry["event"] == "negative_control_estimation_completed" for entry in state.history)
+        )
+        # The audit trail is row-count only -- the same discipline
+        # `materialize_analytic_dataset` uses for its own history entry.
+        completed = next(e for e in state.history if e["event"] == "negative_control_estimation_completed")
+        self.assertIn("row(s)", completed["detail"])
+
+    def test_requires_the_control_to_be_approved(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["negative_controls"]["pending_one"] = {
+            "control_id": "pending_one", "control_type": "negative_control_exposure",
+            "label": "Pending", "rationale": "x", "domain": "", "concept_ids": [],
+            "mapping_status": "candidate_pending_human_approval", "provenance": "llm_proposed",
+        }
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            self.manager.run_negative_control_estimation(
+                self.run_id, "pending_one", _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            )
+
+    def test_requires_a_known_control_id(self):
+        with self.assertRaises(RuntimeError):
+            self.manager.run_negative_control_estimation(
+                self.run_id, "not_a_real_id", _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            )
+
+    def test_requires_execution_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_negative_control_estimation(
+                self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            )
+
+    def test_causal_report_includes_a_negative_controls_section(self):
+        self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
+        self.manager.run_negative_control_estimation(
+            self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            n_bootstrap=30, random_seed=1,
+        )
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("Negative controls", text)
+        self.assertIn(self.control_id, text)
+
+    def test_does_not_persist_the_negative_control_dataframe(self):
+        self.manager.run_negative_control_estimation(
+            self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            n_bootstrap=30, random_seed=1,
+        )
+        self.assertFalse((self.run_dir / f"negative_control_{self.control_id}_dataset.parquet").exists())
+        self.assertFalse(any(self.run_dir.glob("negative_control_*.parquet")))
+
+
+class WorkflowRunDiagnosticsTests(WorkflowRunEstimationTests):
+    """`run_diagnostics` needs no fitted model -- same materialized-dataset
+    fixture as `WorkflowRunEstimationTests`, but exercised independently of
+    `run_estimation` to confirm it does not require it to have run first."""
+
+    def test_writes_a_diagnostics_artifact(self):
+        state = self.manager.run_diagnostics(self.run_id)
+        artifact_path = self.run_dir / "diagnostics.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertIn("Austin", artifact["citation"])
+        self.assertEqual(artifact["smd_flag_threshold"], 0.1)
+        names = {entry["column_name"] for entry in artifact["balance"]}
+        self.assertIn("cov_sofa_score", names)
+        self.assertTrue(any(name.startswith("gender_concept_id=") for name in names))
+        self.assertIn("diagnostics.json", state.artifacts)
+        self.assertTrue(any(entry["event"] == "diagnostics_completed" for entry in state.history))
+
+    def test_does_not_require_estimation_to_have_run_first(self):
+        self.assertFalse((self.run_dir / "estimation.json").is_file())
+        self.manager.run_diagnostics(self.run_id)
+        self.assertTrue((self.run_dir / "diagnostics.json").is_file())
+
+    def test_requires_materialized_dataset(self):
+        (self.run_dir / "analytic_dataset.parquet").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_diagnostics(self.run_id)
+
+    def test_requires_execution_or_diagnostics_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_diagnostics(self.run_id)
+
+
+class WorkflowRunSensitivityAnalysisTests(WorkflowRunEstimationTests):
+    """`run_sensitivity_analysis` needs an already-computed `estimation.json`
+    (unlike `run_diagnostics`, which needs no fitted model) -- same
+    materialized-dataset fixture as `WorkflowRunEstimationTests`, carried one
+    step further through a real `run_estimation` call."""
+
+    def setUp(self):
+        super().setUp()
+        self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
+
+    def test_writes_a_sensitivity_analysis_artifact(self):
+        state = self.manager.run_sensitivity_analysis(self.run_id)
+        artifact_path = self.run_dir / "sensitivity_analysis.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertIn("VanderWeele", artifact["citation"])
+        self.assertGreaterEqual(artifact["e_value_point"], 1.0)
+        self.assertGreaterEqual(artifact["e_value_ci"], 1.0)
+        self.assertIn("sensitivity_analysis.json", state.artifacts)
+        self.assertTrue(any(entry["event"] == "sensitivity_analysis_completed" for entry in state.history))
+
+    def test_requires_estimation_to_have_run_first(self):
+        (self.run_dir / "estimation.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_sensitivity_analysis(self.run_id)
+
+    def test_requires_execution_or_diagnostics_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_sensitivity_analysis(self.run_id)
+
+    def test_causal_report_includes_the_e_value_section(self):
+        self.manager.run_sensitivity_analysis(self.run_id)
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        report_path = self.manager.build_causal_report(self.run_id)
+        report_text = report_path.read_text(encoding="utf-8")
+        self.assertIn("Sensitivity analysis (E-value)", report_text)
+        self.assertIn("VanderWeele", report_text)
+
+
+class WorkflowCausalReportTests(WorkflowRunEstimationTests):
+    """`build_causal_report` is the auditable causal report (roadmap stage
+    11) -- and the first test coverage of the pre-existing `results` gate
+    actually being reached and exercised (see `REQUIRED_GATES["results_
+    review"] == "results"`, previously unused by any test)."""
+
+    def setUp(self):
+        super().setUp()
+        self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
+        self.manager.run_diagnostics(self.run_id)
+
+    def test_requires_results_review_or_report_phase(self):
+        with self.assertRaises(RuntimeError):
+            self.manager.build_causal_report(self.run_id)
+
+    def test_builds_a_report_with_estimate_and_diagnostics_at_results_review(self):
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("Causal effect estimate", text)
+        self.assertIn("g_computation_standardization", text)
+        self.assertIn("Covariate balance", text)
+        self.assertIn("Assumptions and limitations", text)
+        self.assertIn("PROVISIONAL", text)
+        self.assertIn("causal_report.md", self.manager.load(self.run_id).artifacts)
+        self.assertIn("An average treatment effect has been estimated", text)
+
+
+class WorkflowCausalReportWithoutEstimateTests(WorkflowMaterializeAnalyticDatasetTests):
+    """A report built before `run_estimation` ever runs (e.g. a legacy run,
+    or a reviewer previewing early) must not claim an effect was estimated
+    -- regression test for a real bug caught by hand-testing against an
+    existing run directory: the Interpretation section used to say "An
+    average treatment effect has been estimated" unconditionally."""
+
+    def test_report_does_not_claim_an_estimate_exists(self):
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertNotIn("Causal effect estimate", text)
+        self.assertNotIn("An average treatment effect has been estimated", text)
+        self.assertIn("No causal effect has been estimated for this run yet", text)
+
+    def test_advance_to_report_requires_the_results_gate_approved(self):
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        with self.assertRaises(RuntimeError):
+            self.manager.advance(self.run_id)
+        self.manager.decide_gate(self.run_id, "results", "approved", "Dr. Lee")
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "report")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("Results gate approved by Dr. Lee", text)
+        self.assertNotIn("PROVISIONAL", text)
+
+
+class _ResultsNarrativeFixture:
+    """Shared `setUp`/helpers for `WorkflowResultsNarrativeTests` and
+    `WorkflowResultsNarrativeReviewTests` -- a plain mixin (not itself a
+    `unittest.TestCase`), so each concrete class picks only the test
+    *methods* it declares, never the other's. Not a subclass of
+    `WorkflowCausalReportTests` either, even though the setup steps largely
+    overlap: this fixture's own `setUp` advances two phases further (all the
+    way to `results_review`), and subclassing would also inherit its (and
+    its ancestors') test methods, most of which assert phase guards that
+    only hold at the `execution` phase -- those would spuriously fail
+    against a fixture already at `results_review`.
+    """
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
+            },
+            "data_source": "project.dataset",
+            "first_pass_covariates": ["SOFA score"],
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "approved",
+                    "domain": "condition", "concept_ids": [132797],
+                },
+                "treatment": {
+                    "role": "treatment", "status": "approved",
+                    "domain": "drug", "concept_ids": [1],
+                },
+                "comparator": {
+                    "role": "comparator", "status": "approved",
+                    "domain": "drug", "concept_ids": [2],
+                },
+                "outcome": {
+                    "role": "outcome", "status": "approved",
+                    "domain": "condition", "concept_ids": [316866],
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        state = self.manager.run_hypothesis_agent(state.run_id)
+        self.run_id = state.run_id
+        self.run_dir = root / "runs" / self.run_id
+
+        self.manager.review_covariate(
+            self.run_id, "SOFA score", "accept", "Dr. Chen",
+            "Higher SOFA is associated with treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            domain="measurement",
+        )
+        self.manager.map_covariate_concepts(self.run_id, "SOFA score", [4301868], "Dr. Lee")
+        self.manager.review_covariate_aggregation(
+            self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
+        )
+        _approve_pre_mapping_gates(self.manager, self.run_id)
+        for _ in range(3):
+            state = self.manager.advance(self.run_id)
+        self.manager.decide_gate(self.run_id, "clinical_mapping", "approved", "Dr. Lee")
+        self.manager.advance(self.run_id)
+        self.manager.run_data_science_agent(self.run_id)
+        self.manager.advance(self.run_id)
+        plan_path = self.run_dir / "analysis_plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["exploratory_execution_allowed"] = True
+        plan["unresolved_issues"] = []
+        for phenotype in plan["phenotypes"]:
+            phenotype["status"] = "approved"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "Dr. Lee")
+        self.manager.advance(self.run_id)
+        self.manager.build_cohort_plan(self.run_id, self.datasets)
+        self.manager.set_statistical_estimand_strategy(
+            self.run_id,
+            missing_data_strategy="complete_case_analysis",
+            censoring_strategy="ignore_censoring_administrative_waiver",
+            censoring_rationale="No informative censoring expected in this synthetic fixture.",
+            reviewer="Dr. Lee",
+        )
+        self.manager.decide_gate(self.run_id, "statistical_estimand", "approved", "Dr. Lee")
+        self.manager.advance(self.run_id)
+        self.manager.materialize_analytic_dataset(
+            self.run_id, _FakeCohortRowsClient(_synthetic_cohort_csv())
+        )
+        self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
+        self.manager.run_diagnostics(self.run_id)
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def _valid_claims_llm(narrative="Plain language interpretation of the estimate.", claims=None):
+        """A structurally-valid (but not necessarily faithful) response --
+        for tests that only care that parsing/writing succeeds, not about
+        the faithfulness-verification outcome."""
+        if claims is None:
+            claims = [{
+                "text": "See narrative.",
+                "claim_type": "effect_direction",
+                "source_fields": ["estimation.estimand.point_estimate"],
+            }]
+
+        def fake_llm(prompt: str) -> str:
+            return json.dumps({"narrative": narrative, "claims": claims})
+
+        return fake_llm
+
+    def _faithful_llm(self):
+        """A response built from the run's own already-computed
+        `estimation.json`/`diagnostics.json`, so `verify_narrative` grades
+        every check `passed` regardless of which way the synthetic cohort's
+        randomly-seeded effect happened to point."""
+        estimation = json.loads((self.run_dir / "estimation.json").read_text(encoding="utf-8"))
+        diagnostics = json.loads((self.run_dir / "diagnostics.json").read_text(encoding="utf-8"))
+        estimand = estimation["estimand"]
+        direction_word = "an increase" if estimand["point_estimate"] > 0 else "a decrease"
+        crosses_null = estimand["ci_lower"] <= 0 <= estimand["ci_upper"]
+        uncertainty_phrase = "crosses the null" if crosses_null else "does not cross the null"
+        claims = [
+            {
+                "text": f"The point estimate suggests {direction_word} in risk.",
+                "claim_type": "effect_direction",
+                "source_fields": ["estimation.estimand.point_estimate"],
+            },
+            {
+                "text": f"The confidence interval {uncertainty_phrase}.",
+                "claim_type": "uncertainty",
+                "source_fields": ["estimation.estimand.ci_lower", "estimation.estimand.ci_upper"],
+            },
+            {
+                "text": "The analysis is based on the full analytic cohort.",
+                "claim_type": "sample_size",
+                "source_fields": ["estimation.estimand.n_total"],
+            },
+            {
+                "text": "This analysis assumes no unmeasured confounding.",
+                "claim_type": "assumption_or_limitation",
+                "source_fields": ["assumptions_and_limitations"],
+            },
+        ]
+        if diagnostics.get("n_covariates_flagged"):
+            claims.append({
+                "text": "Some covariates show meaningful imbalance between arms.",
+                "claim_type": "diagnostic_warning",
+                "source_fields": ["diagnostics.n_covariates_flagged"],
+            })
+        narrative_text = (
+            f"The estimated effect suggests {direction_word} in risk, and its interval "
+            f"{uncertainty_phrase}."
+        )
+
+        def fake_llm(prompt: str) -> str:
+            return json.dumps({"narrative": narrative_text, "claims": claims})
+
+        return fake_llm
+
+    @staticmethod
+    def _unfaithful_llm():
+        """A response with a number nowhere in the artifacts -- deterministically
+        fails the faithfulness verifier's number check regardless of the
+        run's actual estimate."""
+        def fake_llm(prompt: str) -> str:
+            return json.dumps({
+                "narrative": "The point estimate is 999.999, a huge and fabricated number.",
+                "claims": [{
+                    "text": "See narrative.",
+                    "claim_type": "effect_direction",
+                    "source_fields": ["estimation.estimand.point_estimate"],
+                }],
+            })
+
+        return fake_llm
+
+
+class WorkflowResultsNarrativeTests(_ResultsNarrativeFixture, unittest.TestCase):
+    """`run_results_narrative` is optional and must degrade gracefully."""
+
+    def test_writes_a_results_narrative_artifact(self):
+        state = self.manager.run_results_narrative(
+            self.run_id, self._valid_claims_llm("The estimated risk difference is small and imprecise."),
+            model="test-model", provider="test-provider",
+        )
+        artifact_path = self.run_dir / "results_narrative.json"
+        self.assertTrue(artifact_path.is_file())
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["narrative"], "The estimated risk difference is small and imprecise.")
+        self.assertIn("advisory only", artifact["boundary_statement"])
+        self.assertEqual(artifact["model"], "test-model")
+        self.assertEqual(artifact["provider"], "test-provider")
+        self.assertEqual(artifact["review_status"], "pending")
+        self.assertIsNone(artifact["reviewer"])
+        self.assertIn(artifact["verification"]["status"], {"passed", "warning", "failed"})
+        self.assertEqual(len(artifact["claims"]), 1)
+        self.assertIn("results_narrative.json", state.artifacts)
+        self.assertTrue(any(e["event"] == "results_narrative_generated" for e in state.history))
+
+    def test_causal_report_includes_the_narrative_once_approved(self):
+        self.manager.run_results_narrative(self.run_id, self._faithful_llm())
+        self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("LLM interpretive narrative", text)
+        self.assertIn("its interval", text)
+        self.assertIn("advisory only", text)
+        self.assertIn("Approved by Dr. Lee", text)
+
+    def test_report_omits_narrative_section_when_absent(self):
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("LLM interpretive narrative", text)
+        self.assertIn("No LLM interpretation was requested for this run.", text)
+
+    def test_an_unapproved_narrative_is_not_included_in_the_report(self):
+        """A generated-but-still-`pending` narrative must not leak its text
+        into the final report -- only an explicit approval does."""
+        self.manager.run_results_narrative(self.run_id, self._faithful_llm())
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertNotIn("The estimated effect suggests", text)
+        self.assertIn("pending human review", text)
+
+    def test_requires_estimation_to_have_run(self):
+        (self.run_dir / "estimation.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_results_narrative(self.run_id, self._valid_claims_llm())
+
+    def test_a_failing_llm_call_does_not_write_an_artifact_or_affect_the_run(self):
+        """A broken/unavailable LLM must not corrupt the run or block a
+        report from being built -- the narrative section is purely
+        additive, never required."""
+        def broken_llm(prompt: str) -> str:
+            raise RuntimeError("network down")
+
+        with self.assertRaises(RuntimeError):
+            self.manager.run_results_narrative(self.run_id, broken_llm)
+        self.assertFalse((self.run_dir / "results_narrative.json").is_file())
+        report_path = self.manager.build_causal_report(self.run_id)
+        self.assertTrue(report_path.is_file())
+        self.assertIn("No LLM interpretation was requested for this run.", report_path.read_text(encoding="utf-8"))
+
+    def test_narrative_requires_results_review_or_report_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "execution"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_results_narrative(self.run_id, self._valid_claims_llm())
+
+    def test_a_response_without_claims_is_rejected(self):
+        def no_claims_llm(prompt: str) -> str:
+            return json.dumps({"narrative": "text only"})
+
+        with self.assertRaises(ValueError):
+            self.manager.run_results_narrative(self.run_id, no_claims_llm)
+        self.assertFalse((self.run_dir / "results_narrative.json").is_file())
+
+
+class WorkflowResultsNarrativeReviewTests(_ResultsNarrativeFixture, unittest.TestCase):
+    """`review_results_narrative` is the human-review step, entirely
+    separate from the mandatory `results` gate (`decide_gate`): approving or
+    excluding a narrative never touches `state.gates["results"]`."""
+
+    def test_approves_a_narrative_with_no_failed_checks(self):
+        self.manager.run_results_narrative(self.run_id, self._faithful_llm())
+        state = self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee", "Looks faithful.")
+        artifact = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["review_status"], "approved")
+        self.assertEqual(artifact["reviewer"], "Dr. Lee")
+        self.assertEqual(artifact["review_note"], "Looks faithful.")
+        self.assertIsNotNone(artifact["reviewed_at"])
+        self.assertEqual(state.gates["results"].status, "pending")
+        self.assertTrue(any(e["event"] == "results_narrative_reviewed" for e in state.history))
+
+    def test_refuses_approval_when_a_check_failed(self):
+        self.manager.run_results_narrative(self.run_id, self._unfaithful_llm())
+        artifact = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["verification"]["status"], "failed")
+        with self.assertRaises(ValueError):
+            self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee")
+        artifact_after = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact_after["review_status"], "pending")
+
+    def test_exclusion_always_succeeds_even_with_failed_checks(self):
+        self.manager.run_results_narrative(self.run_id, self._unfaithful_llm())
+        self.manager.review_results_narrative(self.run_id, "excluded", "Dr. Lee", "Fabricated number.")
+        artifact = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["review_status"], "excluded")
+        self.assertEqual(artifact["review_note"], "Fabricated number.")
+
+    def test_excluded_narrative_lets_the_report_build_without_its_text(self):
+        self.manager.run_results_narrative(self.run_id, self._unfaithful_llm())
+        self.manager.review_results_narrative(self.run_id, "excluded", "Dr. Lee")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("The LLM interpretation was excluded from this version of the report.", text)
+        self.assertNotIn("999.999", text)
+
+    def test_requires_an_existing_narrative_artifact(self):
+        with self.assertRaises(RuntimeError):
+            self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee")
+
+    def test_requires_a_non_empty_reviewer(self):
+        self.manager.run_results_narrative(self.run_id, self._faithful_llm())
+        with self.assertRaises(ValueError):
+            self.manager.review_results_narrative(self.run_id, "approved", "  ")
+
+    def test_rejects_an_unknown_decision(self):
+        self.manager.run_results_narrative(self.run_id, self._faithful_llm())
+        with self.assertRaises(ValueError):
+            self.manager.review_results_narrative(self.run_id, "rejected", "Dr. Lee")
+
+    def test_requires_results_review_or_report_phase(self):
+        self.manager.run_results_narrative(self.run_id, self._faithful_llm())
+        state = self.manager.load(self.run_id)
+        state.phase = "execution"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee")
 
 
 class WorkflowVariableRegistryTests(unittest.TestCase):

@@ -21,6 +21,12 @@ PHASES = (
     "concept_mapping",
     "feasibility",
     "analysis_plan",
+    # Roadmap stage 8 (docs/causal_roadmap.md): fixes the observed-data
+    # statistical estimand -- outcome-model spec, the adjustment set
+    # actually built into cohort.sql, and the missing-data/censoring
+    # strategy -- as its own reviewed gate (`statistical_estimand`) before
+    # any patient-level row is materialized or fit.
+    "estimand_review",
     "execution",
     "diagnostics",
     "results_review",

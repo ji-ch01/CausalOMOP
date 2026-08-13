@@ -4,32 +4,63 @@ from __future__ import annotations
 
 import json
 import csv
+import hashlib
 import io
 import os
 import re
 import shutil
 import time
 import uuid
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from causal.orchestrator.state import ApprovalGate, NEXT_PHASE, RunState
+import pandas as pd
+
 from causal.agents import (
     DataScienceAgent,
+    DiagnosticsAgent,
+    EstimationAgent,
     ExecutionAgent,
     HypothesisAgent,
     QueryValidationAgent,
+    TMLEAgent,
     analysis_plan_blockers,
 )
 from causal.agents.dag_identification import assess_identification, build_study_specification, review_dag
 from causal.agents.hypothesis import DAG_VARIABLE_DOMAINS, DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
+from causal.agents.results_faithfulness import verify_narrative
+from causal.agents.results_narrative import (
+    DEFAULT_NARRATIVE_PROMPT_PATH,
+    NARRATIVE_BOUNDARY_STATEMENT,
+    NarrativeInput,
+    build_narrative_prompt,
+    normalize_narrative_artifact,
+    parse_narrative_response,
+)
 from causal.agents.user_question import GeneratedHypothesis
+from causal.llm.base import LLMCallable
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
-from causal.roadmap import CausalQuestion, TargetTrialProtocol
-from causal.data_builder import AnalyticCohortBuilder
+from causal.provenance import artifact_metadata
+from causal.sensitivity import e_value
+from causal.roadmap import (
+    CENSORING_STRATEGIES,
+    ESTIMATION_PROCEDURES,
+    IDENTIFYING_FUNCTIONALS,
+    MISSING_DATA_STRATEGIES,
+    OUTCOME_MODEL_SPECS,
+    CausalQuestion,
+    StatisticalEstimand,
+    TargetTrialProtocol,
+)
+from causal.data_builder import (
+    AnalyticCohortBuilder,
+    parse_cohort_csv_to_dataframe,
+    write_analytic_dataset,
+)
+from causal.data_builder.analytic import AnalyticColumn
 from causal.mapping.audit import (
     approved_concepts_missing_from_data_sql,
     concept_mapping_coverage_sql,
@@ -41,10 +72,15 @@ from causal.mapping.audit import (
     orphan_concepts_sql,
 )
 from causal.mapping.registry import (
+    MAPPING_STATUS_APPROVED,
     VALUE_DOMAINS,
+    OMOPVariableDefinition,
     OMOPVariableRegistry,
     build_extraction_plan,
+    extraction_plan_to_concept_set_spec,
     extraction_plan_to_covariate_spec,
+    fixed_domain_to_concept_set_spec,
+    is_fixed_domain,
     is_sql_executable,
     variable_from_covariate_plan,
 )
@@ -58,6 +94,14 @@ from causal.queries import (
     CovariateSpec,
     feasibility_sql,
 )
+from causal.queries.negative_controls import (
+    DEFAULT_NEGATIVE_CONTROL_PROMPT_PATH,
+    NEGATIVE_CONTROL_ROLES,
+    build_negative_control_prompt,
+    parse_negative_control_response,
+    substitute_spec,
+    variable_from_negative_control_proposal,
+)
 
 
 QUERY_ROLES = ("population", "treatment", "comparator", "outcome")
@@ -68,11 +112,13 @@ REQUIRED_GATES = {
     "identification_review": "identification_estimand",
     "concept_mapping": "clinical_mapping",
     "analysis_plan": "analysis_plan",
+    "estimand_review": "statistical_estimand",
     "results_review": "results",
 }
 
 _ALL_GATE_NAMES = (
-    "target_trial", "dag_review", "identification_estimand", "clinical_mapping", "analysis_plan", "results",
+    "target_trial", "dag_review", "identification_estimand", "clinical_mapping", "analysis_plan",
+    "statistical_estimand", "results",
 )
 
 # Runs created before `protocol_review` was split into target_trial_review /
@@ -103,6 +149,22 @@ def _migrate_legacy_protocol_gate(state: RunState) -> None:
             state.gates[name] = ApprovalGate(name)
     if state.phase == _LEGACY_PROTOCOL_PHASE:
         state.phase = "target_trial_review"
+
+
+def _migrate_missing_gates(state: RunState) -> None:
+    """Runs created before a gate name was added to `_ALL_GATE_NAMES` (most
+    recently `statistical_estimand`, for the `estimand_review` phase) have a
+    `state.json` whose `gates` dict simply lacks that key -- `RunState.
+    from_dict` never invents gates it was not told about. Left alone, the
+    first `decide_gate(..., "statistical_estimand", ...)` call on such a run
+    would raise "Unknown gate" even though the run is otherwise perfectly
+    healthy. Defaulting the missing gate(s) to `pending` is exactly what a
+    freshly `start()`-ed run already gets, so this only backfills, never
+    resets, an existing decision.
+    """
+    for name in _ALL_GATE_NAMES:
+        if name not in state.gates:
+            state.gates[name] = ApprovalGate(name)
 
 # How long a stale `.review.lock` file (left behind by a crashed/killed
 # process -- this is advisory, not OS-enforced) is trusted before a new
@@ -179,6 +241,16 @@ class _RunLock:
 # "Governed causal query rejected" failure deep inside the OMCP subprocess.
 _STUDY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
 
+# `causal.roadmap.CENSORING_STRATEGIES` values whose `EstimationAgent` fit
+# actually reads the per-row `censored` column (to filter rows, or to fit a
+# censoring model from it) -- these must not be approved for the
+# `statistical_estimand` gate while `censored` is still the always-NULL
+# default (see `_load_censoring_definition_approved`); only
+# `ignore_censoring_administrative_waiver` can be approved without it.
+_CENSORING_STRATEGIES_REQUIRING_APPROVED_COLUMN = frozenset(
+    {"exclude_censored_before_analysis", "ipcw_administrative_censoring"}
+)
+
 
 def _validate_study_id(study_id: str) -> str:
     study_id = study_id.strip()
@@ -213,57 +285,24 @@ _ROLE_FALLBACK_ROLES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _resolve_concept_spec(
-    by_role: dict[str, list[dict]], role: str, exposure_contrast: str, *fallback_roles: str
-) -> ConceptSetSpec | None:
-    """Resolve one query role's `ConceptSetSpec` from `concept_sets`, by role.
-
-    Tries `role` first, then each of `fallback_roles` in order (see
-    `_ROLE_FALLBACK_ROLES`). Returns `None` only when *no* `concept_sets`
-    entry declares any of these roles at all -- the caller decides what that
-    means (a hard requirement for population/treatment/comparator, a
-    `death`-table default for outcome). An entry that *does* declare the
-    role but is not yet approved raises immediately instead of falling
-    through to a fallback role or a default -- that would silently bypass
-    the approval gate rather than genuinely finding no entry.
-
-    Exception: `role="comparator"` under `exposure_contrast="vs_unexposed"`
-    (see `causal.queries.feasibility.EXPOSURE_CONTRASTS`) never raises here,
-    approved or not -- there is no OMOP concept for "absence of a drug" (e.g.
-    "aspirin vs no aspirin"), so an unapproved/domain-less/`no_standard_
-    concept` entry is that design's correct, final state, not a blocker.
-    `_cohort_ctes` never reads this spec's `domain`/`concept_ids` in that
-    mode, so whatever is (or isn't) recorded is safe to pass through as-is.
-    """
-    for candidate_role in (role, *fallback_roles):
-        entries = by_role.get(candidate_role, [])
-        if len(entries) > 1:
-            raise RuntimeError(
-                f"concept_sets has more than one entry declaring role '{candidate_role}' -- "
-                "a query needs exactly one"
-            )
-        if len(entries) == 1:
-            entry = entries[0]
-            domain = entry.get("domain")
-            domain_str = domain if isinstance(domain, str) else ""
-            if candidate_role == "comparator" and exposure_contrast == "vs_unexposed":
-                concept_ids = tuple(int(value) for value in entry.get("concept_ids", ()))
-                return ConceptSetSpec(domain=domain_str, concept_ids=concept_ids)
-            if entry.get("status") != "approved" or not domain_str:
-                raise RuntimeError(
-                    f"concept_sets role '{candidate_role}' must be approved with a domain "
-                    "before a query can be generated for it"
-                )
-            concept_ids = tuple(int(value) for value in entry.get("concept_ids", ()))
-            return ConceptSetSpec(domain=domain_str, concept_ids=concept_ids)
-    return None
-
-
 def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
     """Resolve the human-approved, per-question concept sets a cohort/
     feasibility query is built from -- population/treatment/comparator/
-    outcome -- directly from `concept_sets`, by role (see
-    `_resolve_concept_spec`).
+    outcome -- from `OMOPVariableRegistry.from_protocol(protocol)`, by role
+    (`OMOPVariableRegistry.resolve_role`).
+
+    A thin wrapper: the registry is the single source of truth for "which
+    OMOP variable does this role resolve to" (see `causal.mapping.registry`
+    module docstring); this function only adds the two things a registry
+    entry alone cannot know -- which fallback role each query role accepts
+    (`_ROLE_FALLBACK_ROLES`, protocol-shape domain knowledge, not generic
+    registry logic) and the unmapped-outcome-defaults-to-death placeholder
+    (`OMOPVariableRegistry.from_protocol`/`from_dict` never synthesizes a
+    default entry that was not actually declared -- see that classmethod's
+    docstring on rebuilding fresh, never inventing). Any `ValueError` from
+    registry construction or resolution (an entry exists but is not yet
+    approved, has no domain, etc.) is re-wrapped as `RuntimeError` here, the
+    error type every caller of this function already expects.
 
     Previously read from a separate `query_concept_sets` store that a
     reviewer had to map independently from `concept_sets`, with nothing
@@ -275,41 +314,84 @@ def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
     `AnalyticCohortBuilder.build`, `profile_sql`, `followup_audit_sql`) and
     by `DataScienceAgent`'s phenotype-review plan alike.
     """
-    concept_sets = protocol.get("concept_sets")
-    if not isinstance(concept_sets, dict):
+    if not isinstance(protocol.get("concept_sets"), dict):
         raise RuntimeError(
             "Protocol requires concept_sets (population/treatment/comparator/outcome, "
             "each approved with a domain and concept_ids) before a cohort or feasibility "
             "query can be generated for this question"
         )
-    by_role: dict[str, list[dict]] = defaultdict(list)
-    for definition in concept_sets.values():
-        if isinstance(definition, dict) and isinstance(definition.get("role"), str):
-            by_role[definition["role"]].append(definition)
+    # `OMOPVariableRegistry.from_protocol` requires a non-empty `study_id` --
+    # a real invariant for a persisted registry, but irrelevant to resolving
+    # concept specs (never read below), and every real `protocol.json`
+    # already has one (`_validate_study_id`, enforced at `start()`). Only a
+    # placeholder here, for callers (namely this function's own unit tests)
+    # that build a minimal protocol dict without it.
+    registry_protocol = protocol if isinstance(protocol.get("study_id"), str) and protocol["study_id"].strip() else {
+        **protocol, "study_id": "unspecified",
+    }
+    try:
+        registry = OMOPVariableRegistry.from_protocol(registry_protocol)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     exposure_contrast = _load_exposure_contrast(protocol)
     specs: dict[str, ConceptSetSpec] = {}
     for role in QUERY_ROLES:
         fallback_roles = _ROLE_FALLBACK_ROLES.get(role, ())
-        spec = _resolve_concept_spec(by_role, role, exposure_contrast, *fallback_roles)
-        if spec is None:
+        matched = registry.resolve_role(role, *fallback_roles)
+
+        if role == "comparator" and exposure_contrast == "vs_unexposed":
+            # Never raises here, matched or not, approved or not -- there is
+            # no OMOP concept for "absence of a drug" (e.g. "aspirin vs no
+            # aspirin"), so an unapproved/domain-less/absent comparator is
+            # this design's correct, final state, not a blocker (mirrors
+            # `_resolve_concept_spec`'s former carve-out one-for-one).
+            if matched is None:
+                specs[role] = ConceptSetSpec(domain="", concept_ids=())
+            else:
+                specs[role] = ConceptSetSpec(
+                    domain=matched.domain or "",
+                    concept_ids=matched.root_concept_ids,
+                    include_descendants=matched.include_descendants,
+                    excluded_concept_ids=matched.excluded_concept_ids,
+                )
+            continue
+
+        if matched is None:
             if role == "outcome":
-                # No role="outcome" concept set declared at all: the same
+                # No role="outcome" variable declared at all: the same
                 # "all-cause death via the standard OMOP `death` table"
                 # default `DataScienceAgent.run` falls back to when it finds
                 # no phenotype declaring role="outcome" either -- kept in
                 # sync so both readers of `concept_sets` agree on what an
-                # omitted outcome role means.
-                spec = ConceptSetSpec(domain="death", concept_ids=())
-            elif role == "comparator" and exposure_contrast == "vs_unexposed":
-                # No comparator entry declared at all -- fine under this
-                # design (see `_resolve_concept_spec`'s docstring): there is
-                # nothing to map in the first place.
-                spec = ConceptSetSpec(domain="", concept_ids=())
+                # omitted outcome role means. A caller-level placeholder
+                # (never persisted, never written back into the registry --
+                # see this function's docstring).
+                placeholder = OMOPVariableDefinition(
+                    variable_id="outcome_all_cause_death_default",
+                    dag_node_label="outcome",
+                    variable_kind="phenotype",
+                    causal_role="outcome",
+                    observed=True,
+                    domain="death",
+                    mapping_status=MAPPING_STATUS_APPROVED,
+                    provenance="protocol_declared",
+                )
+                specs[role] = fixed_domain_to_concept_set_spec(placeholder)
+                continue
+            wanted = f"role {role!r}" + (f" or {fallback_roles[0]!r}" if fallback_roles else "")
+            raise RuntimeError(f"concept_sets requires an approved entry with {wanted}")
+
+        try:
+            if is_fixed_domain(matched.domain):
+                specs[role] = fixed_domain_to_concept_set_spec(matched)
             else:
-                wanted = f"role {role!r}" + (f" or {fallback_roles[0]!r}" if fallback_roles else "")
-                raise RuntimeError(f"concept_sets requires an approved entry with {wanted}")
-        specs[role] = spec
+                specs[role] = extraction_plan_to_concept_set_spec(build_extraction_plan(matched))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"concept_sets role '{role}' must be approved with a domain before a query can be "
+                f"generated for it ({exc})"
+            ) from exc
     return specs
 
 
@@ -351,6 +433,38 @@ def _load_censoring_definition_approved(protocol: dict) -> bool:
     if not isinstance(settings, dict):
         return False
     return bool(settings.get("censoring_definition_approved", False))
+
+
+def _load_statistical_estimand_settings(protocol: dict) -> dict[str, str] | None:
+    """Read the reviewer-set missing-data/censoring/estimation-procedure
+    strategy (`protocol["statistical_estimand_settings"]`; see
+    `WorkflowManager.set_statistical_estimand_strategy`). Kept in its own
+    top-level protocol key rather than folded into `query_settings`: these
+    are statistical modeling decisions consumed by `EstimationAgent`/
+    `TMLEAgent`, not SQL-generation settings consumed by
+    `analytic_cohort_sql`. Returns `None` (not a dict of empty strings) when
+    no reviewer has set this yet, so callers can tell "not reviewed" apart
+    from "reviewed as empty".
+
+    `estimation_procedure` defaults to `"plug_in_standardization"` when
+    absent from the persisted settings -- a run whose reviewer called
+    `set_statistical_estimand_strategy` before this field existed keeps
+    today's g-computation behavior rather than being forced back into
+    re-review.
+    """
+    settings = protocol.get("statistical_estimand_settings")
+    if not isinstance(settings, dict):
+        return None
+    required = ("missing_data_strategy", "censoring_strategy", "censoring_rationale")
+    if not all(isinstance(settings.get(key), str) and settings.get(key) for key in required):
+        return None
+    estimation_procedure = settings.get("estimation_procedure", "plug_in_standardization")
+    if estimation_procedure not in ESTIMATION_PROCEDURES:
+        return None
+    return {
+        **{key: settings[key] for key in required},
+        "estimation_procedure": estimation_procedure,
+    }
 
 
 # A concept whose text plainly appears in this many *unmapped* (concept_id=0)
@@ -544,6 +658,105 @@ def _mismatched_concept_domains(
     return mismatches
 
 
+def _censoring_strategy_report_note(estimand_block: dict[str, Any]) -> str:
+    """Parenthetical detail for `causal_report.md`'s censoring-strategy line
+    -- what actually happened to censored rows differs enough by strategy
+    (dropped vs. reweighted vs. left alone) that one fixed phrase would
+    misdescribe at least two of the three `causal.roadmap.
+    CENSORING_STRATEGIES` values."""
+    strategy = estimand_block.get("censoring_strategy")
+    if strategy == "exclude_censored_before_analysis":
+        return f" ({estimand_block.get('n_excluded_censored', 0)} row(s) excluded for censoring)"
+    if strategy == "ipcw_administrative_censoring":
+        return (
+            f" ({estimand_block.get('n_censored', 0)} row(s) reweighted via IPCW; "
+            f"censoring-model AUC {estimand_block.get('censoring_model_auc', '-')}, "
+            f"mean/max weight {estimand_block.get('ipcw_weight_mean', '-')}/"
+            f"{estimand_block.get('ipcw_weight_max', '-')})"
+        )
+    return ""
+
+
+def _gather_assumptions(
+    study_spec: dict[str, Any],
+    readiness: dict[str, Any],
+    cohort_manifest: dict[str, Any],
+    dataset_manifest: dict[str, Any],
+    diagnostics: dict[str, Any],
+    estimand_block: dict[str, Any],
+) -> list[str]:
+    """Deduplicated assumptions/limitations for the causal report and the
+    results narrative -- shared by `WorkflowManager.build_causal_report` and
+    `WorkflowManager.run_results_narrative` so the two never drift apart on
+    what a reviewer (human or LLM-assisted) sees as the caveats for the same
+    estimate. Every artifact argument is optional (an empty dict when the
+    corresponding file does not exist yet)."""
+    assumptions: list[str] = []
+    if study_spec:
+        identification = study_spec.get("identification", {})
+        assumptions.append(
+            "Identification relies on the reviewed causal DAG and backdoor adjustment set "
+            f"(identified_by_backdoor_adjustment="
+            f"{identification.get('identified_by_backdoor_adjustment', '-')}); an unmeasured "
+            "confounder omitted from the DAG would still bias this estimate."
+        )
+    for artifact, key in (
+        (readiness, "warnings"), (cohort_manifest, "unresolved_issues"),
+        (dataset_manifest, "warnings"), (diagnostics, "warnings"),
+    ):
+        assumptions.extend(artifact.get(key, ()) if artifact else ())
+    assumptions.extend(estimand_block.get("warnings", ()) if estimand_block else ())
+    assumptions = list(dict.fromkeys(assumptions))
+    assumptions.append(
+        "Out of scope (docs/causal_roadmap.md milestone #4): CATE/effect-modification "
+        "estimation -- both implemented estimators (g-computation, TMLE) report the "
+        "population ATE only. Censoring-aware (IPCW) adjustment is implemented for "
+        "single-interval administrative censoring only, and only for the g-computation "
+        "estimator -- see the statistical estimand's censoring_strategy above."
+    )
+    return assumptions
+
+
+def _dispatch_estimator(
+    statistical_estimand: dict[str, Any],
+    dataframe: pd.DataFrame,
+    *,
+    study_id: str,
+    covariate_columns: tuple[str, ...],
+    n_bootstrap: int,
+    random_seed: int,
+) -> Any:
+    """Fit `EstimationAgent` or `TMLEAgent` over `dataframe`, dispatched on
+    `statistical_estimand`'s reviewed `estimation_procedure` -- the shared
+    logic behind `WorkflowManager.run_estimation` (the real study's
+    materialized dataset) and `WorkflowManager.run_negative_control_
+    estimation` (a negative-control-substituted cohort), so the two never
+    drift on which estimator a reviewed `estimation_procedure` maps to.
+    `n_bootstrap` is ignored when TMLE is the reviewed procedure -- TMLE
+    replaces the bootstrap with a closed-form efficient-influence-curve
+    variance estimator.
+    """
+    estimation_procedure = statistical_estimand.get("estimation_procedure", "plug_in_standardization")
+    if estimation_procedure == "targeted_minimum_loss_based_estimation":
+        return TMLEAgent().run(
+            dataframe,
+            study_id=study_id,
+            covariate_columns=covariate_columns,
+            censoring_strategy=statistical_estimand["censoring_strategy"],
+            missing_data_strategy=statistical_estimand["missing_data_strategy"],
+            random_seed=random_seed,
+        )
+    return EstimationAgent().run(
+        dataframe,
+        study_id=study_id,
+        covariate_columns=covariate_columns,
+        censoring_strategy=statistical_estimand["censoring_strategy"],
+        missing_data_strategy=statistical_estimand["missing_data_strategy"],
+        n_bootstrap=n_bootstrap,
+        random_seed=random_seed,
+    )
+
+
 class WorkflowManager:
     def __init__(self, runs_dir: str | Path = "artifacts/runs") -> None:
         self.runs_dir = Path(runs_dir)
@@ -632,6 +845,7 @@ class WorkflowManager:
             raise FileNotFoundError(f"Unknown run_id: {run_id}")
         state = RunState.from_dict(json.loads(path.read_text(encoding="utf-8")))
         _migrate_legacy_protocol_gate(state)
+        _migrate_missing_gates(state)
         return state
 
     def save(self, state: RunState) -> None:
@@ -658,11 +872,16 @@ class WorkflowManager:
                 self._write_study_specification_if_hypothesis_exists(run_id)
             if gate == "analysis_plan" and status == "approved":
                 self._block_if_analysis_plan_incomplete(run_id)
+            if gate == "statistical_estimand" and status == "approved":
+                self._write_statistical_estimand(run_id)
             state.gates[gate].decide(status, reviewer, comment)  # type: ignore[arg-type]
             state.record("gate_decided", f"{gate}={status} by {reviewer}")
             if gate == "identification_estimand" and status == "approved":
                 if "study_specification.json" not in state.artifacts:
                     state.artifacts.append("study_specification.json")
+            if gate == "statistical_estimand" and status == "approved":
+                if "statistical_estimand.json" not in state.artifacts:
+                    state.artifacts.append("statistical_estimand.json")
             self.save(state)
         return state
 
@@ -893,6 +1112,180 @@ class WorkflowManager:
         )
         self._invalidate_gate(state, "clinical_mapping", f"concept_sets['{name}'] changed")
         self._invalidate_gate(state, "analysis_plan", f"concept_sets['{name}'] changed")
+        self.save(state)
+        return state
+
+    def propose_negative_controls(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        *,
+        prompt_path: Path = DEFAULT_NEGATIVE_CONTROL_PROMPT_PATH,
+    ) -> RunState:
+        """LLM-assisted negative-control candidate proposal (`docs.
+        causal_roadmap` milestone 6, `causal.queries.negative_controls`).
+
+        Clinical label + rationale only, never an OMOP concept -- concept
+        mapping and approval are the separate, human-reviewed
+        `map_negative_control` step below, the same "propose a label, map
+        concepts separately" split `candidate_dag` covariates already use.
+        Every candidate this writes has `mapping_status=
+        "candidate_pending_human_approval"`; nothing in `causal.queries.
+        negative_controls.parse_negative_control_response` can ever mark one
+        approved, no matter what the raw LLM response claims (see that
+        function's docstring) -- this call cannot make a negative control
+        queryable by itself.
+
+        Folds into the existing `clinical_mapping` gate/`concept_mapping`
+        phase rather than a new gate, same as `map_concept_set`; only
+        requires `hypothesis.json` to already exist, not a specific phase,
+        so a reviewer can propose/re-propose at any point a mapping review
+        is still open.
+        """
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before proposing negative controls")
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        concept_sets = protocol.get("concept_sets", {})
+        # A `concept_sets` entry's clinical label is its dict key (e.g.
+        # "albumin"), not a separate field.
+        target = {
+            role: next(
+                (name for name, entry in concept_sets.items()
+                 if isinstance(entry, dict) and entry.get("role") == role),
+                "",
+            )
+            for role in QUERY_ROLES
+        }
+        prompt = build_negative_control_prompt(prompt_path, target)
+        raw = llm(prompt)
+        candidates = parse_negative_control_response(raw)
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            existing = protocol.get("negative_controls", {})
+            already_approved = {
+                control_id for control_id, entry in existing.items()
+                if isinstance(entry, dict) and entry.get("mapping_status") == "approved"
+            }
+            updated = dict(existing)
+            for candidate in candidates:
+                if candidate["control_id"] in already_approved:
+                    # Never overwrite an already-approved candidate with a
+                    # fresh, unreviewed proposal of the same slugified label.
+                    continue
+                updated[candidate["control_id"]] = candidate
+            protocol["negative_controls"] = updated
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            state = self.load(run_id)
+            state.record(
+                "negative_controls_proposed",
+                f"{len(candidates)} candidate(s) proposed: "
+                f"{', '.join(candidate['control_id'] for candidate in candidates)}",
+            )
+            self.save(state)
+        return state
+
+    def map_negative_control(
+        self,
+        run_id: str,
+        control_id: str,
+        domain: str,
+        concept_ids: list[int],
+        reviewer: str,
+        status: str = "approved",
+        comment: str | None = None,
+        concept_lookup: OMCPClient | None = None,
+    ) -> RunState:
+        """Human review of one negative-control candidate: map it to a real
+        OMOP domain/concept(s) and approve or reject it in one action --
+        the same shape as `map_concept_set` (this is the one place a
+        negative control actually becomes approved; `propose_negative_
+        controls` above never can). `concept_lookup` is the same optional,
+        opt-in domain cross-check `map_concept_set`/`map_covariate_concepts`
+        already support.
+        """
+        control_id = control_id.strip()
+        if not control_id:
+            raise ValueError("control_id is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("status is required")
+        status = status.strip()
+        try:
+            concept_ids = [int(concept_id) for concept_id in concept_ids]
+        except (TypeError, ValueError):
+            raise ValueError("concept_ids must be a list of integers")
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+
+        existing_entry = json.loads(protocol_path.read_text(encoding="utf-8")).get(
+            "negative_controls", {}
+        ).get(control_id)
+        if not isinstance(existing_entry, dict):
+            raise RuntimeError(f"negative_controls has no candidate named '{control_id}'")
+        if domain not in DOMAIN_TABLES:
+            raise ValueError(f"domain must be one of {tuple(DOMAIN_TABLES)}")
+        if status == "approved" and not concept_ids:
+            raise ValueError("status='approved' requires at least one concept_id")
+
+        if concept_lookup is not None and concept_ids:
+            response = concept_lookup.get_concepts_by_id(concept_ids)
+            mismatches = _mismatched_concept_domains(response.text, concept_ids, domain)
+            if mismatches:
+                raise ValueError(
+                    f"Concept domain check failed for negative_controls['{control_id}']: "
+                    + "; ".join(mismatches)
+                )
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            negative_controls = protocol.get("negative_controls", {})
+            entry = negative_controls.get(control_id)
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"negative_controls has no candidate named '{control_id}'")
+            before = {
+                "domain": entry.get("domain", ""),
+                "concept_ids": entry.get("concept_ids", []),
+                "mapping_status": entry.get("mapping_status", "candidate_pending_human_approval"),
+            }
+            updated_entry = {
+                **entry,
+                "domain": domain,
+                "concept_ids": concept_ids,
+                "mapping_status": status,
+                "reviewer": reviewer.strip(),
+                "provenance": "omcp_candidate" if concept_lookup is not None else entry.get("provenance", "llm_proposed"),
+            }
+            # Validated the same way every other registry entry is --
+            # raises before anything is persisted if e.g. status="approved"
+            # with a provenance in `_UNSUPERVISED_PROVENANCE` and no
+            # reviewer (cannot happen here since reviewer is required
+            # above, but this keeps exactly one validating code path).
+            try:
+                variable_from_negative_control_proposal(updated_entry)
+            except ValueError as exc:
+                raise ValueError(f"Cannot map negative control '{control_id}': {exc}") from exc
+            protocol["negative_controls"] = {**negative_controls, control_id: updated_entry}
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+        detail = f"{control_id}: domain={domain}, {len(concept_ids)} concept(s), status={status} by {reviewer}"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "negative_control_mapped", detail,
+            changes={"before": before, "after": {"domain": domain, "concept_ids": concept_ids, "status": status}},
+        )
         self.save(state)
         return state
 
@@ -1538,6 +1931,105 @@ class WorkflowManager:
         temporary.write_text(json.dumps(spec.to_dict(), indent=2), encoding="utf-8")
         temporary.replace(spec_path)
 
+    def _write_statistical_estimand(self, run_id: str) -> None:
+        """Build and persist `statistical_estimand.json` (`roadmap.
+        StatisticalEstimand`) when approving the `statistical_estimand`
+        gate, and act as that gate's completeness check.
+
+        Distinct from `study_specification.json`'s `CausalEstimand`: this
+        fixes how the already-approved counterfactual contrast will actually
+        be estimated -- the adjustment set as built into `cohort.sql` (not
+        re-derived, `cohort_manifest.json`'s `baseline_covariate` columns are
+        the single source of truth, same as `run_estimation`/`run_
+        diagnostics`), and the reviewer's explicit missing-data/censoring
+        strategy (`set_statistical_estimand_strategy`) -- rather than the
+        g-formula and complete-case behavior staying implicit in `causal.
+        agents.estimation.EstimationAgent`'s code with the analytic cohort's
+        `censored` column silently unused, as before this gate existed.
+        """
+        run_dir = self.runs_dir / run_id
+        study_spec_path = run_dir / "study_specification.json"
+        if not study_spec_path.is_file():
+            raise ValueError(
+                "Cannot approve the statistical_estimand gate: run and approve "
+                "identification_estimand first (study_specification.json is missing)"
+            )
+        manifest_path = run_dir / "cohort_manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(
+                "Cannot approve the statistical_estimand gate: run `workflow cohort-plan` first "
+                "(cohort_manifest.json is missing) so the adjustment set actually built into "
+                "cohort.sql is known"
+            )
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        strategy = _load_statistical_estimand_settings(protocol)
+        if strategy is None:
+            raise ValueError(
+                "Cannot approve the statistical_estimand gate: run `workflow estimand-strategy` "
+                "first to record a reviewed missing-data strategy, censoring strategy, and "
+                "rationale"
+            )
+        if (
+            strategy["censoring_strategy"] in _CENSORING_STRATEGIES_REQUIRING_APPROVED_COLUMN
+            and not _load_censoring_definition_approved(protocol)
+        ):
+            raise ValueError(
+                f"Cannot approve the statistical_estimand gate: censoring_strategy is "
+                f"{strategy['censoring_strategy']!r} but the per-row `censored` column has not "
+                "been approved yet (run `workflow approve-censoring-definition` first, or choose "
+                "'ignore_censoring_administrative_waiver' with a stated rationale)"
+            )
+        study_spec = json.loads(study_spec_path.read_text(encoding="utf-8"))
+        effect_measure = study_spec.get("estimand", {}).get("effect_measure")
+        if effect_measure != "risk_difference":
+            raise ValueError(
+                "Cannot approve the statistical_estimand gate: only the risk_difference effect "
+                "measure is implemented (causal.agents.estimation.EstimationAgent, causal.agents."
+                f"tmle.TMLEAgent), but study_specification.json declares effect_measure="
+                f"{effect_measure!r}. Either revise protocol.json's target_trial.effect_measure to "
+                "risk_difference, or wait for an estimator that supports that scale."
+            )
+        # Passed straight through, not re-derived -- `population_summary`
+        # was already fixed at the causal-question stage
+        # (`CausalEstimand.population_summary`, `study_specification.json`
+        # `estimand.population_summary`). Re-declaring or overriding it
+        # here would let a reviewer silently change *what* is being
+        # estimated at the estimation-procedure-review stage, which is not
+        # this gate's job.
+        population_summary = study_spec.get("estimand", {}).get("population_summary")
+        cohort_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        adjustment_set = tuple(
+            column["name"] for column in cohort_manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        )
+        state = self.load(run_id)
+        if strategy["estimation_procedure"] in {
+            "targeted_minimum_loss_based_estimation", "causal_forest_dml",
+        }:
+            outcome_model = "super_learner_ensemble"
+        else:
+            outcome_model = "logistic_regression_unpenalized"
+        try:
+            estimand = StatisticalEstimand(
+                schema_version="1.2",
+                study_id=state.study_id,
+                identifying_functional="g_formula_standardization",
+                outcome_model=outcome_model,
+                adjustment_set=adjustment_set,
+                effect_measure=effect_measure,
+                missing_data_strategy=strategy["missing_data_strategy"],
+                censoring_strategy=strategy["censoring_strategy"],
+                censoring_rationale=strategy["censoring_rationale"],
+                population_summary=population_summary or "ATE",
+                estimation_procedure=strategy["estimation_procedure"],
+            )
+        except ValueError as exc:
+            raise ValueError(f"Cannot approve the statistical_estimand gate: {exc}") from exc
+        estimand_path = run_dir / "statistical_estimand.json"
+        temporary = estimand_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(estimand.to_dict(), indent=2), encoding="utf-8")
+        temporary.replace(estimand_path)
+
     def _write_hypothesis(self, run_id: str, protocol: dict) -> None:
         artifact = HypothesisAgent().run(protocol).to_dict()
         artifact_path = self.runs_dir / run_id / "hypothesis.json"
@@ -1647,9 +2139,10 @@ class WorkflowManager:
         run_dir = self.runs_dir / run_id
         with _RunLock(run_dir):
             state = self.load(run_id)
-            if state.phase not in {"feasibility", "analysis_plan", "execution"}:
+            if state.phase not in {"feasibility", "analysis_plan", "estimand_review", "execution"}:
                 raise RuntimeError(
-                    "Execution readiness requires feasibility, analysis_plan, or execution phase"
+                    "Execution readiness requires feasibility, analysis_plan, estimand_review, or "
+                    "execution phase"
                 )
             plan_path = run_dir / "analysis_plan.json"
             if not plan_path.is_file():
@@ -1700,8 +2193,8 @@ class WorkflowManager:
     ) -> RunState:
         """Write cohort SQL and its governance manifest without executing it."""
         state = self.load(run_id)
-        if state.phase not in {"analysis_plan", "execution"}:
-            raise RuntimeError("Cohort planning requires analysis_plan or execution phase")
+        if state.phase not in {"analysis_plan", "estimand_review", "execution"}:
+            raise RuntimeError("Cohort planning requires analysis_plan, estimand_review, or execution phase")
         run_dir = self.runs_dir / run_id
         self.run_execution_readiness(run_id)
         state = self.load(run_id)
@@ -1761,6 +2254,530 @@ class WorkflowManager:
                 "cohort_plan_generated",
                 f"cohort.sql; execution_allowed={manifest.execution_allowed}; query_validation=passed",
             )
+            self.save(state)
+        return state
+
+    def materialize_analytic_dataset(self, run_id: str, client: OMCPClient) -> RunState:
+        """Execute the governed cohort SQL and write patient-level rows to
+        `analytic_dataset.parquet` -- the one place in this codebase person-
+        level data is ever pulled into memory (see `causal.data_builder.
+        materialize`'s own docstring). Requires `cohort.sql`/`cohort_
+        manifest.json` (`build_cohort_plan`) to already exist.
+
+        Governance: reuses the already-signed `mcp_context.json` and calls
+        `client.causal_select(cohort_sql, "cohort_build", context)` --
+        `omcp.governance.authorize_causal_operation` already authorizes
+        `"cohort_build"` off `analysis_plan_status == "approved"` and
+        `context.analytic_dataset_build_allowed` (both re-derived fresh by
+        `run_execution_readiness` below, not trusted from a stale readiness
+        snapshot). There is deliberately no direct-database bypass for this
+        call, unlike the dev-only escape hatch some aggregate feasibility
+        paths retain -- person-level materialization always goes through
+        OMCP's signed path.
+        """
+        state = self.load(run_id)
+        if state.phase != "execution":
+            raise RuntimeError("Dataset materialization requires the execution phase")
+        run_dir = self.runs_dir / run_id
+        cohort_sql_path = run_dir / "cohort.sql"
+        manifest_path = run_dir / "cohort_manifest.json"
+        if not cohort_sql_path.is_file() or not manifest_path.is_file():
+            raise RuntimeError("Run build_cohort_plan first")
+        self.run_execution_readiness(run_id)
+        state = self.load(run_id)
+        readiness = json.loads((run_dir / "execution_readiness.json").read_text(encoding="utf-8"))
+        if not readiness["analytic_dataset_build_allowed"]:
+            raise RuntimeError("Execution readiness does not permit building the analytic dataset")
+        cohort_sql = cohort_sql_path.read_text(encoding="utf-8")
+        cohort_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # Defense in depth, cheap -- same rationale as build_cohort_plan's own
+        # call: the SQL on disk should already be valid, but re-checking here
+        # costs nothing and never trusts a file it did not just validate.
+        validation = QueryValidationAgent().run(cohort_sql, purpose="person_level_dataset")
+        if not validation.passed:
+            raise RuntimeError(
+                f"Cohort SQL failed re-validation before materialization: {', '.join(validation.violations)}"
+            )
+        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
+        response = client.causal_select(cohort_sql, "cohort_build", context)
+        columns = tuple(AnalyticColumn(**column) for column in cohort_manifest["columns"])
+        dataframe = parse_cohort_csv_to_dataframe(response.text, columns)
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            dataset_manifest = write_analytic_dataset(
+                dataframe, run_dir,
+                study_id=state.study_id, run_id=state.run_id,
+                source_query_sha256=cohort_manifest["query_sha256"],
+            )
+            (run_dir / "dataset_manifest.json").write_text(
+                json.dumps(dataset_manifest.to_dict(), indent=2), encoding="utf-8"
+            )
+            for artifact in ("analytic_dataset.parquet", "dataset_manifest.json"):
+                if artifact not in state.artifacts:
+                    state.artifacts.append(artifact)
+            # Row count only -- this is the audit trail for the one place
+            # patient-level rows are ever pulled into memory, so it must
+            # never itself carry a value.
+            state.record(
+                "analytic_dataset_materialized",
+                f"analytic_dataset.parquet; {dataset_manifest.row_count} row(s)",
+            )
+            self.save(state)
+        return state
+
+    def run_estimation(
+        self,
+        run_id: str,
+        *,
+        n_bootstrap: int = 1000,
+        random_seed: int = 0,
+    ) -> RunState:
+        """Fit the ATE (`causal.agents.estimation.EstimationAgent`'s g-
+        computation or `causal.agents.tmle.TMLEAgent`'s TMLE, dispatched on
+        `statistical_estimand.json`'s reviewed `estimation_procedure`) over
+        the materialized `analytic_dataset.parquet` and write
+        `estimation.json`. Requires `materialize_analytic_dataset` to have
+        already run in this run directory. `n_bootstrap` is ignored when
+        TMLE is the reviewed procedure -- TMLE replaces the bootstrap with a
+        closed-form efficient-influence-curve variance estimator.
+
+        The covariate list is read from `cohort_manifest.json`'s own
+        `baseline_covariate`-role columns rather than re-derived from
+        `analysis_plan.json` -- that manifest is exactly the reviewed
+        covariate set the materialized parquet was built from, so this is
+        the single source of truth for "what is actually in this file",
+        not a second, independently-computed list that could drift from it.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"execution", "diagnostics"}:
+            raise RuntimeError("Estimation requires the execution or diagnostics phase")
+        run_dir = self.runs_dir / run_id
+        dataset_path = run_dir / "analytic_dataset.parquet"
+        manifest_path = run_dir / "cohort_manifest.json"
+        if not dataset_path.is_file() or not manifest_path.is_file():
+            raise RuntimeError("Run materialize_analytic_dataset first")
+        estimand_path = run_dir / "statistical_estimand.json"
+        if not estimand_path.is_file():
+            raise RuntimeError("Run and approve the statistical_estimand gate first")
+        self.run_execution_readiness(run_id)
+        state = self.load(run_id)
+        readiness = json.loads((run_dir / "execution_readiness.json").read_text(encoding="utf-8"))
+        if not readiness["causal_estimation_allowed"]:
+            raise RuntimeError("Execution readiness does not permit causal estimation")
+        cohort_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        covariate_columns = tuple(
+            column["name"] for column in cohort_manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        )
+        statistical_estimand = json.loads(estimand_path.read_text(encoding="utf-8"))
+        if tuple(statistical_estimand["adjustment_set"]) != covariate_columns:
+            raise RuntimeError(
+                "statistical_estimand.json's adjustment_set no longer matches cohort_manifest."
+                "json's baseline_covariate columns -- re-approve the statistical_estimand gate "
+                "after the analysis plan or cohort plan changed"
+            )
+        dataframe = pd.read_parquet(dataset_path)
+        artifact = _dispatch_estimator(
+            statistical_estimand, dataframe,
+            study_id=state.study_id, covariate_columns=covariate_columns,
+            n_bootstrap=n_bootstrap, random_seed=random_seed,
+        )
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            (run_dir / "estimation.json").write_text(
+                json.dumps(artifact.to_dict(), indent=2), encoding="utf-8"
+            )
+            if "estimation.json" not in state.artifacts:
+                state.artifacts.append("estimation.json")
+            estimand = artifact.estimand
+            state.record(
+                "estimation_completed",
+                f"estimation.json; {estimand.effect_measure}="
+                f"{estimand.point_estimate:.4f} "
+                f"[{estimand.ci_lower:.4f}, {estimand.ci_upper:.4f}] "
+                f"(n={estimand.n_total})",
+            )
+            self.save(state)
+        return state
+
+    def run_diagnostics(self, run_id: str) -> RunState:
+        """Compute the standardized mean difference (SMD) covariate-balance
+        table (`causal.agents.diagnostics.DiagnosticsAgent`) over the
+        materialized `analytic_dataset.parquet` and write `diagnostics.json`.
+        Needs no fitted model, so it can run before or after `run_estimation`
+        -- only `materialize_analytic_dataset` is a prerequisite.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"execution", "diagnostics"}:
+            raise RuntimeError("Diagnostics requires the execution or diagnostics phase")
+        run_dir = self.runs_dir / run_id
+        dataset_path = run_dir / "analytic_dataset.parquet"
+        manifest_path = run_dir / "cohort_manifest.json"
+        if not dataset_path.is_file() or not manifest_path.is_file():
+            raise RuntimeError("Run materialize_analytic_dataset first")
+        cohort_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        covariate_columns = tuple(
+            column["name"] for column in cohort_manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        )
+        covariate_data_types = {
+            column["name"]: column["data_type"] for column in cohort_manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        }
+        dataframe = pd.read_parquet(dataset_path)
+        artifact = DiagnosticsAgent().run(
+            dataframe,
+            study_id=state.study_id,
+            covariate_columns=covariate_columns,
+            covariate_data_types=covariate_data_types,
+        )
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            (run_dir / "diagnostics.json").write_text(
+                json.dumps(artifact.to_dict(), indent=2), encoding="utf-8"
+            )
+            if "diagnostics.json" not in state.artifacts:
+                state.artifacts.append("diagnostics.json")
+            state.record(
+                "diagnostics_completed",
+                f"diagnostics.json; {artifact.n_covariates_flagged}/{len(artifact.balance)} "
+                "covariate(s) flagged for imbalance",
+            )
+            self.save(state)
+        return state
+
+    def run_sensitivity_analysis(self, run_id: str) -> RunState:
+        """Compute the E-value quantitative sensitivity analysis
+        (`causal.sensitivity.e_value`, VanderWeele & Ding 2017) over an
+        already-computed `estimation.json` and write
+        `sensitivity_analysis.json`. Works identically for a g-computation
+        or TMLE estimate -- both report a risk_ratio_point_estimate/
+        risk_ratio_ci_lower/risk_ratio_ci_upper alongside their primary
+        risk-difference estimate specifically for this. Needs no fitted
+        model of its own, so -- like `run_diagnostics` -- it is callable any
+        time after `run_estimation`, in either order relative to
+        `run_diagnostics`.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"execution", "diagnostics"}:
+            raise RuntimeError("Sensitivity analysis requires the execution or diagnostics phase")
+        run_dir = self.runs_dir / run_id
+        estimation_path = run_dir / "estimation.json"
+        if not estimation_path.is_file():
+            raise RuntimeError("Run run_estimation first")
+        estimand = json.loads(estimation_path.read_text(encoding="utf-8"))["estimand"]
+        try:
+            result = e_value(
+                estimand["risk_ratio_point_estimate"],
+                estimand["risk_ratio_ci_lower"],
+                estimand["risk_ratio_ci_upper"],
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot compute a sensitivity analysis: {exc}") from exc
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            (run_dir / "sensitivity_analysis.json").write_text(
+                json.dumps(result.to_dict(), indent=2), encoding="utf-8"
+            )
+            if "sensitivity_analysis.json" not in state.artifacts:
+                state.artifacts.append("sensitivity_analysis.json")
+            state.record(
+                "sensitivity_analysis_completed",
+                f"sensitivity_analysis.json; E-value(point)={result.e_value_point:.3f}, "
+                f"E-value(CI)={result.e_value_ci:.3f}",
+            )
+            self.save(state)
+        return state
+
+    def run_negative_control_estimation(
+        self,
+        run_id: str,
+        control_id: str,
+        client: OMCPClient,
+        *,
+        datasets: BigQueryDatasets | None = None,
+        n_bootstrap: int = 1000,
+        random_seed: int = 0,
+    ) -> RunState:
+        """Run whichever estimator (`EstimationAgent`/`TMLEAgent`, per the
+        already-reviewed `statistical_estimand.json`) was reviewed for the
+        real study against a negative-control-substituted cohort instead
+        (`docs/causal_roadmap.md` milestone 6, `causal.queries.
+        negative_controls`). Requires `map_negative_control(..., status=
+        "approved")` to have already run for `control_id`.
+
+        `causal.queries.negative_controls.substitute_spec` swaps the
+        approved negative control in for `treatment` (a negative-control
+        exposure) or `outcome` (a negative-control outcome) -- population,
+        comparator, the reviewed baseline covariates, censoring strategy,
+        and exposure_contrast are all identical to the real study. The
+        substituted cohort SQL is executed through the same governed OMCP
+        `cohort_build` path `materialize_analytic_dataset` uses, but the
+        resulting person-level DataFrame is never written to disk -- unlike
+        the real study's `analytic_dataset.parquet`, this is a diagnostic
+        side-analysis, not the run's primary governed dataset, so nothing
+        is gained by persisting a second copy of patient-level rows for it.
+        Only the negative-control cohort SQL (safe -- no patient-level
+        values) and the aggregate estimate are written to disk.
+
+        A diagnostic, not a gate: a null result here is evidence *for* the
+        adjustment set; a non-null result is a warning `build_causal_report`
+        surfaces, never something that blocks or changes any gate decision.
+        """
+        state = self.load(run_id)
+        if state.phase != "execution":
+            raise RuntimeError("Negative control estimation requires the execution phase")
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        entry = protocol.get("negative_controls", {}).get(control_id)
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"negative_controls has no candidate named '{control_id}'")
+        if entry.get("mapping_status") != MAPPING_STATUS_APPROVED:
+            raise RuntimeError(
+                f"Negative control '{control_id}' is not approved (mapping_status="
+                f"{entry.get('mapping_status')!r}) -- run map_negative_control first"
+            )
+
+        hypothesis_path = run_dir / "hypothesis.json"
+        estimand_path = run_dir / "statistical_estimand.json"
+        analysis_plan_path = run_dir / "analysis_plan.json"
+        for path, label in (
+            (hypothesis_path, "the Hypothesis Agent"),
+            (estimand_path, "and approve the statistical_estimand gate"),
+            (analysis_plan_path, "and approve the analysis_plan gate"),
+        ):
+            if not path.is_file():
+                raise RuntimeError(f"Run {label} first")
+
+        self.run_execution_readiness(run_id)
+        state = self.load(run_id)
+        readiness = json.loads((run_dir / "execution_readiness.json").read_text(encoding="utf-8"))
+        if not readiness["analytic_dataset_build_allowed"]:
+            raise RuntimeError("Execution readiness does not permit building an analytic dataset")
+
+        control_variable = variable_from_negative_control_proposal(entry)
+        try:
+            if is_fixed_domain(control_variable.domain):
+                control_spec = fixed_domain_to_concept_set_spec(control_variable)
+            else:
+                control_spec = extraction_plan_to_concept_set_spec(build_extraction_plan(control_variable))
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot resolve negative control '{control_id}': {exc}") from exc
+
+        specs = _load_concept_specs(protocol)
+        substituted = substitute_spec(specs, control_variable.causal_role, control_spec)
+        hypothesis = json.loads(hypothesis_path.read_text(encoding="utf-8"))
+        analysis_plan = json.loads(analysis_plan_path.read_text(encoding="utf-8"))
+        settings = _load_query_settings(protocol)
+        exposure_contrast = _load_exposure_contrast(protocol)
+        covariates = _load_covariate_specs(analysis_plan)
+        censoring_definition_approved = _load_censoring_definition_approved(protocol)
+
+        sql, manifest = AnalyticCohortBuilder().build(
+            state.study_id,
+            datasets or BigQueryDatasets.from_env(),
+            population=substituted["population"],
+            treatment=substituted["treatment"],
+            comparator=substituted["comparator"],
+            outcome=substituted["outcome"],
+            grace_period_hours=hypothesis["grace_period_hours"],
+            follow_up_days=hypothesis["follow_up_days"],
+            execution_allowed=True,
+            exposure_contrast=exposure_contrast,
+            covariates=covariates,
+            censoring_definition_approved=censoring_definition_approved,
+            **settings,
+        )
+        validation = QueryValidationAgent().run(sql, purpose="person_level_dataset")
+        if not validation.passed:
+            raise RuntimeError(
+                f"Negative control cohort SQL failed governance validation: {', '.join(validation.violations)}"
+            )
+        context = json.loads((run_dir / "mcp_context.json").read_text(encoding="utf-8"))
+        response = client.causal_select(sql, "cohort_build", context)
+        dataframe = parse_cohort_csv_to_dataframe(response.text, manifest.columns)
+
+        statistical_estimand = json.loads(estimand_path.read_text(encoding="utf-8"))
+        covariate_columns = tuple(
+            column.name for column in manifest.columns if column.role == "baseline_covariate"
+        )
+        artifact = _dispatch_estimator(
+            statistical_estimand, dataframe,
+            study_id=f"{state.study_id}_negative_control_{control_id}",
+            covariate_columns=covariate_columns,
+            n_bootstrap=n_bootstrap, random_seed=random_seed,
+        )
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            sql_filename = f"negative_control_{control_id}_cohort.sql"
+            result_filename = f"negative_control_estimation_{control_id}.json"
+            (run_dir / sql_filename).write_text(sql, encoding="utf-8")
+            (run_dir / result_filename).write_text(
+                json.dumps(artifact.to_dict(), indent=2), encoding="utf-8"
+            )
+            for artifact_name in (sql_filename, result_filename):
+                if artifact_name not in state.artifacts:
+                    state.artifacts.append(artifact_name)
+            estimand = artifact.estimand
+            # Row count only -- same discipline as materialize_analytic_
+            # dataset's own audit-trail entry; the DataFrame itself is
+            # never written to disk or logged.
+            state.record(
+                "negative_control_estimation_completed",
+                f"{result_filename}; {len(dataframe)} row(s); {estimand.effect_measure}="
+                f"{estimand.point_estimate:.4f} [{estimand.ci_lower:.4f}, {estimand.ci_upper:.4f}]",
+            )
+            self.save(state)
+        return state
+
+    def run_results_narrative(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        *,
+        model: str = "unknown",
+        provider: str = "unknown",
+        prompt_path: Path = DEFAULT_NARRATIVE_PROMPT_PATH,
+    ) -> RunState:
+        """Optional, gracefully-degrading LLM interpretation of an already-
+        computed estimate (`causal.agents.results_narrative`). Requires
+        `estimation.json` to exist; builds `NarrativeInput` from on-disk JSON
+        artifacts only -- `analytic_dataset.parquet` is never read here and
+        never reaches `llm`.
+
+        Fully separate from `build_causal_report`: if `llm(prompt)` raises
+        (network, malformed response) this call raises too and no
+        `results_narrative.json` is written, but the run and any previously
+        built report are entirely unaffected -- `build_causal_report` only
+        ever reads `results_narrative.json` if it happens to already exist
+        (see its own docstring), it never calls an LLM itself.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"results_review", "report"}:
+            raise RuntimeError("Results narrative requires the results_review or report phase")
+        run_dir = self.runs_dir / run_id
+        estimation_path = run_dir / "estimation.json"
+        if not estimation_path.is_file():
+            raise RuntimeError("Run run_estimation first")
+        study_spec = self._read_optional_json(run_dir / "study_specification.json")
+        dataset_manifest = self._read_optional_json(run_dir / "dataset_manifest.json")
+        estimation = json.loads(estimation_path.read_text(encoding="utf-8"))
+        diagnostics = self._read_optional_json(run_dir / "diagnostics.json")
+        readiness = self._read_optional_json(run_dir / "execution_readiness.json")
+        cohort_manifest = self._read_optional_json(run_dir / "cohort_manifest.json")
+        assumptions = _gather_assumptions(
+            study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics,
+            estimation.get("estimand", {}),
+        )
+        narrative_input = NarrativeInput(
+            study_id=state.study_id,
+            question=study_spec.get("question", {}),
+            estimand=study_spec.get("estimand", {}),
+            dataset_summary={
+                "row_count": dataset_manifest.get("row_count"),
+                "column_count": dataset_manifest.get("column_count"),
+            },
+            estimation=estimation,
+            diagnostics=diagnostics,
+            gate_history=tuple(
+                {
+                    "name": gate.name, "status": gate.status,
+                    "reviewer": gate.reviewer, "decided_at": gate.decided_at,
+                }
+                for gate in state.gates.values()
+            ),
+            assumptions_and_limitations=tuple(assumptions),
+        )
+        prompt = build_narrative_prompt(prompt_path, narrative_input)
+        result = parse_narrative_response(llm(prompt))
+        verification = verify_narrative(result, narrative_input)
+        artifact = {
+            "schema_version": "2.0",
+            "narrative": result.narrative_text,
+            "claims": [claim.to_dict() for claim in result.claims],
+            "verification": verification.to_dict(),
+            "review_status": "pending",
+            "reviewer": None,
+            "reviewed_at": None,
+            "review_note": None,
+            "boundary_statement": NARRATIVE_BOUNDARY_STATEMENT,
+            "model": model,
+            "provider": provider,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "metadata": artifact_metadata(
+                "results_narrative_agent", "0.2.0",
+                {"study_id": state.study_id, "model": model, "provider": provider},
+            ),
+        }
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            (run_dir / "results_narrative.json").write_text(
+                json.dumps(artifact, indent=2), encoding="utf-8"
+            )
+            if "results_narrative.json" not in state.artifacts:
+                state.artifacts.append("results_narrative.json")
+            state.record(
+                "results_narrative_generated",
+                f"results_narrative.json; model={provider}:{model}; "
+                f"verification={verification.status}; claims={len(result.claims)}",
+            )
+            self.save(state)
+        return state
+
+    def review_results_narrative(
+        self,
+        run_id: str,
+        decision: str,
+        reviewer: str,
+        note: str | None = None,
+    ) -> RunState:
+        """Human review of the optional LLM results-narrative interpretation
+        -- entirely separate from the mandatory `results` gate, which still
+        governs the statistical estimate itself and is untouched by this
+        call (see `decide_gate`).
+
+        `decision == "approved"` requires the deterministic faithfulness
+        verification already stored on the artifact (`run_results_narrative`
+        -> `causal.agents.results_faithfulness.verify_narrative`) to contain
+        no `failed` check -- a reviewer cannot rubber-stamp a narrative the
+        verifier has already flagged as unfaithful to the underlying
+        artifacts; the only way past a failed check is `decision ==
+        "excluded"`, which always succeeds and simply drops the narrative
+        from `build_causal_report`.
+        """
+        if decision not in {"approved", "excluded"}:
+            raise ValueError("decision must be approved or excluded")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        run_dir = self.runs_dir / run_id
+        narrative_path = run_dir / "results_narrative.json"
+        if not narrative_path.is_file():
+            raise RuntimeError("Run run_results_narrative first")
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            if state.phase not in {"results_review", "report"}:
+                raise RuntimeError("Results-narrative review requires the results_review or report phase")
+            artifact = normalize_narrative_artifact(
+                json.loads(narrative_path.read_text(encoding="utf-8"))
+            )
+            if decision == "approved":
+                verification = artifact.get("verification") or {}
+                checks = verification.get("checks", ())
+                if verification.get("status") not in {"passed", "warning"} or any(
+                    check.get("status") == "failed" for check in checks
+                ):
+                    raise ValueError(
+                        "Cannot approve the results narrative: deterministic faithfulness "
+                        f"verification status is '{verification.get('status', 'not_run')}'. "
+                        "Exclude it from the report instead, or regenerate the narrative."
+                    )
+            artifact["review_status"] = decision
+            artifact["reviewer"] = reviewer.strip()
+            artifact["review_note"] = note.strip() if note else None
+            artifact["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+            narrative_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+            state.record("results_narrative_reviewed", f"results_narrative.json {decision} by {reviewer.strip()}")
             self.save(state)
         return state
 
@@ -2298,6 +3315,320 @@ class WorkflowManager:
         self.save(state)
         return report_path
 
+    def build_causal_report(self, run_id: str) -> Path:
+        """Assemble the auditable causal report (`docs/causal_roadmap.md`
+        roadmap stage 11): the estimated effect, its diagnostics, and every
+        assumption/limitation/gate decision it depends on, all linked back
+        to the protocol/DAG/estimand contract and each artifact's own
+        provenance. A distinct artifact from `build_demo_report` (left
+        unchanged) -- that one is a pre-estimation feasibility snapshot;
+        this one is only meaningful once an estimate exists.
+
+        Callable from `results_review` (so a reviewer can preview the report
+        before deciding the `results` gate) or `report`.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"results_review", "report"}:
+            raise RuntimeError("Causal report requires the results_review or report phase")
+        run_dir = self.runs_dir / run_id
+        study_spec = self._read_optional_json(run_dir / "study_specification.json")
+        statistical_estimand = self._read_optional_json(run_dir / "statistical_estimand.json")
+        dataset_manifest = self._read_optional_json(run_dir / "dataset_manifest.json")
+        estimation = self._read_optional_json(run_dir / "estimation.json")
+        diagnostics = self._read_optional_json(run_dir / "diagnostics.json")
+        sensitivity_analysis = self._read_optional_json(run_dir / "sensitivity_analysis.json")
+        negative_control_results = sorted(
+            (
+                (path.stem[len("negative_control_estimation_"):], self._read_optional_json(path))
+                for path in run_dir.glob("negative_control_estimation_*.json")
+            ),
+            key=lambda item: item[0],
+        )
+        cate = self._read_optional_json(run_dir / "cate.json")
+        readiness = self._read_optional_json(run_dir / "execution_readiness.json")
+        cohort_manifest = self._read_optional_json(run_dir / "cohort_manifest.json")
+        narrative = self._read_optional_json(run_dir / "results_narrative.json")
+
+        results_gate = state.gates.get("results")
+        if results_gate is not None and results_gate.status == "approved":
+            banner = f"Results gate approved by {results_gate.reviewer} on {results_gate.decided_at}."
+        else:
+            status = results_gate.status if results_gate is not None else "pending"
+            banner = f"PROVISIONAL -- the `results` gate is `{status}`, not yet approved."
+
+        lines = [
+            f"# CausalOMOP causal report -- {state.study_id}",
+            "",
+            f"> {banner}",
+            "",
+            "## Workflow status",
+            "",
+            f"- Run: `{state.run_id}`",
+            f"- Mode: `{state.mode}`",
+            f"- Phase: `{state.phase}`",
+            f"- Created: `{state.created_at}`",
+        ]
+
+        if study_spec:
+            question = study_spec.get("question", {})
+            trial = study_spec.get("target_trial", {})
+            estimand = study_spec.get("estimand", {})
+            identification = study_spec.get("identification", {})
+            lines.extend([
+                "", "## Causal question, target trial, and estimand", "",
+                f"- Population: {question.get('population', '-')}",
+                f"- Treatment: {question.get('treatment', '-')}",
+                f"- Comparator: {question.get('comparator', '-')}",
+                f"- Outcome: {question.get('outcome', '-')}",
+                f"- Time zero: {trial.get('time_zero', '-')}",
+                f"- Follow-up: {trial.get('follow_up_days', '-')} days",
+                f"- Primary estimand (population summary): {estimand.get('population_summary', '-')}",
+                f"- Effect measure: {estimand.get('effect_measure', '-')}",
+                f"- Identified by backdoor adjustment: "
+                f"`{identification.get('identified_by_backdoor_adjustment', '-')}`",
+                f"- Minimum adjustment set(s): {identification.get('minimum_adjustment_sets', '-')}",
+            ])
+
+        if statistical_estimand:
+            lines.extend([
+                "", "## Statistical estimand", "",
+                "> The observed-data contract this run was actually estimated under -- distinct "
+                "from the counterfactual estimand above, and reviewed via the "
+                "`statistical_estimand` gate.",
+                "",
+                f"- Identifying functional: {statistical_estimand.get('identifying_functional', '-')}",
+                f"- Outcome model: {statistical_estimand.get('outcome_model', '-')}",
+                f"- Adjustment set: {list(statistical_estimand.get('adjustment_set', ()))}",
+                f"- Missing-data strategy: {statistical_estimand.get('missing_data_strategy', '-')}",
+                f"- Censoring strategy: {statistical_estimand.get('censoring_strategy', '-')}",
+                f"- Censoring rationale: {statistical_estimand.get('censoring_rationale', '-')}",
+            ])
+
+        if dataset_manifest:
+            lines.extend([
+                "", "## Analytic dataset", "",
+                "> Row/column counts and hashes only -- no patient-level value ever appears in "
+                "this report.",
+                "",
+                f"- Rows: **{dataset_manifest.get('row_count', '-')}**",
+                f"- Columns: **{dataset_manifest.get('column_count', '-')}**",
+                f"- Parquet sha256: `{dataset_manifest.get('parquet_sha256', '-')}`",
+                f"- Source cohort query sha256: `{dataset_manifest.get('source_cohort_query_sha256', '-')}`",
+            ])
+
+        estimand_block = estimation.get("estimand", {}) if estimation else {}
+        if estimand_block:
+            lines.extend([
+                "", "## Causal effect estimate", "",
+                f"- Method: {estimand_block.get('method', '-')} "
+                f"({estimand_block.get('citation', '-')})",
+                f"- Effect measure: {estimand_block.get('effect_measure', '-')}",
+                f"- Point estimate: **{estimand_block.get('point_estimate', '-')}**",
+                f"- {int(estimand_block.get('ci_level', 0.95) * 100)}% CI: "
+                f"[{estimand_block.get('ci_lower', '-')}, {estimand_block.get('ci_upper', '-')}]",
+                f"- Risk ratio: {estimand_block.get('risk_ratio_point_estimate', '-')} "
+                f"[{estimand_block.get('risk_ratio_ci_lower', '-')}, "
+                f"{estimand_block.get('risk_ratio_ci_upper', '-')}]",
+                f"- N (total / treated / comparator): "
+                f"{estimand_block.get('n_total', '-')} / {estimand_block.get('n_treated', '-')} / "
+                f"{estimand_block.get('n_comparator', '-')}",
+                f"- Outcome events: {estimand_block.get('n_outcome_events', '-')}",
+                f"- Bootstrap resamples used: {estimand_block.get('n_bootstrap', '-')} "
+                f"(seed {estimand_block.get('bootstrap_seed', '-')})",
+                f"- Outcome model: {estimand_block.get('outcome_model', '-')} "
+                f"(AUC {estimand_block.get('outcome_model_auc', '-')}, "
+                f"Brier {estimand_block.get('outcome_model_brier', '-')})",
+                f"- Covariates adjusted for: {list(estimand_block.get('covariates_adjusted', ()))}",
+                f"- Missing-data strategy: {estimand_block.get('missing_data_strategy', '-')}",
+                f"- Censoring strategy: {estimand_block.get('censoring_strategy', '-')}"
+                f"{_censoring_strategy_report_note(estimand_block)}",
+                "",
+                "> This is the study's estimated average treatment effect under the assumptions "
+                "listed below -- not a clinical recommendation.",
+            ])
+
+        if diagnostics:
+            lines.extend([
+                "", "## Diagnostics", "",
+                f"### Covariate balance (SMD, {diagnostics.get('citation', 'Austin 2009')})", "",
+                f"- {diagnostics.get('n_covariates_flagged', 0)} of "
+                f"{len(diagnostics.get('balance', ()))} covariate(s) flagged "
+                f"(|SMD| > {diagnostics.get('smd_flag_threshold', 0.1)})",
+                "",
+                "| Covariate | SMD | Treated mean | Comparator mean | Flagged |",
+                "|---|---|---|---|---|",
+            ])
+            for entry in diagnostics.get("balance", ()):
+                lines.append(
+                    f"| {entry['column_name']} | {entry['smd']:.3f} | {entry['treated_mean']:.3f} | "
+                    f"{entry['comparator_mean']:.3f} | {'yes' if entry['flagged'] else 'no'} |"
+                )
+
+        if sensitivity_analysis:
+            lines.extend([
+                "", "## Sensitivity analysis (E-value)", "",
+                f"> {sensitivity_analysis.get('citation', '-')}",
+                "",
+                f"- Risk ratio: {sensitivity_analysis.get('risk_ratio', '-')}",
+                f"- E-value for the point estimate: **{sensitivity_analysis.get('e_value_point', '-')}**",
+                f"- E-value for the confidence interval: **{sensitivity_analysis.get('e_value_ci', '-')}**",
+                "",
+                f"> {sensitivity_analysis.get('interpretation', '-')}",
+            ])
+
+        if negative_control_results:
+            lines.extend([
+                "", "## Negative controls", "",
+                "> A negative control substitutes an exposure or outcome believed to have no "
+                "true causal effect, then fits this run's same reviewed estimator against it. A "
+                "null result (CI crossing zero) is evidence *for* the adjustment set; a non-null "
+                "result is a warning of possible unaddressed confounding -- a diagnostic, never a "
+                "blocking gate.",
+                "",
+                "| Control | Point estimate | 95% CI | Crosses null |",
+                "|---|---|---|---|",
+            ])
+            for control_id, result in negative_control_results:
+                if not result:
+                    continue
+                control_estimand = result.get("estimand", {})
+                point = control_estimand.get("point_estimate")
+                ci_lower = control_estimand.get("ci_lower")
+                ci_upper = control_estimand.get("ci_upper")
+                crosses_null = isinstance(ci_lower, (int, float)) and isinstance(ci_upper, (int, float)) and ci_lower <= 0 <= ci_upper
+                flag = "yes" if crosses_null else "**no -- possible residual confounding**"
+                lines.append(f"| {control_id} | {point} | [{ci_lower}, {ci_upper}] | {flag} |")
+
+        cate_estimand = cate.get("estimand", {}) if cate else {}
+        if cate_estimand:
+            lines.extend([
+                "", "## CATE (conditional average treatment effect)", "",
+                f"> {cate_estimand.get('citation', '-')} Adjusted CI/p-value use "
+                f"{cate_estimand.get('multiple_testing_method', '-')} "
+                f"({cate_estimand.get('multiple_testing_citation', '-')}) across the "
+                f"{cate_estimand.get('n_prespecified_subgroups_tested', '-')} prespecified "
+                "subgroup(s) below -- never the raw column.",
+                "",
+                f"- Overall ATE from the forest (cross-check against the primary estimate above): "
+                f"{cate_estimand.get('overall_ate_from_forest', '-')} "
+                f"[{cate_estimand.get('overall_ate_ci_lower', '-')}, "
+                f"{cate_estimand.get('overall_ate_ci_upper', '-')}]",
+                "",
+                "### Prespecified subgroups (family-wise error controlled)", "",
+                "| Subgroup | N | Point estimate | Raw CI | Raw p | Adjusted CI | Adjusted p |",
+                "|---|---|---|---|---|---|---|",
+            ])
+            for entry in cate_estimand.get("prespecified_subgroup_results", ()):
+                lines.append(
+                    f"| {entry['subgroup_column']}={entry['stratum']} | {entry['n']} | "
+                    f"{entry['point_estimate']:.4f} | [{entry['ci_lower']:.4f}, {entry['ci_upper']:.4f}] | "
+                    f"{entry['pvalue']:.4f} | [{entry['adjusted_ci_lower']:.4f}, "
+                    f"{entry['adjusted_ci_upper']:.4f}] | {entry['adjusted_pvalue']:.4f} |"
+                )
+            exploratory = cate_estimand.get("exploratory_subgroup_results", ())
+            if exploratory:
+                lines.extend([
+                    "", "### Exploratory subgroups (hypothesis-generating only -- NOT family-wise "
+                    "error controlled)", "",
+                    "| Subgroup | N | Point estimate | Raw CI | Raw p |",
+                    "|---|---|---|---|---|",
+                ])
+                for entry in exploratory:
+                    lines.append(
+                        f"| {entry['subgroup_column']}={entry['stratum']} | {entry['n']} | "
+                        f"{entry['point_estimate']:.4f} | [{entry['ci_lower']:.4f}, "
+                        f"{entry['ci_upper']:.4f}] | {entry['pvalue']:.4f} |"
+                    )
+
+        assumptions = _gather_assumptions(
+            study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics, estimand_block
+        )
+        lines.extend(["", "## Assumptions and limitations", ""])
+        lines.extend(f"- {item}" for item in assumptions)
+
+        lines.extend(["", "## LLM interpretive narrative", ""])
+        if not narrative:
+            lines.append("No LLM interpretation was requested for this run.")
+        else:
+            narrative = normalize_narrative_artifact(narrative)
+            verification = narrative.get("verification") or {}
+            verification_ok = verification.get("status") in {"passed", "warning"} and not any(
+                check.get("status") == "failed" for check in verification.get("checks", ())
+            )
+            if narrative.get("review_status") == "excluded":
+                lines.append("The LLM interpretation was excluded from this version of the report.")
+                if narrative.get("reviewer"):
+                    lines.append(f"_Excluded by {narrative['reviewer']} on {narrative.get('reviewed_at', '-')}._")
+            elif narrative.get("review_status") == "approved" and verification_ok:
+                lines.extend([
+                    narrative["narrative"],
+                    "",
+                    f"> {narrative.get('boundary_statement', '')}",
+                    "",
+                    f"_Model: {narrative.get('provider', 'unknown')}:{narrative.get('model', 'unknown')}. "
+                    f"Approved by {narrative.get('reviewer', '-')} on {narrative.get('reviewed_at', '-')}._",
+                ])
+            else:
+                lines.append(
+                    "An LLM interpretation was generated but is still pending human review (or failed "
+                    "deterministic faithfulness verification) -- it is not included in this version of "
+                    "the report."
+                )
+
+        lines.extend([
+            "", "## Approval gates", "",
+            "| Gate | Status | Reviewer | Decided |",
+            "|---|---|---|---|",
+        ])
+        for gate in state.gates.values():
+            lines.append(
+                f"| {gate.name} | {gate.status} | {gate.reviewer or '-'} | {gate.decided_at or '-'} |"
+            )
+
+        lines.extend(["", "## Audit trail", "", "| At | Event | Detail |", "|---|---|---|"])
+        for entry in state.history:
+            lines.append(f"| {entry['at']} | {entry['event']} | {entry['detail']} |")
+
+        lines.extend(["", "## Provenance", "", "| Artifact | Agent | Version | Generated (UTC) |", "|---|---|---|---|"])
+        for name in (
+            "hypothesis.json", "study_specification.json", "statistical_estimand.json",
+            "cohort_manifest.json", "dataset_manifest.json", "estimation.json", "diagnostics.json",
+            "results_narrative.json",
+        ):
+            payload = self._read_optional_json(run_dir / name)
+            metadata = payload.get("metadata") if payload else None
+            if not metadata:
+                continue
+            lines.append(
+                f"| {name} | {metadata.get('agent_name', '-')} | {metadata.get('agent_version', '-')} | "
+                f"{metadata.get('generated_at_utc', '-')} |"
+            )
+
+        if estimand_block:
+            interpretation = (
+                "An average treatment effect has been estimated under the assumptions listed "
+                "above. This is a governed technical result, not a clinical conclusion -- final "
+                "sign-off is the `results` gate, decided by a human reviewer with the full "
+                "assumptions list in view."
+            )
+        else:
+            interpretation = (
+                "No causal effect has been estimated for this run yet -- run `workflow estimate` "
+                "(or the Streamlit Estimation & report tab) first. This report reflects only the "
+                "protocol, gates, and audit trail collected so far."
+            )
+        lines.extend(["", "## Interpretation", "", interpretation, ""])
+
+        report_path = run_dir / "causal_report.md"
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            if "causal_report.md" not in state.artifacts:
+                state.artifacts.append("causal_report.md")
+            state.record("causal_report_generated", "causal_report.md")
+            self.save(state)
+        return report_path
+
     def set_exposure_contrast(
         self,
         run_id: str,
@@ -2400,7 +3731,239 @@ class WorkflowManager:
             changes={"before": before, "after": True},
         )
         self._invalidate_gate(state, "analysis_plan", "censoring_definition_approved changed")
+        self._invalidate_gate(state, "statistical_estimand", "censoring_definition_approved changed")
         self.save(state)
+        return state
+
+    def set_statistical_estimand_strategy(
+        self,
+        run_id: str,
+        *,
+        missing_data_strategy: str,
+        censoring_strategy: str,
+        censoring_rationale: str,
+        reviewer: str,
+        estimation_procedure: str = "plug_in_standardization",
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's explicit missing-data, censoring, and estimation-
+        procedure strategy (`protocol["statistical_estimand_settings"]`) for
+        the `statistical_estimand` gate (roadmap stage 8: the observed-data
+        statistical estimand).
+
+        Before this method existed, `EstimationAgent` always did complete-
+        case analysis and always ignored the analytic cohort's per-row
+        `censored` column -- a real modeling choice left implicit in
+        estimator code, with the reviewer never asked. `censoring_rationale`
+        is required non-empty text, not a checkbox: whichever strategy is
+        picked, a human states *why* here, and `_write_statistical_estimand`
+        persists it into `statistical_estimand.json` where `run_estimation`
+        actually reads it back, so this is never a rubber stamp on an
+        unread field. `estimation_procedure` (`causal.roadmap.
+        ESTIMATION_PROCEDURES`) picks which reviewed estimator --
+        `EstimationAgent`'s g-computation or `TMLEAgent`'s TMLE -- computes
+        the shared `g_formula_standardization` functional; defaults to
+        today's plug-in behavior so existing callers are unaffected.
+        """
+        if missing_data_strategy not in MISSING_DATA_STRATEGIES:
+            raise ValueError(f"missing_data_strategy must be one of {MISSING_DATA_STRATEGIES}")
+        if censoring_strategy not in CENSORING_STRATEGIES:
+            raise ValueError(f"censoring_strategy must be one of {CENSORING_STRATEGIES}")
+        if estimation_procedure not in ESTIMATION_PROCEDURES:
+            raise ValueError(f"estimation_procedure must be one of {ESTIMATION_PROCEDURES}")
+        if not censoring_rationale.strip():
+            raise ValueError("censoring_rationale is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            before = protocol.get("statistical_estimand_settings")
+            protocol["statistical_estimand_settings"] = {
+                "missing_data_strategy": missing_data_strategy,
+                "censoring_strategy": censoring_strategy,
+                "censoring_rationale": censoring_rationale.strip(),
+                "estimation_procedure": estimation_procedure,
+            }
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+        detail = (
+            f"statistical_estimand_settings set by {reviewer}: "
+            f"missing_data_strategy={missing_data_strategy}, censoring_strategy={censoring_strategy}, "
+            f"estimation_procedure={estimation_procedure}"
+        )
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record(
+            "statistical_estimand_strategy_set", detail,
+            changes={"before": before, "after": protocol["statistical_estimand_settings"]},
+        )
+        self._invalidate_gate(state, "statistical_estimand", "statistical_estimand_settings changed")
+        self.save(state)
+        return state
+
+    def set_cate_cutpoint(self, run_id: str, covariate_name: str, cutpoint: float, reviewer: str) -> RunState:
+        """Record a reviewer-entered cutpoint for splitting a continuous
+        effect-modifier covariate into two CATE subgroup strata
+        (`docs/causal_roadmap.md` milestone #4's CATE item) -- extends the
+        existing human-review-gate pattern (the same pattern already used
+        for covariate windows/aggregations) rather than inventing a
+        clinical threshold or switching the multiple-testing unit to a
+        continuous curve.
+
+        Only a covariate with more than `causal.agents.cate.
+        _MAX_CATEGORICAL_LEVELS` distinct values needs one -- a lower-
+        cardinality covariate (e.g. a presence flag) is split by level
+        automatically. `run_cate` raises a clear error naming which column
+        still needs a cutpoint if one is missing, rather than silently
+        dropping that subgroup from the prespecified family.
+        """
+        covariate_name = covariate_name.strip()
+        if not covariate_name:
+            raise ValueError("covariate_name is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+        column_name = _slugify_covariate_name(covariate_name)
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            cutpoints = dict(protocol.get("cate_cutpoints", {}))
+            before = cutpoints.get(column_name)
+            cutpoints[column_name] = float(cutpoint)
+            protocol["cate_cutpoints"] = cutpoints
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+        state.record(
+            "cate_cutpoint_set",
+            f"{covariate_name} ({column_name}): cutpoint={cutpoint} by {reviewer}",
+            changes={"before": before, "after": cutpoint},
+        )
+        self.save(state)
+        return state
+
+    def run_cate(
+        self,
+        run_id: str,
+        *,
+        random_seed: int = 0,
+    ) -> RunState:
+        """Fit `CATEAgent` (a causal forest, Wager & Athey 2018) over the
+        materialized `analytic_dataset.parquet` for a prespecified family
+        of effect-modifier subgroups, and write `cate.json`.
+
+        Gated on `statistical_estimand.json`'s `population_summary ==
+        "CATE"` (which itself requires `estimation_procedure=
+        "causal_forest_dml"`, enforced by `StatisticalEstimand`'s own
+        cross-check) -- CATE is never the default; a study must have
+        explicitly declared it as the primary estimand at the causal-
+        question stage for this to be callable at all.
+
+        The prespecified subgroup family resolves from `analysis_plan.
+        json`'s `causal_role == "effect_modifier"`, `status == "ready"`
+        covariates, matched to their materialized `cov_*` column names --
+        never `hypothesis.json`'s free-text `candidate_effect_modifiers`,
+        an early, ungated LLM hint, not a reviewed set fit for a family-
+        wise-error-controlled test.
+        """
+        # Deferred, not a module-level import: `causal.agents.cate` pulls
+        # in `econml`, which alone takes ~5s to import (numba/lightgbm/
+        # statsmodels transitively) -- paying that on every `import causal.
+        # orchestrator.workflow` (nearly the entire test suite) for a
+        # method most runs never call would be a real, avoidable tax.
+        from causal.agents.cate import CATEAgent
+
+        state = self.load(run_id)
+        if state.phase not in {"execution", "diagnostics"}:
+            raise RuntimeError("CATE estimation requires the execution or diagnostics phase")
+        run_dir = self.runs_dir / run_id
+        dataset_path = run_dir / "analytic_dataset.parquet"
+        manifest_path = run_dir / "cohort_manifest.json"
+        if not dataset_path.is_file() or not manifest_path.is_file():
+            raise RuntimeError("Run materialize_analytic_dataset first")
+        estimand_path = run_dir / "statistical_estimand.json"
+        if not estimand_path.is_file():
+            raise RuntimeError("Run and approve the statistical_estimand gate first")
+        statistical_estimand = json.loads(estimand_path.read_text(encoding="utf-8"))
+        if statistical_estimand.get("population_summary") != "CATE":
+            raise RuntimeError(
+                "CATE estimation requires statistical_estimand.json's population_summary to be "
+                f"'CATE' (found {statistical_estimand.get('population_summary')!r}) -- this "
+                "study's primary estimand was not declared as CATE"
+            )
+        self.run_execution_readiness(run_id)
+        state = self.load(run_id)
+        readiness = json.loads((run_dir / "execution_readiness.json").read_text(encoding="utf-8"))
+        if not readiness["causal_estimation_allowed"]:
+            raise RuntimeError("Execution readiness does not permit causal estimation")
+        cohort_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        covariate_columns = tuple(
+            column["name"] for column in cohort_manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        )
+        if tuple(statistical_estimand["adjustment_set"]) != covariate_columns:
+            raise RuntimeError(
+                "statistical_estimand.json's adjustment_set no longer matches cohort_manifest."
+                "json's baseline_covariate columns -- re-approve the statistical_estimand gate "
+                "after the analysis plan or cohort plan changed"
+            )
+        analysis_plan_path = run_dir / "analysis_plan.json"
+        if not analysis_plan_path.is_file():
+            raise RuntimeError("Run the Data Science Agent first (analysis_plan.json is missing)")
+        analysis_plan = json.loads(analysis_plan_path.read_text(encoding="utf-8"))
+        subgroup_columns = tuple(
+            _slugify_covariate_name(item["name"])
+            for item in analysis_plan.get("covariates", ())
+            if isinstance(item, dict) and item.get("status") == "ready"
+            and item.get("causal_role") == "effect_modifier"
+        )
+        if not subgroup_columns:
+            raise RuntimeError(
+                "No reviewed effect-modifier covariates found in analysis_plan.json "
+                "(causal_role='effect_modifier', status='ready') -- CATE requires at least one "
+                "prespecified subgroup"
+            )
+        missing_subgroups = [column for column in subgroup_columns if column not in covariate_columns]
+        if missing_subgroups:
+            raise RuntimeError(
+                f"Effect-modifier column(s) {missing_subgroups} are not in the materialized "
+                "adjustment set -- re-approve the statistical_estimand gate after the analysis "
+                "plan changed"
+            )
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        cutpoints = protocol.get("cate_cutpoints", {})
+        dataframe = pd.read_parquet(dataset_path)
+        try:
+            artifact = CATEAgent().run(
+                dataframe,
+                study_id=state.study_id,
+                covariate_columns=covariate_columns,
+                subgroup_columns=subgroup_columns,
+                cutpoints=cutpoints,
+                random_seed=random_seed,
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot run CATE estimation: {exc}") from exc
+        with _RunLock(run_dir):
+            state = self.load(run_id)
+            (run_dir / "cate.json").write_text(json.dumps(artifact.to_dict(), indent=2), encoding="utf-8")
+            if "cate.json" not in state.artifacts:
+                state.artifacts.append("cate.json")
+            estimand = artifact.estimand
+            state.record(
+                "cate_completed",
+                f"cate.json; overall_ate_from_forest={estimand.overall_ate_from_forest:.4f}; "
+                f"{estimand.n_prespecified_subgroups_tested} prespecified subgroup(s) tested",
+            )
+            self.save(state)
         return state
 
     def run_feasibility(self, run_id: str, gateway: BigQueryOMOPGateway) -> RunState:
