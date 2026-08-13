@@ -203,12 +203,13 @@ See [docs/repo_map.md](docs/repo_map.md) for ownership and Git rules.
 ## External projects
 
 The integration repositories are pinned as Git submodules. Their own READMEs
-remain authoritative for installation and upstream behavior:
+remain authoritative for installation and upstream behavior. See the
+[FastOMOP organization](https://github.com/fastomop) for the official upstream projects:
 
 | Local path | Official repository |
 |---|---|
-| `agno_fastomop/` | [ji-ch01/agno_fastomop](https://github.com/ji-ch01/agno_fastomop) |
-| `omcp/` | [ji-ch01/omcp](https://github.com/ji-ch01/omcp) |
+| `agno_fastomop/` | [fastomop/agno_fastomop](https://github.com/fastomop/agno_fastomop) |
+| `omcp/` | [fastomop/omcp](https://github.com/fastomop/omcp) |
 | `foem/` | [ji-ch01/foem](https://github.com/ji-ch01/foem) |
 | `external/ohdsi_mimic/` | [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) |
 
