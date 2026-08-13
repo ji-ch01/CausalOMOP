@@ -498,6 +498,60 @@ class DataScienceAgentCovariateTests(unittest.TestCase):
         covariate = next(c for c in result.covariates if c.name == "sofa_score")
         self.assertEqual(covariate.status, "ready")
 
+    def test_not_ready_confounder_blocks_final_execution(self):
+        """A confounder that is not `status == "ready"` (unmapped, no
+        aggregation reviewed, etc.) must show up in `unresolved_issues` and
+        block `final_execution_allowed` -- otherwise a study could run in
+        final mode without ever adjusting for this confounder, silently
+        biasing the estimate instead of surfacing a blocking warning."""
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "sofa_score")
+        self.assertEqual(covariate.status, "definition_pending")
+        self.assertIn("covariate:sofa_score:not_ready", result.unresolved_issues)
+        self.assertFalse(result.final_execution_allowed)
+
+    def test_unobserved_confounder_is_also_flagged_as_not_ready(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "unmeasured_frailty", "role": "confounder",
+                "temporal_classification": "pre_treatment", "observed": False,
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        self.assertIn("covariate:unmeasured_frailty:not_ready", result.unresolved_issues)
+
+    def test_ready_confounder_is_not_flagged_as_not_ready(self):
+        hypothesis = self._hypothesis(candidate_dag=[
+            {
+                "label": "sofa_score", "role": "confounder",
+                "temporal_classification": "pre_treatment", "domain": "measurement",
+                "concept_ids": [4301868], "mapping_status": "approved",
+                "aggregation": "last_value_before_index",
+            },
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        self.assertNotIn("covariate:sofa_score:not_ready", result.unresolved_issues)
+
+    def test_not_ready_non_confounder_covariate_does_not_block_final_execution(self):
+        """Only `role == "confounder"` covariates are adjustment-critical in
+        the "biases the effect estimate if skipped" sense this check guards
+        against; an effect_modifier/outcome_cause_only/treatment_cause_only
+        left not-ready is a missed refinement, not a silent bias risk, so it
+        intentionally does not gain this extra blocking check."""
+        hypothesis = self._hypothesis(candidate_dag=[
+            {"label": "baseline_severity", "role": "effect_modifier", "temporal_classification": "pre_treatment"},
+        ])
+        result = DataScienceAgent().run(hypothesis, self._protocol())
+        covariate = next(c for c in result.covariates if c.name == "baseline_severity")
+        self.assertEqual(covariate.status, "definition_pending")
+        self.assertNotIn("covariate:baseline_severity:not_ready", result.unresolved_issues)
+
     def test_covariate_without_a_domain_is_left_unmapped(self):
         lookup = self._FakeLookup()
         hypothesis = self._hypothesis(candidate_dag=[

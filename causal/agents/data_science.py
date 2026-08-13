@@ -216,6 +216,16 @@ class DataScienceAgent:
             )
         excluded_from_adjustment = self._excluded_from_adjustment(dag_variables, hypothesis)
         unclassified_covariates = self._unclassified_covariates(hypothesis, dag_variables)
+        # A confounder that never reaches `status == "ready"` (unmapped,
+        # no aggregation reviewed, or altogether unobserved) must block
+        # `final_execution_allowed` the same way a missing-domain or
+        # unclassified covariate already does -- otherwise a study can run
+        # in final mode without ever adjusting for it, silently biasing the
+        # estimate instead of surfacing a blocking warning.
+        covariates_not_ready = tuple(
+            covariate.name for covariate in covariates
+            if covariate.causal_role == "confounder" and covariate.status != "ready"
+        )
         unresolved = (
             tuple(hypothesis.get("unresolved_issues", ()))
             + tuple(
@@ -224,6 +234,7 @@ class DataScienceAgent:
             )
             + tuple(f"covariate:{label}:unclassified_by_dag" for label in unclassified_covariates)
             + tuple(f"covariate:{label}:missing_domain" for label in covariates_missing_domain)
+            + tuple(f"covariate:{label}:not_ready" for label in covariates_not_ready)
         )
         required_tables = tuple(sorted({table for phenotype in phenotypes for table in phenotype.omop_tables} | {
             "person", "measurement", "procedure_occurrence", "drug_exposure", "condition_occurrence"
