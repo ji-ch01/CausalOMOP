@@ -6,9 +6,13 @@ question into reviewable artifacts: a target-trial draft, an evidence-grounded
 causal DAG, an identification assessment, an OMOP variable registry, governed
 SQL, feasibility diagnostics, and an execution-readiness decision.
 
-The repository does **not** yet estimate treatment effects. No ATE, ATT, CATE,
-g-computation, TMLE, or clinical conclusion should be inferred from its current
-outputs.
+The repository can now estimate a prespecified, transparent effect,
+risk-difference scale, via three reviewed estimators: g-computation/
+standardization or TMLE for the population ATE, or a causal forest for a
+prespecified-subgroup CATE (see [causal/README.md](causal/README.md)'s
+Current Capabilities), plus E-value sensitivity analysis and negative
+controls as diagnostics. No clinical conclusion should be inferred from its
+current outputs (see [docs/causal_roadmap.md](docs/causal_roadmap.md)).
 
 ## Documentation
 
@@ -34,8 +38,8 @@ are:
 | DAG review | Role/timing validation, cycle checks, bounded critique/revision, optional multi-candidate tournament, backdoor identification, minimum adjustment sets, SHD/SID audit metrics |
 | OMOP operationalization | Human-reviewed concept mapping, versioned variable registry, mapping diagnostics, windows and aggregation rules |
 | Data access | BigQuery or local DuckDB, with governed OMCP execution as the default causal path |
-| Study construction | Aggregate feasibility and follow-up audits, plus governed person-level analytic-cohort SQL generation |
-| Estimation and final causal report | Not implemented |
+| Study construction | Aggregate feasibility and follow-up audits, plus governed person-level analytic-cohort SQL generation and materialization into a local, non-versioned dataset |
+| Estimation and final causal report | G-computation or TMLE ATE estimator, or a causal-forest CATE estimator for a prespecified effect-modifier subgroup family (reviewer's choice per run), SMD covariate-balance and calibration diagnostics, E-value quantitative sensitivity analysis, negative controls (LLM-proposed, human-approved), and an auditable `causal_report.md` gated by human `results` review, with an optional advisory-only LLM narrative (CATE subgroup results are reported as a deterministic table only, no LLM narrative yet) |
 
 The workflow now has separate `target_trial`, `dag_review`, and
 `identification_estimand` gates (see [docs/causal_roadmap.md](docs/causal_roadmap.md)'s
@@ -81,11 +85,54 @@ than invented from scratch:
   [`causal/agents/dag_metrics.py`](causal/agents/dag_metrics.py) and used
   both for tournament deduplication/merge and for comparing a generated DAG
   against a study's reference DAG.
-- **TMLE** -- van der Laan, M.J. & Rubin, D. (2006). Targeted Maximum
-  Likelihood Learning. *The International Journal of Biostatistics*, 2(1),
-  Article 11. Planned estimator for CATE, the primary estimand (see
-  [causal/README.md](causal/README.md)'s Planned Direction), once
-  identification and data-support checks pass.
+- **G-computation / standardization** -- Hernan, M.A. & Robins, J.M. (2020).
+  *Causal Inference: What If*. Boca Raton: Chapman & Hall/CRC. Chapter 13
+  (Standardization and the parametric g-formula). Implemented as the ATE
+  baseline in [`causal/agents/estimation.py`](causal/agents/estimation.py)
+  (`EstimationAgent`): an unpenalized logistic outcome-regression model,
+  standardized under forced treatment/comparator, with a nonparametric
+  bootstrap confidence interval.
+- **SMD covariate-balance diagnostics** -- Austin, P.C. (2009). Balance
+  diagnostics for comparing the distribution of baseline covariates between
+  treatment groups in propensity-score matched samples. *Statistics in
+  Medicine*, 28(25), 3083-3107.
+  [doi:10.1002/sim.3697](https://doi.org/10.1002/sim.3697). Implemented in
+  [`causal/agents/diagnostics.py`](causal/agents/diagnostics.py)
+  (`DiagnosticsAgent`), `|SMD| > 0.1` as the standard flag threshold.
+- **TMLE** -- Van der Laan, M.J. & Rose, S. (2011). *Targeted Learning:
+  Causal Inference for Observational and Experimental Data*. New York:
+  Springer. Doubly robust sibling estimator to the g-computation baseline
+  above, for the identical ATE, risk-difference-scale functional. Implemented
+  in [`causal/agents/tmle.py`](causal/agents/tmle.py) (`TMLEAgent`):
+  `causal.nuisance.SuperLearner`-ensembled outcome/treatment nuisance models,
+  a targeting step, and an efficient-influence-curve closed-form variance
+  estimator.
+- **CATE (conditional average treatment effect)** -- Athey, S. & Imbens, G.
+  (2016). Recursive partitioning for heterogeneous causal effects. *PNAS*,
+  113(27), 7353-7360. [doi:10.1073/pnas.1510489113](https://doi.org/10.1073/pnas.1510489113);
+  Wager, S. & Athey, S. (2018). Estimation and Inference of Heterogeneous
+  Treatment Effects using Random Forests. *JASA*, 113(523), 1228-1242.
+  [doi:10.1080/01621459.2017.1319839](https://doi.org/10.1080/01621459.2017.1319839).
+  The primary estimand target (see [causal/README.md](causal/README.md)'s
+  Planned Direction). Implemented in
+  [`causal/agents/cate.py`](causal/agents/cate.py) (`CATEAgent`, a causal
+  forest via `econml.dml.CausalForestDML`) for a prespecified family of
+  effect-modifier subgroups only -- an unprespecified search over every
+  covariate for "the subgroup with the biggest effect" is the textbook way
+  to manufacture a false positive. Multiple-testing correction across the
+  prespecified family via Holm's (1979) sequentially rejective stepdown
+  procedure (Scand J Stat, 6(2), 65-70), motivated by List, Shaikh & Xu
+  (2019). Multiple hypothesis testing in experimental economics. *Exp
+  Econ*, 22(4), 773-793. [doi:10.1007/s10683-018-9597-5](https://doi.org/10.1007/s10683-018-9597-5).
+- **E-value sensitivity analysis** -- VanderWeele, T.J. & Ding, P. (2017).
+  Sensitivity Analysis in Observational Research: Introducing the E-Value.
+  *Annals of Internal Medicine*, 167(4), 268-274.
+  [doi:10.7326/M16-2607](https://doi.org/10.7326/M16-2607). The minimum
+  risk-ratio-scale strength an unmeasured confounder would need to fully
+  explain away the observed association. Implemented in
+  [`causal/sensitivity.py`](causal/sensitivity.py) (`e_value`); both
+  implemented estimators report a risk ratio alongside their primary
+  risk-difference estimate for this.
 - **Grounding an LLM causal co-pilot in verifiable evidence** -- Alaa, A. et
   al. (2024). [arXiv:2407.19118](https://arxiv.org/abs/2407.19118). Shaped
   the Hypothesis Agent's evidence-grounded drafting and citation-allow-list

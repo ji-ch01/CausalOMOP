@@ -59,19 +59,28 @@ the full literature grounding, including a second candidate comparison case.
 | 5. Identification | Implemented for backdoor adjustment: cycle/temporal checks, d-separation, minimum adjustment sets, explicit failure. |
 | 6. OMOP operationalization | Implemented as a first governed version: concept-set and covariate review actions, `OMOPVariableRegistry`, windows, aggregations, and deterministic SQL adapters. |
 | 7. Data support | Extended: aggregate feasibility, mapping audits, cohort profile, and follow-up observability, plus univariate treatment-arm overlap (`positivity_audit_sql` -- one covariate at a time, not full joint-adjustment-set stratification), per-covariate missingness (`covariate_missingness_sql`, generalized beyond the three hardcoded demographics), and a reviewer-approvable per-row administrative censoring definition (`WorkflowManager.approve_censoring_definition`, reusing `followup_audit_sql`'s own aggregate logic per person). None of these is a full positivity/missing-data-mechanism/censoring-model validation in the statistical sense -- see each function's own docstring for what it does and does not claim. |
-| 8. Statistical estimand | Not implemented as an executable contract. |
-| 9. Estimation | Not implemented. |
-| 10. Diagnostics and sensitivity | Only pre-estimation data diagnostics exist; estimator diagnostics and causal sensitivity analyses are not implemented. |
-| 11. Causal report | Not implemented. `demo_report.md` is explicitly a technical/feasibility report. |
+| 8. Statistical estimand | Implemented: `roadmap.StatisticalEstimand` is a separate, persisted contract from the counterfactual estimand (`CausalEstimand`) -- identifying functional, outcome-model specification, the adjustment set as actually built into `cohort.sql` (`cohort_manifest.json`'s `baseline_covariate` columns, not re-derived), and an explicit, reviewer-set missing-data and censoring strategy (`WorkflowManager.set_statistical_estimand_strategy`), persisted as `statistical_estimand.json` when the `statistical_estimand` gate is approved (`estimand_review` phase, between `analysis_plan` and `execution`). The analytic cohort's per-row `censored` column, previously unused by anything, is now read by `EstimationAgent` when `censoring_strategy="exclude_censored_before_analysis"`; `"ignore_censoring_administrative_waiver"` is the explicit, reviewed alternative when a reviewer judges it unused. Neither strategy is IPCW or another censoring-weighting method -- see milestone 3 below for what remains open. |
+| 9. Estimation | Implemented for the ATE, risk-difference scale, binary outcome, via a reviewer's choice of estimator: `causal.agents.estimation.EstimationAgent` (transparent g-computation/standardization, an unpenalized logistic outcome-regression model, nonparametric bootstrap CI, cited to Hernan & Robins *Causal Inference: What If* ch. 13) or `causal.agents.tmle.TMLEAgent` (TMLE, `SuperLearner`-ensembled nuisance models, doubly robust). Also implemented: `causal.agents.cate.CATEAgent` for the CATE, a prespecified effect-modifier subgroup family via a causal forest. `WorkflowManager.materialize_analytic_dataset` is the one code path that pulls patient-level rows into memory (via OMCP's already-existing, previously-unused `cohort_build` governed operation) to fit any of them. See milestone 4 for full detail and what remains (an LLM narrative for CATE subgroup results). |
+| 10. Diagnostics and sensitivity | Extended beyond pre-estimation data diagnostics: standardized mean difference (SMD) covariate balance per arm (`causal.agents.diagnostics.DiagnosticsAgent`, Austin 2009, `\|SMD\| > 0.1` flag), in-sample outcome-model AUC/Brier calibration, E-value quantitative sensitivity analysis (`causal.sensitivity.e_value`, VanderWeele & Ding 2017), and negative controls (`causal.queries.negative_controls`) are implemented. Joint/multivariate covariate balance is not (see milestone 6). |
+| 11. Causal report | Implemented: `WorkflowManager.build_causal_report` writes `causal_report.md`, linking the estimate, diagnostics, assumptions/limitations, approval-gate history, and per-artifact provenance -- the `results` gate (`REQUIRED_GATES["results_review"]`, previously defined but never reached by any run) is now the human sign-off before it, entirely independent of the optional narrative below. An optional, gracefully-degrading LLM narrative section (`causal.agents.results_narrative`) may interpret the already-computed numbers for a clinical reviewer; it is fed only JSON-safe artifacts, never the patient-level dataset, must return structured `claims` alongside its prose, and is deterministically fact-checked by `causal.agents.results_faithfulness.verify_narrative` (no second LLM) before a human reviewer (`WorkflowManager.review_results_narrative`) can approve or exclude it -- only an `approved` narrative with no `failed` check is ever included in `causal_report.md`; everything else renders as "not requested" or "excluded". `demo_report.md` (`build_demo_report`) is unchanged and remains the earlier pre-estimation feasibility snapshot. |
 
 ## Core contracts
 
 `causal/roadmap.py` defines `CausalQuestion`, `TargetTrialProtocol`,
-`CausalEstimand`, `CausalDAG`, and `CausalStudySpecification`. The general DAG
-logic is used by the live workflow. The question, protocol, and estimand
-contracts are not yet instantiated as one persistent workflow object, so the
-current `protocol` human gate carries more responsibility than the target
-architecture intends.
+`CausalEstimand`, `CausalDAG`, `CausalStudySpecification`, and
+`StatisticalEstimand`. The general DAG logic is used by the live workflow.
+The question, protocol, and estimand contracts are not yet instantiated as
+one persistent workflow object, so the current `protocol` human gate carries
+more responsibility than the target architecture intends.
+
+`StatisticalEstimand` is deliberately a separate contract from
+`CausalEstimand`, not a few extra fields on it: `CausalEstimand` (stage 3)
+fixes the counterfactual contrast and is meaningful before any OMOP data
+exists; `StatisticalEstimand` (stage 8) fixes how that contrast is actually
+estimated from the observed, incomplete, and administratively censored data
+this pipeline extracts -- persisted separately as `statistical_estimand.json`
+once its own `statistical_estimand` gate is approved, not folded into
+`study_specification.json`.
 
 The deterministic DAG layer rejects unknown nodes, duplicate identifiers,
 cycles, self-loops, temporal contradictions, and inadmissible adjustment for
@@ -93,6 +102,25 @@ reviewable graphs.
   correctness.
 - Human reviewers remain responsible for clinical completeness, causal roles,
   temporal interpretation, mappings, and gate decisions.
+- The optional results narrative (`causal.agents.results_narrative`) is the
+  same kind of advisory step: it reads only the already-computed estimate,
+  diagnostics, and gate history (never the patient-level dataset), must
+  quote every number verbatim from that input, must break its own prose
+  into structured `claims` (typed, each citing the JSON path it is based
+  on), and its output is always wrapped in a fixed, code-appended boundary
+  statement the model's own text cannot override. Before any human ever
+  sees it, `causal.agents.results_faithfulness.verify_narrative` -- plain
+  deterministic code, not a second LLM -- checks every number, the effect
+  direction, the null-crossing interpretation, diagnostic-warning coverage,
+  assumption/limitation coverage, and every claim's source-field
+  provenance. A reviewer (`WorkflowManager.review_results_narrative`) can
+  then approve the narrative only when no check `failed`, or exclude it
+  outright; either way this is a separate decision from the mandatory
+  `results` gate, which the narrative can never approve, invalidate, or
+  otherwise influence. `causal_report.md` includes the narrative's text
+  only once it is `approved` with a clean verification -- an unrequested,
+  still-`pending`, or `excluded` narrative renders as a plain status line
+  instead.
 
 See [llm_hypothesis_integration.md](llm_hypothesis_integration.md) and the
 dated [DAG audit](dag_generation_audit.md).
@@ -121,13 +149,14 @@ change the mapping; a reviewer must act through `concept-set-map` or the
 
 ## Governance boundary
 
-The persistent workflow has six named gates: `target_trial`, `dag_review`,
-`identification_estimand`, `clinical_mapping`, `analysis_plan`, and
-`results` -- each tied to its own phase (`target_trial_review`,
-`dag_review`, `identification_review`, `concept_mapping`, `analysis_plan`,
-`results_review`). A final-mode run requires approval; exploratory
-provisional mapping can authorize only the limited operations encoded by the
-Execution Agent and OMCP context.
+The persistent workflow has seven named gates: `target_trial`, `dag_review`,
+`identification_estimand`, `clinical_mapping`, `analysis_plan`,
+`statistical_estimand`, and `results` -- each tied to its own phase
+(`target_trial_review`, `dag_review`, `identification_review`,
+`concept_mapping`, `analysis_plan`, `estimand_review`, `results_review`). A
+final-mode run requires approval; exploratory provisional mapping can
+authorize only the limited operations encoded by the Execution Agent and
+OMCP context.
 
 This implements the split an earlier version of this section proposed as
 future work, into separate reviews for:
@@ -140,7 +169,19 @@ future work, into separate reviews for:
    identification holds *and* the full `CausalStudySpecification` --
    question, target trial, estimand, DAG -- validates as one internally
    consistent contract; persists `study_specification.json` on approval);
-4. OMOP operationalization (`clinical_mapping` gate, unchanged).
+4. OMOP operationalization (`clinical_mapping` gate, unchanged);
+5. the observed-data statistical estimand (`statistical_estimand` gate,
+   `estimand_review` phase between `analysis_plan` and `execution`):
+   `roadmap.StatisticalEstimand` -- identifying functional, outcome model,
+   the adjustment set as actually built into `cohort.sql`
+   (`cohort_manifest.json`), and the reviewer's missing-data/censoring
+   strategy (`WorkflowManager.set_statistical_estimand_strategy`) -- must
+   construct and persists `statistical_estimand.json` on approval; blocked
+   if `study_specification.json`'s declared `effect_measure` is not
+   `risk_difference` (the only scale `EstimationAgent` implements) or if
+   `censoring_strategy="exclude_censored_before_analysis"` is chosen before
+   the per-row `censored` column has itself been approved
+   (`approve_censoring_definition`).
 
 OMCP is the default governed execution transport. The direct BigQuery
 feasibility path is retained for equivalence testing, not as the preferred
@@ -150,26 +191,134 @@ parser and is not applied uniformly to those aggregate paths.
 
 ## Remaining scientific milestones
 
-1. Finish reviewer controls for descendant inclusion/exclusion and make the
-   registry the operational source used consistently by every builder --
-   `_load_concept_specs` still reads `concept_sets` directly for population/
-   treatment/comparator/outcome rather than through
-   `OMOPVariableRegistry`, unlike covariates (`_load_covariate_specs`,
-   already registry-backed).
+1. Done: `OMOPVariableRegistry` is now the sole operational source for all
+   four query roles, not just covariates. `_load_concept_specs` is a thin
+   wrapper around `OMOPVariableRegistry.from_protocol` +
+   `OMOPVariableRegistry.resolve_role` (population/treatment/comparator/
+   outcome resolve the same way `_load_covariate_specs` already resolved
+   covariates), with two additive registry functions covering the two gaps
+   that previously blocked this: `fixed_domain_to_concept_set_spec` for the
+   `death`/`standard` fixed-domain roles `build_extraction_plan` cannot
+   handle (it requires a concept-based domain and `root_concept_ids`), and a
+   widened `variable_from_concept_set` domain check tolerating
+   `domain == ""` for the `exposure_contrast="vs_unexposed"` comparator's
+   genuinely domain-less state. Reviewer controls for descendant
+   inclusion/exclusion remain finished as before this item landed.
 2. Validate the MIMIC-IV Sepsis-3 population, time zero, exposure strategies,
    censoring, outcome, baseline covariates, missingness, and positivity --
    the diagnostics now exist (`positivity_audit_sql`,
    `covariate_missingness_sql`, `approve_censoring_definition`); running
    them against the real dataset and acting on the results does not.
-3. Define the observed-data estimand and missing-data/censoring strategy.
-4. Implement a transparent g-computation baseline, then prespecified TMLE and
-   CATE analyses with reproducible nuisance-model specifications.
-5. Add balance, calibration, and estimator model diagnostics beyond the
-   univariate positivity/missingness audits above.
-6. Add negative controls and quantitative sensitivity analyses where the study
-   design supports them.
-7. Produce a final report that links estimates to protocol versions, registry
-   versions, code versions, diagnostics, assumptions, and human decisions.
+3. Done for exclusion/waiver: `roadmap.StatisticalEstimand` and the
+   `statistical_estimand` gate formalize the observed-data estimand and
+   require a reviewer to explicitly pick a missing-data strategy
+   (`complete_case_analysis`, the only one implemented) and a censoring
+   strategy (`exclude_censored_before_analysis`, which now actually drops
+   `censored=1` rows in `EstimationAgent`, or
+   `ignore_censoring_administrative_waiver`, an explicit waiver rather than
+   silent non-use, or `ipcw_administrative_censoring`, a stabilized
+   inverse-probability-of-censoring-weighted g-formula (`causal.agents.
+   estimation.EstimationAgent._fit_and_standardize_ipcw`) -- unlike
+   exclusion, this keeps the estimate over the original eligible
+   population instead of changing who it is over. Still not implemented:
+   multiple imputation for missing covariates, and censoring weighting for
+   anything beyond a single fixed-horizon administrative-censoring
+   indicator (e.g. time-varying censoring).
+4. Done for the baseline: a transparent g-computation estimator
+   (`causal.agents.estimation.EstimationAgent`) is implemented for the ATE,
+   risk-difference scale, binary outcome, with a nonparametric bootstrap
+   confidence interval. Done for SuperLearner nuisance-model infrastructure:
+   `causal.nuisance.SuperLearner` (a prespecified candidate library
+   combined by cross-validated non-negative least squares, van der Laan,
+   Polley & Hubbard 2007). Done for TMLE: `causal.agents.tmle.TMLEAgent`
+   (Van der Laan & Rose 2011) pairs a `SuperLearner`-ensembled outcome and
+   treatment nuisance fit with a targeting step and an efficient-influence-
+   curve closed-form variance estimator instead of a bootstrap -- doubly
+   robust (consistent if either nuisance model is correctly specified, not
+   only both), unlike the plug-in baseline. Both estimators target the same
+   `g_formula_standardization` functional; `StatisticalEstimand.
+   estimation_procedure` (schema_version 1.1) records which one a reviewer
+   chose for a given run, and `WorkflowManager.run_estimation` dispatches
+   accordingly. Scoped out of TMLE v1, and not silently half-implemented:
+   `ipcw_administrative_censoring` (`TMLEAgent.run` raises `ValueError` --
+   censored-data TMLE needs a materially different efficient-influence-
+   function construction, Van der Laan & Rose 2011 ch. 5, not a reuse of
+   `EstimationAgent`'s stabilized-weight IPCW).
 
-Until these milestones are complete, CausalOMOP is a governed design and
-feasibility prototype, not a clinical causal-effect engine.
+   Done for CATE: `causal.agents.cate.CATEAgent` (Athey & Imbens 2016,
+   Wager & Athey 2018) fits `econml.dml.CausalForestDML` over
+   `SuperLearner`-backed nuisance models (`SuperLearnerClassifier`/
+   `SuperLearnerRegressor`, new sklearn-compatible adapters in `causal.
+   nuisance` -- `SuperLearner` itself stays deliberately non-sklearn-
+   compatible), for a prespecified family of `causal_role="effect_modifier"`
+   subgroup covariates resolved from `analysis_plan.json` (never
+   `hypothesis.json`'s free-text, ungated `candidate_effect_modifiers`).
+   Multiple-testing correction across the family uses Holm's (1979)
+   sequentially rejective stepdown procedure -- not the originally-planned
+   resampling-based stepdown (List, Shaikh & Xu 2019's headline method):
+   bootstrapping the causal forest's already-fitted per-unit point
+   estimates (cheap) was tried first and found to understate the null
+   distribution's spread (it captures only resampling noise of averaging
+   fixed numbers, not genuine forest estimation uncertainty), producing
+   spuriously significant adjusted p-values -- caught by inspecting output
+   before shipping it, documented in `causal.agents.cate._holm_stepdown_
+   fwer_correction`'s own docstring. New `StatisticalEstimand.
+   population_summary` (schema_version 1.2, `"ATE"`/`"ATT"`/`"CATE"`) gates
+   `WorkflowManager.run_cate` -- CATE is never the default. `causal.agents.
+   cate`/`econml` are lazily imported inside `run_cate` only (not at
+   `causal.orchestrator.workflow` module scope): `econml` alone costs ~5s
+   to import (numba/lightgbm/statsmodels transitively), which would
+   otherwise tax nearly every test in the suite. Deliberately not
+   implemented alongside v1: an LLM narrative for subgroup results
+   (`build_causal_report`'s CATE section is a deterministic table only).
+5. Partially done: standardized mean difference (SMD) covariate balance
+   (`causal.agents.diagnostics.DiagnosticsAgent`) and cross-validated
+   outcome-model AUC/Brier calibration (`causal.agents.estimation.
+   EstimationAgent._cross_validated_outcome_diagnostics`, falling back to
+   in-sample only when too few outcome events exist to stratify into
+   folds) are implemented. Joint/multivariate covariate balance remains
+   future work.
+6. Done for E-values: `causal.sensitivity.e_value` (VanderWeele & Ding 2017)
+   computes the minimum unmeasured-confounder strength, on the risk-ratio
+   scale, that would fully explain away the observed association -- for
+   both the point estimate and the confidence-interval bound closest to the
+   null. Both estimators (`GComputationEstimate`/`TMLEEstimate`) now report
+   a risk ratio alongside their primary risk-difference estimate so the
+   E-value has one to work with (g-computation: the same bootstrap
+   resamples, tracked for the ratio too, not a second model;
+   TMLE: a delta-method Wald CI on `log(psi1/psi0)` from the per-arm
+   targeted means, no second fluctuation). `WorkflowManager.
+   run_sensitivity_analysis` writes `sensitivity_analysis.json`, callable
+   any time after `run_estimation`; `build_causal_report` includes an
+   E-value section when it exists.
+
+   Done for negative controls: `causal.queries.negative_controls` reuses
+   `causal.queries.feasibility`'s existing cohort-building machinery (no
+   new SQL-generation logic) via a substituted `ConceptSetSpec` --
+   `substitute_spec` swaps a reviewed negative control in for `treatment`
+   or `outcome`, keeping population/comparator/covariates/censoring
+   identical to the real study. Candidate proposal mirrors `causal.agents.
+   dag_critique`'s bounded prompt/parse pattern (`WorkflowManager.
+   propose_negative_controls`, no orchestration duplicated): an LLM
+   proposes a clinical label and rationale only, never a concept id, and
+   `parse_negative_control_response` cannot return an approved candidate
+   regardless of what the raw response claims. `WorkflowManager.
+   map_negative_control` is the one place a candidate is actually mapped
+   to OMOP concepts and approved or rejected, folded into the existing
+   `clinical_mapping` gate rather than a new one. `WorkflowManager.
+   run_negative_control_estimation` fits whichever estimator was reviewed
+   for the real study against the substituted cohort and writes
+   `negative_control_estimation_<control_id>.json` -- a diagnostic
+   `build_causal_report` surfaces, never a blocking gate. The
+   materialized negative-control cohort is never written to disk, unlike
+   the real study's `analytic_dataset.parquet`.
+7. Done: `WorkflowManager.build_causal_report` writes `causal_report.md`,
+   linking the estimate to the protocol/estimand contract
+   (`study_specification.json`), the analytic-dataset manifest, diagnostics,
+   every upstream warning/assumption, the full approval-gate history, and
+   each artifact's own provenance metadata.
+
+Milestones 1, 2, and 6 remain open. Until they are complete, the g-computation
+estimate this pipeline can now produce is a transparent, prespecified baseline
+under stated (not yet fully validated) assumptions -- not a clinical
+causal-effect engine.

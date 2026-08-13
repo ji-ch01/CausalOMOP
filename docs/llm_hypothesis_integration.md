@@ -99,6 +99,48 @@ Useful controls:
 - `--max-critique-rounds` to bound critique rounds;
 - `--tournament-size` to draft multiple candidates.
 
+## Results narrative (post-estimation interpretation)
+
+After `causal.agents.estimation`/`causal.agents.diagnostics` compute the
+statistical estimate, an optional, separate LLM step
+(`causal.agents.results_narrative`) may translate the already-computed
+numbers into plain language:
+
+```text
+estimation.json + diagnostics.json
+  -> results-narrative prompt (JSON-safe artifacts only, never the
+     patient-level analytic_dataset.parquet)
+  -> strict-JSON response: { narrative, claims[] }
+  -> causal.agents.results_faithfulness.verify_narrative
+     (deterministic checks, no second LLM)
+  -> WorkflowManager.review_results_narrative (human approve/exclude)
+  -> build_causal_report includes the narrative text only if
+     review_status == "approved" and verification has no `failed` check
+```
+
+Every claim in `claims` is typed (`effect_direction`, `effect_magnitude`,
+`uncertainty`, `sample_size`, `diagnostic_warning`,
+`assumption_or_limitation`) and cites the dotted JSON path(s) it is based
+on (e.g. `estimation.estimand.point_estimate`). `verify_narrative` checks,
+per claim: every number appears verbatim in the source artifacts; the
+stated effect direction matches the point estimate's sign; the stated
+uncertainty matches whether the confidence interval crosses the null; each
+`source_field` actually resolves inside the artifacts the model was shown
+(never a made-up or out-of-scope field); diagnostic warnings and
+assumptions/limitations already present in the artifacts are not silently
+dropped or contradicted. A `failed` check never blocks estimation, the
+`results` gate, or the causal report itself -- it only blocks this
+narrative's own automatic approval, and is shown prominently in the
+Streamlit "Estimation & causal report" tab (deterministic results ->
+generate interpretation -> faithfulness verification -> human review ->
+build the final report).
+
+Approving or excluding the narrative (`WorkflowManager.
+review_results_narrative`) is entirely separate from `decide_gate(...,
+"results", ...)`: the narrative can never approve, invalidate, or otherwise
+influence the `results` gate, and the gate's approval never implies the
+narrative was reviewed.
+
 ## Privacy and governance
 
 Never include patient-level data, direct identifiers, or sensitive free text in

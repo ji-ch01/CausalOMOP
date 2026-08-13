@@ -21,10 +21,19 @@ protocol.json (causal question, target-trial protocol, first-pass covariates)
   -> human review/approval gates                    (causal.orchestrator)
   -> causal.mapping.registry / causal.mapping.audit  (OMOP concept mapping + diagnostics)
   -> causal.agents.data_science.DataScienceAgent     (analysis_plan.json)
+  -> human `statistical_estimand` gate                (roadmap.StatisticalEstimand, statistical_estimand.json)
   -> causal.agents.execution.ExecutionAgent          (execution_readiness.json)
   -> causal.queries.feasibility / causal.data_builder.analytic
        (feasibility SQL, person-level analytic cohort SQL)
   -> causal.mcp_client.OMCPClient -> omcp            (governed query execution)
+  -> causal.data_builder.materialize                 (analytic_dataset.parquet, dataset_manifest.json)
+  -> causal.agents.estimation.EstimationAgent        (g-computation ATE, estimation.json)
+  -> causal.agents.diagnostics.DiagnosticsAgent      (SMD balance, diagnostics.json)
+  -> causal.agents.results_narrative (optional, advisory-only LLM narrative + structured claims)
+  -> causal.agents.results_faithfulness              (deterministic fact-check, no second LLM)
+  -> human review of the narrative                    (WorkflowManager.review_results_narrative)
+  -> human `results` gate                            (causal.orchestrator, independent of the narrative)
+  -> causal.orchestrator.workflow.build_causal_report (causal_report.md)
 ```
 
 `causal.orchestrator.workflow.WorkflowManager` drives all of the above
@@ -41,19 +50,120 @@ call it.
 - human-in-the-loop concept mapping and analysis-plan review, with gates
   that cannot be approved while the plan is incomplete and that reset once
   approved content is later changed;
+- a separate, persisted observed-data statistical estimand
+  (`causal.roadmap.StatisticalEstimand`: identifying functional, outcome
+  model, the adjustment set as actually built into `cohort.sql`, and an
+  explicit reviewer-set missing-data/censoring strategy), gated by its own
+  `statistical_estimand` review before any patient-level row is
+  materialized -- the analytic cohort's per-row `censored` column, unused by
+  anything before this gate existed, is now excluded from the estimation
+  sample when the reviewed strategy says so;
 - aggregate-only feasibility counts, mapping-audit diagnostics, univariate
   positivity screening, and per-covariate missingness audits;
 - person-level analytic cohort SQL generation (`A`, `Y`, `index_datetime`,
   covariates, and an optional reviewer-approved `censored` column) for OMOP
   CDM, portable across BigQuery and DuckDB;
 - governed, read-only query execution via OMCP, with SQL-safety validation
-  before anything reaches a database.
+  before anything reaches a database;
+- governed materialization of that person-level cohort into a local
+  `analytic_dataset.parquet` (`causal.data_builder.materialize`), the one
+  place patient-level rows are ever pulled into memory -- never delivered to
+  an LLM;
+- a transparent g-computation (standardization) baseline for the ATE,
+  risk-difference scale, binary outcome, with a nonparametric bootstrap
+  confidence interval (`causal.agents.estimation.EstimationAgent`, cited to
+  Hernan & Robins *Causal Inference: What If* ch. 13);
+- standardized mean difference (SMD) covariate-balance diagnostics (Austin
+  2009, `causal.agents.diagnostics.DiagnosticsAgent`) and cross-validated
+  outcome-model AUC/Brier calibration;
+- a stabilized inverse-probability-of-censoring-weighted (IPCW) g-formula
+  for single-interval administrative censoring, cited to Hernan & Robins
+  ch. 12, alongside row-exclusion and an explicit waiver as reviewed
+  `censoring_strategy` choices;
+- SuperLearner nuisance-model ensembling (`causal.nuisance.SuperLearner`,
+  cited to van der Laan, Polley & Hubbard 2007): a prespecified library of
+  five sklearn-only candidates combined by cross-validated non-negative
+  least squares;
+- targeted maximum likelihood estimation (TMLE) for the same ATE, risk-
+  difference-scale functional (`causal.agents.tmle.TMLEAgent`, cited to Van
+  der Laan & Rose 2011): SuperLearner-ensembled outcome and treatment
+  nuisance models, a targeting step, and an efficient-influence-curve
+  closed-form variance estimator in place of a bootstrap -- doubly robust,
+  consistent if either nuisance model is correctly specified rather than
+  only both. A reviewer picks `plug_in_standardization` (the g-computation
+  baseline) or `targeted_minimum_loss_based_estimation` per run via
+  `StatisticalEstimand.estimation_procedure`;
+- E-value quantitative sensitivity analysis (`causal.sensitivity.e_value`,
+  cited to VanderWeele & Ding 2017): the minimum risk-ratio-scale strength
+  an unmeasured confounder would need, for both the point estimate and the
+  confidence-interval bound closest to the null, to fully explain away the
+  observed association. Both estimators report a risk ratio alongside their
+  primary risk-difference estimate for exactly this
+  (`WorkflowManager.run_sensitivity_analysis`, `sensitivity_analysis.json`,
+  included in `causal_report.md` when present);
+- negative controls (`causal.queries.negative_controls`): a reviewed
+  exposure or outcome believed to have no true causal effect, substituted
+  in for the real one via `causal.queries.feasibility`'s existing cohort-
+  building machinery -- no new SQL-generation logic. LLM-assisted candidate
+  proposal (clinical label + rationale only, never a concept id) mirrors
+  `causal.agents.dag_critique`'s bounded prompt/parse pattern and can never
+  auto-approve a candidate; a human maps concepts and approves/rejects in
+  one step (`WorkflowManager.map_negative_control`, folded into the
+  existing `clinical_mapping` gate). `WorkflowManager.run_negative_control_
+  estimation` fits whichever estimator was reviewed for the real study
+  against the substituted cohort -- a diagnostic `causal_report.md`
+  surfaces, never a blocking gate;
+- an auditable causal report (`causal_report.md`) linking the estimate to
+  the protocol/estimand contract, diagnostics, assumptions, the full
+  approval-gate history, and each artifact's provenance, gated by a human
+  `results` decision; with an optional, gracefully-degrading LLM narrative
+  section that only ever reads already-computed JSON results, never the
+  patient-level dataset, must return typed/source-cited `claims` alongside
+  its prose, is deterministically fact-checked by `causal.agents.
+  results_faithfulness` (no second LLM), and is included in the report only
+  once a human reviewer approves it with no failed check
+  (`WorkflowManager.review_results_narrative`) -- a decision entirely
+  separate from the mandatory `results` gate;
+- CATE (conditional average treatment effect) for a prespecified family of
+  effect-modifier subgroups, cited to Athey & Imbens 2016 and Wager & Athey
+  2018 (`causal.agents.cate.CATEAgent`, a causal forest via `econml.dml.
+  CausalForestDML`). Multiple-testing correction across the prespecified
+  family via Holm's (1979) stepdown procedure, motivated by List, Shaikh &
+  Xu 2019; exploratory (non-prespecified) subgroups are reported separately
+  and never family-wise-error controlled. `StatisticalEstimand.
+  population_summary` (`"ATE"`/`"ATT"`/`"CATE"`) gates whether a run may
+  call `WorkflowManager.run_cate` at all -- CATE is never the default, a
+  study must explicitly declare it as the primary estimand. Reported as a
+  deterministic markdown table only (`build_causal_report`) -- no LLM
+  narrative for subgroup results yet.
+
+Also implemented, but deliberately outside the governed pipeline above --
+an offline maintainer tool, not a workflow step any clinical study run
+touches:
+
+- an outcome-blind simulation harness (`causal.simulation`, cited to
+  Rudolph, Fox & Naimi 2021) validating `EstimationAgent`/`TMLEAgent`'s
+  bias, variance calibration, and CI coverage against three closed-form
+  data-generating processes with an exactly-known true ATE, including one
+  whose outcome mechanism a logistic-in-the-raw-covariates model
+  structurally cannot represent (`tests/test_simulation.py`, opt-in via
+  `pytest -m slow`).
 
 ## Current Limitations
 
-- no TMLE, SuperLearner-style nuisance modeling, g-computation, or CATE
-  estimator is implemented yet -- this package stops at cohort construction
-  and readiness gating, deliberately, before causal estimation.
+- CATE subgroup results have no LLM narrative interpretation yet
+  (deterministic table only) -- `results_faithfulness`'s null-crossing
+  logic is built around one scalar estimate, and stretching it to N
+  subgroup results without redesigning it would be exactly the kind of
+  bolted-on half-extension this project avoids. TMLE also does not support
+  `ipcw_administrative_censoring` (`TMLEAgent.run` raises `ValueError`):
+  censored-data TMLE needs a materially different efficient-influence-
+  function construction (Van der Laan & Rose 2011, ch. 5), not a reuse of
+  `EstimationAgent`'s stabilized-weight IPCW.
+- IPCW censoring weighting (g-computation only) covers a single fixed-
+  horizon administrative-censoring indicator, not time-varying censoring;
+  multiple imputation for missing covariates is not implemented
+  (`docs/causal_roadmap.md` milestone 3).
 - source OMOP vocabulary mapping completeness is checked and enforced per
   concept set before a cohort query runs, but not guaranteed by this
   package -- an unmapped concept blocks with an explicit error rather than
@@ -62,10 +172,12 @@ call it.
 
 ## Planned Direction
 
-The primary methodological target is CATE inference with OMOP CDM data.
-Planned estimators include TMLE with SuperLearner-style nuisance models and
-g-computation. Average treatment-effect summaries may still be reported as
-secondary outputs for comparison with published studies.
+The primary methodological target, CATE inference with OMOP CDM data, is
+now implemented (`causal.agents.cate.CATEAgent`) for a prespecified
+effect-modifier subgroup family. Average treatment-effect summaries from
+either ATE estimator (g-computation or TMLE) are also reported as secondary
+outputs for comparison with published studies. An LLM narrative
+interpretation of CATE subgroup results remains future work.
 
 ## Entry points
 
@@ -91,9 +203,9 @@ without error, and the result is persisted as `study_specification.json`.
 The scientific review decisions are split across three gates
 (`target_trial`, `dag_review`, `identification_estimand`) instead of one
 combined `protocol` gate. `causal.mapping.registry.OMOPVariableRegistry` is
-still not the sole source every query builder resolves population/treatment/
-comparator/outcome concepts from -- only covariates are registry-backed
-today.
+now the sole source every query builder resolves population/treatment/
+comparator/outcome concepts from, the same as covariates
+(`OMOPVariableRegistry.resolve_role`, `_load_concept_specs`).
 
 For maintained documentation, see `docs/index.md`,
 `docs/causal_roadmap.md`, and `docs/fastomop_integration.md`.

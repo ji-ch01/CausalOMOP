@@ -1,8 +1,8 @@
 # CausalOMOP Architecture Diagrams
 
 These diagrams reflect the maintained architecture. Green components are
-implemented, yellow components require human review, blue components are
-external, and dashed components are planned.
+implemented, yellow components require human review, and blue components are
+external.
 
 ## End-to-end architecture
 
@@ -31,23 +31,26 @@ flowchart TB
     FEAS --> PLAN[Analysis plan + execution readiness]
     PLAN --> APG{Analysis-plan gate}
     APG --> SQL[Person-level analytic-cohort SQL plan]
+    SQL --> SEG{Statistical-estimand gate}
+    SEG --> ESTSPEC[StatisticalEstimand persisted\nadjustment set, missing-data/censoring strategy]
 
-    SQL -. planned .-> EST[Observed-data estimand + estimators]
-    EST -. planned .-> DIAG[Estimator diagnostics + sensitivity]
-    DIAG -. planned .-> REPORT[Auditable causal report]
+    ESTSPEC --> MAT[Governed materialization: analytic_dataset.parquet]
+    MAT --> EST[G-computation/TMLE ATE, or causal-forest CATE]
+    EST --> DIAG[SMD balance + calibration diagnostics\n+ E-value sensitivity analysis]
+    DIAG --> RG{Results gate}
+    RG --> REPORT[Auditable causal report\n+ optional advisory LLM narrative]
 
     MIMIC[(MIMIC-IV OMOP\nBigQuery or local DuckDB)] --> OMCP
     FAST --> OMCP
     FEAS --> OMCP
+    MAT -. governed cohort_build operation .-> OMCP
 
     classDef done fill:#d9ead3,stroke:#38761d,color:#1b1b1b;
     classDef gate fill:#fff2cc,stroke:#bf9000,color:#1b1b1b;
     classDef external fill:#cfe2f3,stroke:#3d85c6,color:#1b1b1b;
-    classDef planned fill:#eeeeee,stroke:#777,color:#333,stroke-dasharray:5 5;
-    class Q,QG,USER,DRAFT,DAG,CRIT,ID,SPEC,MAP,REG,FEAS,PLAN,SQL done;
-    class TTG,DG,IEG,MG,APG gate;
+    class Q,QG,USER,DRAFT,DAG,CRIT,ID,SPEC,MAP,REG,FEAS,PLAN,SQL,ESTSPEC,MAT,EST,DIAG,REPORT done;
+    class TTG,DG,IEG,MG,APG,SEG,RG gate;
     class FAST,LIT,KG,OMCP,MIMIC external;
-    class EST,DIAG,REPORT planned;
 ```
 
 The descriptive branch is currently a redirect: the CLI and UI tell the user
@@ -68,7 +71,9 @@ flowchart LR
     C --> F[feasibility]
     F --> AP[analysis_plan]
     AP --> A{analysis_plan gate}
-    A --> E[execution]
+    A --> ER[estimand_review]
+    ER --> SEG{statistical_estimand gate}
+    SEG --> E[execution]
     E --> D[diagnostics]
     D --> RR[results_review]
     RR --> R{results gate}
@@ -77,19 +82,21 @@ flowchart LR
     IG -. approved .-> SPEC[study_specification.json persisted]
     C -. provisional exploratory .-> AGG[Aggregate audits only]
     A -. blocked .-> NOPERSON[No authorized person-level execution]
+    SEG -. approved .-> ESTSPEC[statistical_estimand.json persisted]
 
     classDef phase fill:#d9ead3,stroke:#38761d,color:#1b1b1b;
     classDef gate fill:#fff2cc,stroke:#bf9000,color:#1b1b1b;
     classDef block fill:#f4cccc,stroke:#cc0000,color:#1b1b1b;
-    class TR,DR,IR,CM,F,AP,E,D,RR,RP,AGG,SPEC phase;
-    class TG,DG,IG,C,A,R gate;
+    class TR,DR,IR,CM,F,AP,ER,E,D,RR,RP,AGG,SPEC,ESTSPEC phase;
+    class TG,DG,IG,C,A,SEG,R gate;
     class NOPERSON block;
 ```
 
-The six current gates implement the governance split docs/causal_roadmap.md
+The seven current gates implement the governance split docs/causal_roadmap.md
 used to propose as future work: separate review of the target trial
 (`target_trial`), the DAG (`dag_review`), identification/estimand
-(`identification_estimand`), and OMOP operationalization (`clinical_mapping`),
+(`identification_estimand`), OMOP operationalization (`clinical_mapping`),
+and the observed-data statistical estimand (`statistical_estimand`),
 plus the pre-existing `analysis_plan`/`results` gates.
 
 ## Trust and data boundary
@@ -115,5 +122,17 @@ person-level cohort query is not authorization to export or share its result.
 ## Current boundary
 
 CausalOMOP currently reaches governed study design, mapping, feasibility,
-aggregate diagnostics, readiness assessment, and analytic-cohort SQL planning.
-It does not yet implement treatment-effect estimation or a final causal report.
+aggregate diagnostics, readiness assessment, analytic-cohort SQL planning and
+governed materialization, and a reviewer's choice of estimator -- a
+transparent g-computation ATE baseline (with an IPCW-weighted variant for
+single-interval administrative censoring), TMLE (SuperLearner-ensembled
+nuisance models, doubly robust ATE), or a causal forest for the CATE over a
+prespecified effect-modifier subgroup family (Athey & Imbens 2016, Wager &
+Athey 2018, Holm-stepdown multiple-testing correction) -- with covariate-
+balance/calibration diagnostics, E-value quantitative sensitivity analysis
+(VanderWeele & Ding 2017), negative controls (LLM-proposed, human-approved,
+reusing the same cohort-building machinery via a substituted concept set),
+and an auditable causal report gated by human `results` review (with an
+optional, advisory-only LLM narrative for the ATE estimate -- CATE subgroup
+results are a deterministic table only, no narrative yet). See
+[docs/causal_roadmap.md](causal_roadmap.md) for what remains.
