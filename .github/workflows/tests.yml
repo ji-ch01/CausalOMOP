@@ -28,6 +28,7 @@ jobs:
           pip install -r requirements-mcp.txt
           pip install -r requirements-causal-discovery.txt
           pip install -r requirements-knowledge-graph.txt
+          pip install -r requirements-estimation.txt
           pip install pytest
 
       - name: Run tests

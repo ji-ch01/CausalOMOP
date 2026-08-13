@@ -1,0 +1,20 @@
+-r requirements.txt
+# Outcome-regression model for the g-computation ATE baseline
+# (causal.agents.estimation), the SuperLearner nuisance-model ensemble
+# (causal.nuisance) used by causal.agents.tmle's TMLE estimator and (via
+# the sklearn-compatible SuperLearnerClassifier/SuperLearnerRegressor
+# adapters) causal.agents.cate's CATE estimator. scipy (causal.agents.
+# tmle's targeting-step optimizer and logit/expit) is already a transitive
+# scikit-learn dependency -- no separate pin needed.
+scikit-learn>=1.2,<2
+# Parquet I/O for the materialized analytic dataset
+# (causal.data_builder.materialize) -- already a transitive BigQuery
+# dependency, listed explicitly here so a DuckDB-only install still gets it.
+pyarrow>=16.0.0
+# Causal forest DML (causal.agents.cate.CATEAgent), Wager & Athey 2018 /
+# Athey & Imbens 2016 -- accepted as a new dependency (docs/causal_roadmap.md
+# milestone #4): no honest-splitting causal forest exists in the
+# scikit-learn-only stack above. Brings in numba/lightgbm/statsmodels/shap
+# transitively; verified installable on Windows/Python 3.12 before this
+# pin was added.
+econml>=0.15
