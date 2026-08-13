@@ -210,7 +210,7 @@ remain authoritative for installation and upstream behavior. See the
 |---|---|
 | `agno_fastomop/` | [fastomop/agno_fastomop](https://github.com/fastomop/agno_fastomop) |
 | `omcp/` | [fastomop/omcp](https://github.com/fastomop/omcp) |
-| `foem/` | [ji-ch01/foem](https://github.com/ji-ch01/foem) |
+| `foem/` | [fastomop/foem](https://github.com/fastomop/foem) |
 | `external/ohdsi_mimic/` | [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) |
 
 Initialize them with:
