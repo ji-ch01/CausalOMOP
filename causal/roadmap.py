@@ -126,6 +126,145 @@ class CausalEstimand:
         )
 
 
+# Roadmap stage 8 (docs/causal_roadmap.md): three estimators are
+# implemented today, all targeting the identical statistical functional
+# (the g-formula) via different estimation procedures -- `causal.agents.
+# estimation.EstimationAgent` (parametric g-computation, an unpenalized
+# logistic outcome model), `causal.agents.tmle.TMLEAgent` (targeted maximum
+# likelihood estimation, a SuperLearner-ensembled outcome/treatment model),
+# and `causal.agents.cate.CATEAgent` (a causal forest, for the conditional
+# rather than population-average functional -- see `StatisticalEstimand.
+# population_summary`). These sets are deliberately narrow, not because no
+# other functional/model could ever be legitimate, but because declaring
+# one that nothing can fit would make `StatisticalEstimand` a promise the
+# pipeline cannot keep -- widen them only alongside a real estimator for
+# the new value.
+IDENTIFYING_FUNCTIONALS = {"g_formula_standardization"}
+OUTCOME_MODEL_SPECS = {"logistic_regression_unpenalized", "super_learner_ensemble"}
+
+# Which estimation procedure computes the identifying functional above.
+# `plug_in_standardization` is `EstimationAgent`'s parametric g-computation;
+# `targeted_minimum_loss_based_estimation` is `TMLEAgent`'s TMLE (see that
+# module's docstring for the citation and scope); `causal_forest_dml` is
+# `CATEAgent`'s causal forest (Wager & Athey 2018), the only procedure that
+# supports `population_summary="CATE"` (see `StatisticalEstimand`'s own
+# cross-check). All are valid, reviewed choices for the same
+# `identifying_functional`, not a ranked "better" option -- see
+# `StatisticalEstimand.estimation_procedure`.
+ESTIMATION_PROCEDURES = {
+    "plug_in_standardization", "targeted_minimum_loss_based_estimation", "causal_forest_dml",
+}
+
+# Only complete-case analysis (listwise deletion of rows with any missing
+# adjustment covariate) is implemented; see the same rationale above.
+MISSING_DATA_STRATEGIES = {"complete_case_analysis"}
+
+# Unlike the two sets above, all three of these are real, implemented
+# choices for the analytic dataset's per-row `censored` column (`causal.
+# data_builder.analytic.AnalyticCohortBuilder`): `exclude_censored_before_
+# analysis` drops censored rows before fitting and `ignore_censoring_
+# administrative_waiver` is an explicit reviewed waiver not to use the
+# column at all -- neither corrects for *informative* censoring.
+# `ipcw_administrative_censoring` does: a stabilized inverse-probability-of-
+# censoring-weighted g-formula (see `causal.agents.estimation.
+# EstimationAgent` for the citation and implementation). Multiple imputation
+# for missing covariates remains unimplemented (`MISSING_DATA_STRATEGIES`
+# above).
+CENSORING_STRATEGIES = {
+    "exclude_censored_before_analysis",
+    "ignore_censoring_administrative_waiver",
+    "ipcw_administrative_censoring",
+}
+
+
+@dataclass(frozen=True)
+class StatisticalEstimand:
+    """The observed-data statistical estimand (`docs/causal_roadmap.md`
+    stage 8): the identifying functional and estimation contract that turns
+    `CausalEstimand`'s counterfactual contrast into something computable
+    from `analytic_dataset.parquet`.
+
+    Deliberately a separate object from `CausalEstimand`, not a few extra
+    fields bolted onto it: `CausalEstimand` fixes *what* causal contrast is
+    being asked for (population summary, treatment/comparator values,
+    horizon) and is meaningful even before any OMOP data exists.
+    `StatisticalEstimand` fixes *how* that contrast will actually be
+    estimated from the observed, possibly incomplete and administratively
+    censored data this pipeline can extract -- the outcome-model
+    specification, the exact adjustment set that was reviewed and built into
+    `cohort.sql`, and -- unlike before this object existed -- an explicit,
+    reviewed missing-data and censoring strategy, rather than a choice left
+    implicit in `EstimationAgent`'s code with the analytic cohort's
+    `censored` column silently unused by anything.
+
+    `estimation_procedure` (added in schema_version 1.1) answers "how will
+    this be estimated" -- `plug_in_standardization` (`EstimationAgent`) or
+    `targeted_minimum_loss_based_estimation` (`TMLEAgent`) -- as a distinct
+    question from `identifying_functional`, which both procedures currently
+    share (`g_formula_standardization`): the functional says what
+    statistical quantity identifies the causal contrast, the procedure says
+    which reviewed estimator computes it.
+
+    `population_summary` (added in schema_version 1.2) must match
+    `study_specification.json`'s `estimand.population_summary` -- closes a
+    real gap where a study declaring `"CATE"` at the causal-question stage
+    could still silently run plain ATE g-computation, since nothing
+    previously re-checked that declaration this late in the pipeline (see
+    `causal.orchestrator.workflow._write_statistical_estimand`).
+    `"CATE"` additionally requires `estimation_procedure=
+    "causal_forest_dml"` (`CATEAgent`, the only estimator that computes
+    it) -- `plug_in_standardization`/`targeted_minimum_loss_based_
+    estimation` only ever report the ATE.
+    """
+
+    schema_version: str
+    study_id: str
+    identifying_functional: str
+    outcome_model: str
+    adjustment_set: tuple[str, ...]
+    effect_measure: str
+    missing_data_strategy: str
+    censoring_strategy: str
+    censoring_rationale: str
+    estimation_procedure: str = "plug_in_standardization"
+    population_summary: str = "ATE"
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in {"1.0", "1.1", "1.2"}:
+            raise ValueError("Statistical estimand schema_version must be 1.0, 1.1, or 1.2")
+        if not self.study_id or not self.study_id.replace("_", "").isalnum():
+            raise ValueError("study_id must be an alphanumeric snake_case identifier")
+        if self.identifying_functional not in IDENTIFYING_FUNCTIONALS:
+            raise ValueError(f"Unsupported identifying functional: {self.identifying_functional!r}")
+        if self.outcome_model not in OUTCOME_MODEL_SPECS:
+            raise ValueError(f"Unsupported outcome model specification: {self.outcome_model!r}")
+        if self.estimation_procedure not in ESTIMATION_PROCEDURES:
+            raise ValueError(f"Unsupported estimation procedure: {self.estimation_procedure!r}")
+        if self.population_summary not in {"ATE", "ATT", "CATE"}:
+            raise ValueError("population_summary must be ATE, ATT, or CATE")
+        if self.population_summary == "CATE" and self.estimation_procedure != "causal_forest_dml":
+            raise ValueError(
+                "population_summary='CATE' requires estimation_procedure='causal_forest_dml' -- "
+                "plug_in_standardization/targeted_minimum_loss_based_estimation only report the ATE"
+            )
+        if self.effect_measure not in {
+            "risk_difference", "risk_ratio", "odds_ratio", "mean_difference", "survival_difference"
+        }:
+            raise ValueError("Unsupported causal effect measure")
+        if len(set(self.adjustment_set)) != len(self.adjustment_set):
+            raise ValueError("adjustment_set must not contain duplicate columns")
+        if self.missing_data_strategy not in MISSING_DATA_STRATEGIES:
+            raise ValueError(f"Unsupported missing-data strategy: {self.missing_data_strategy!r}")
+        if self.censoring_strategy not in CENSORING_STRATEGIES:
+            raise ValueError(f"Unsupported censoring strategy: {self.censoring_strategy!r}")
+        object.__setattr__(
+            self, "censoring_rationale", _require_text(self.censoring_rationale, "censoring_rationale")
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass(frozen=True)
 class CausalNode:
     node_id: str

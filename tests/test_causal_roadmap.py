@@ -7,6 +7,7 @@ from causal.roadmap import (
     CausalNode,
     CausalQuestion,
     CausalStudySpecification,
+    StatisticalEstimand,
     TargetTrialProtocol,
 )
 
@@ -235,6 +236,104 @@ class CausalEstimandValidationTests(unittest.TestCase):
         self.assertIn("risk_difference", contrast)
         self.assertIn("albumin_plus_crystalloids", contrast)
         self.assertIn("day 28", contrast)
+
+
+def _statistical_estimand(**overrides):
+    fields = dict(
+        schema_version="1.0",
+        study_id="albumin_sepsis_28d",
+        identifying_functional="g_formula_standardization",
+        outcome_model="logistic_regression_unpenalized",
+        adjustment_set=("severity",),
+        effect_measure="risk_difference",
+        missing_data_strategy="complete_case_analysis",
+        censoring_strategy="ignore_censoring_administrative_waiver",
+        censoring_rationale="Administrative censoring reviewed and judged non-informative.",
+    )
+    fields.update(overrides)
+    return StatisticalEstimand(**fields)
+
+
+class StatisticalEstimandValidationTests(unittest.TestCase):
+    def test_distinct_from_causal_estimand(self):
+        # Same study, two different, independently persistable contracts --
+        # a StatisticalEstimand is not just CausalEstimand plus a couple of
+        # fields; it has its own schema_version/study_id and validation.
+        causal_estimand = _estimand()
+        statistical_estimand = _statistical_estimand()
+        self.assertNotIsInstance(statistical_estimand, type(causal_estimand))
+        self.assertEqual(statistical_estimand.effect_measure, causal_estimand.effect_measure)
+
+    def test_rejects_unsupported_identifying_functional(self):
+        with self.assertRaisesRegex(ValueError, "identifying functional"):
+            _statistical_estimand(identifying_functional="tmle")
+
+    def test_rejects_unsupported_outcome_model(self):
+        with self.assertRaisesRegex(ValueError, "outcome model"):
+            _statistical_estimand(outcome_model="random_forest")
+
+    def test_rejects_unsupported_missing_data_strategy(self):
+        with self.assertRaisesRegex(ValueError, "missing-data strategy"):
+            _statistical_estimand(missing_data_strategy="multiple_imputation")
+
+    def test_rejects_unsupported_censoring_strategy(self):
+        with self.assertRaisesRegex(ValueError, "censoring strategy"):
+            _statistical_estimand(censoring_strategy="ipcw")
+
+    def test_accepts_both_implemented_censoring_strategies(self):
+        for strategy in ("exclude_censored_before_analysis", "ignore_censoring_administrative_waiver"):
+            self.assertEqual(_statistical_estimand(censoring_strategy=strategy).censoring_strategy, strategy)
+
+    def test_rejects_blank_censoring_rationale(self):
+        with self.assertRaisesRegex(ValueError, "censoring_rationale"):
+            _statistical_estimand(censoring_rationale="   ")
+
+    def test_rejects_duplicate_adjustment_set_columns(self):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            _statistical_estimand(adjustment_set=("age", "age"))
+
+    def test_accepts_empty_adjustment_set(self):
+        self.assertEqual(_statistical_estimand(adjustment_set=()).adjustment_set, ())
+
+    def test_rejects_unsupported_effect_measure(self):
+        with self.assertRaisesRegex(ValueError, "effect measure"):
+            _statistical_estimand(effect_measure="hazard_ratio")
+
+    def test_rejects_invalid_study_id(self):
+        with self.assertRaisesRegex(ValueError, "study_id"):
+            _statistical_estimand(study_id="not a valid id!")
+
+    def test_to_dict_round_trips(self):
+        as_dict = _statistical_estimand().to_dict()
+        self.assertEqual(as_dict["identifying_functional"], "g_formula_standardization")
+        self.assertEqual(as_dict["adjustment_set"], ("severity",))
+
+    def test_population_summary_defaults_to_ate(self):
+        self.assertEqual(_statistical_estimand().population_summary, "ATE")
+
+    def test_rejects_unsupported_population_summary(self):
+        with self.assertRaisesRegex(ValueError, "population_summary"):
+            _statistical_estimand(population_summary="not_a_real_summary")
+
+    def test_accepts_cate_with_causal_forest_dml(self):
+        estimand = _statistical_estimand(
+            population_summary="CATE", estimation_procedure="causal_forest_dml",
+            outcome_model="super_learner_ensemble",
+        )
+        self.assertEqual(estimand.population_summary, "CATE")
+
+    def test_cate_requires_causal_forest_dml_procedure(self):
+        with self.assertRaisesRegex(ValueError, "causal_forest_dml"):
+            _statistical_estimand(
+                population_summary="CATE", estimation_procedure="plug_in_standardization",
+            )
+
+    def test_accepts_schema_version_1_2(self):
+        self.assertEqual(_statistical_estimand(schema_version="1.2").schema_version, "1.2")
+
+    def test_rejects_unsupported_estimation_procedure(self):
+        with self.assertRaisesRegex(ValueError, "estimation procedure"):
+            _statistical_estimand(estimation_procedure="not_a_real_procedure")
 
 
 class TargetTrialProtocolValidationTests(unittest.TestCase):
