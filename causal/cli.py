@@ -23,8 +23,10 @@ from causal.agents.user_question import LLMRawOutput
 from causal.knowledge_graph import OptimusKGClient
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
+from causal.roadmap import CENSORING_STRATEGIES, ESTIMATION_PROCEDURES, MISSING_DATA_STRATEGIES
 from causal.mcp_client import OMCPClient
 from causal.orchestrator import WorkflowManager
+from causal.queries import DOMAIN_TABLES
 from causal.roadmap import to_dagitty
 
 
@@ -104,7 +106,7 @@ def main() -> int:
         "gate",
         choices=(
             "target_trial", "dag_review", "identification_estimand",
-            "clinical_mapping", "analysis_plan", "results",
+            "clinical_mapping", "analysis_plan", "statistical_estimand", "results",
         ),
     )
     workflow_gate.add_argument("status", choices=("approved", "rejected", "provisional"))
@@ -169,6 +171,38 @@ def main() -> int:
         "--with-mcp", action="store_true",
         help="verify each concept_id's real OMOP domain matches --domain through OMCP",
     )
+    workflow_negative_controls_propose = workflow_sub.add_parser(
+        "negative-controls-propose",
+        help="LLM-assisted negative-control candidate proposal (label + rationale only, never auto-approved)",
+    )
+    workflow_negative_controls_propose.add_argument("run_id")
+    workflow_negative_controls_propose.add_argument("--model", default=None)
+    workflow_negative_control_map = workflow_sub.add_parser(
+        "negative-control-map",
+        help="record the OMOP domain + concept(s) for a proposed negative control, and approve/reject it",
+    )
+    workflow_negative_control_map.add_argument("run_id")
+    workflow_negative_control_map.add_argument("control_id")
+    workflow_negative_control_map.add_argument("--domain", required=True, choices=sorted(DOMAIN_TABLES))
+    workflow_negative_control_map.add_argument(
+        "--concept-ids", type=int, nargs="+", default=[],
+        help="one or more OMOP concept_id values; required unless --status is non-approved",
+    )
+    workflow_negative_control_map.add_argument("--reviewer", required=True)
+    workflow_negative_control_map.add_argument("--status", default="approved")
+    workflow_negative_control_map.add_argument("--comment")
+    workflow_negative_control_map.add_argument(
+        "--with-mcp", action="store_true",
+        help="verify each concept_id's real OMOP domain matches --domain through OMCP",
+    )
+    workflow_negative_control_estimate = workflow_sub.add_parser(
+        "negative-control-estimate",
+        help="fit the reviewed estimator over a negative-control-substituted cohort (diagnostic, not a gate)",
+    )
+    workflow_negative_control_estimate.add_argument("run_id")
+    workflow_negative_control_estimate.add_argument("control_id")
+    workflow_negative_control_estimate.add_argument("--n-bootstrap", type=int, default=1000)
+    workflow_negative_control_estimate.add_argument("--seed", type=int, default=0)
     workflow_covariate_map_concepts = workflow_sub.add_parser(
         "covariate-map-concepts",
         help="record the OMOP concept(s) chosen for an already-accepted covariate",
@@ -253,6 +287,82 @@ def main() -> int:
         "cohort-plan", help="generate governed analytic-cohort SQL without executing it"
     )
     workflow_cohort_plan.add_argument("run_id")
+    workflow_estimand_strategy = workflow_sub.add_parser(
+        "estimand-strategy",
+        help="record the reviewed missing-data/censoring strategy for the statistical_estimand gate",
+    )
+    workflow_estimand_strategy.add_argument("run_id")
+    workflow_estimand_strategy.add_argument(
+        "missing_data_strategy", choices=sorted(MISSING_DATA_STRATEGIES),
+    )
+    workflow_estimand_strategy.add_argument(
+        "censoring_strategy", choices=sorted(CENSORING_STRATEGIES),
+    )
+    workflow_estimand_strategy.add_argument(
+        "--rationale", required=True,
+        help="why this censoring strategy was chosen (required, persisted into statistical_estimand.json)",
+    )
+    workflow_estimand_strategy.add_argument(
+        "--estimation-procedure",
+        choices=sorted(ESTIMATION_PROCEDURES),
+        default="plug_in_standardization",
+        help="which reviewed estimator computes the g-formula functional (default: plug_in_standardization)",
+    )
+    workflow_estimand_strategy.add_argument("--reviewer", required=True)
+    workflow_estimand_strategy.add_argument("--comment")
+    workflow_materialize_dataset = workflow_sub.add_parser(
+        "materialize-dataset",
+        help="execute the governed cohort SQL through OMCP and write analytic_dataset.parquet",
+    )
+    workflow_materialize_dataset.add_argument("run_id")
+    workflow_estimate = workflow_sub.add_parser(
+        "estimate", help="fit the g-computation ATE baseline over the materialized analytic dataset"
+    )
+    workflow_estimate.add_argument("run_id")
+    workflow_estimate.add_argument("--n-bootstrap", type=int, default=1000)
+    workflow_estimate.add_argument("--seed", type=int, default=0)
+    workflow_balance_diagnostics = workflow_sub.add_parser(
+        "balance-diagnostics",
+        help="compute standardized mean difference covariate balance over the materialized dataset",
+    )
+    workflow_balance_diagnostics.add_argument("run_id")
+    workflow_sensitivity_analysis = workflow_sub.add_parser(
+        "sensitivity-analysis",
+        help="compute the E-value quantitative sensitivity analysis over an already-computed estimate",
+    )
+    workflow_sensitivity_analysis.add_argument("run_id")
+    workflow_cate_cutpoint = workflow_sub.add_parser(
+        "cate-cutpoint",
+        help="record a reviewer-entered cutpoint for a continuous CATE effect-modifier subgroup",
+    )
+    workflow_cate_cutpoint.add_argument("run_id")
+    workflow_cate_cutpoint.add_argument("covariate_name")
+    workflow_cate_cutpoint.add_argument("cutpoint", type=float)
+    workflow_cate_cutpoint.add_argument("--reviewer", required=True)
+    workflow_cate = workflow_sub.add_parser(
+        "cate",
+        help="fit the CATE causal forest over the prespecified effect-modifier subgroup family",
+    )
+    workflow_cate.add_argument("run_id")
+    workflow_cate.add_argument("--seed", type=int, default=0)
+    workflow_causal_report = workflow_sub.add_parser(
+        "causal-report", help="build the auditable causal report (estimate, diagnostics, assumptions, gates)"
+    )
+    workflow_causal_report.add_argument("run_id")
+    workflow_narrative = workflow_sub.add_parser(
+        "narrative",
+        help="optional LLM interpretation of an already-computed estimate (advisory only)",
+    )
+    workflow_narrative.add_argument("run_id")
+    workflow_narrative.add_argument("--model", default=None)
+    workflow_narrative_review = workflow_sub.add_parser(
+        "narrative-review",
+        help="human review of a generated results narrative (approve or exclude from the causal report)",
+    )
+    workflow_narrative_review.add_argument("run_id")
+    workflow_narrative_review.add_argument("decision", choices=("approved", "excluded"))
+    workflow_narrative_review.add_argument("--reviewer", required=True)
+    workflow_narrative_review.add_argument("--note")
     workflow_cohort_profile = workflow_sub.add_parser(
         "cohort-profile", help="run aggregate-only cohort validation through OMCP"
     )
@@ -370,6 +480,26 @@ def main() -> int:
                 comment=args.comment,
                 concept_lookup=concept_lookup,
             )
+        elif args.workflow_command == "negative-controls-propose":
+            resolved_llm = build_hypothesis_llm(model=args.model)
+            state = manager.propose_negative_controls(args.run_id, resolved_llm.call)
+        elif args.workflow_command == "negative-control-map":
+            concept_lookup = OMCPClient(datasets) if args.with_mcp else None
+            state = manager.map_negative_control(
+                args.run_id,
+                args.control_id,
+                args.domain,
+                args.concept_ids,
+                args.reviewer,
+                status=args.status,
+                comment=args.comment,
+                concept_lookup=concept_lookup,
+            )
+        elif args.workflow_command == "negative-control-estimate":
+            state = manager.run_negative_control_estimation(
+                args.run_id, args.control_id, OMCPClient(datasets),
+                n_bootstrap=args.n_bootstrap, random_seed=args.seed,
+            )
         elif args.workflow_command == "covariate-review":
             state = manager.review_covariate(
                 args.run_id,
@@ -457,6 +587,46 @@ def main() -> int:
             state = manager.run_execution_readiness(args.run_id)
         elif args.workflow_command == "cohort-plan":
             state = manager.build_cohort_plan(args.run_id, datasets)
+        elif args.workflow_command == "estimand-strategy":
+            state = manager.set_statistical_estimand_strategy(
+                args.run_id,
+                missing_data_strategy=args.missing_data_strategy,
+                censoring_strategy=args.censoring_strategy,
+                censoring_rationale=args.rationale,
+                reviewer=args.reviewer,
+                estimation_procedure=args.estimation_procedure,
+                comment=args.comment,
+            )
+        elif args.workflow_command == "materialize-dataset":
+            state = manager.materialize_analytic_dataset(args.run_id, OMCPClient(datasets))
+        elif args.workflow_command == "estimate":
+            state = manager.run_estimation(
+                args.run_id, n_bootstrap=args.n_bootstrap, random_seed=args.seed
+            )
+        elif args.workflow_command == "balance-diagnostics":
+            state = manager.run_diagnostics(args.run_id)
+        elif args.workflow_command == "sensitivity-analysis":
+            state = manager.run_sensitivity_analysis(args.run_id)
+        elif args.workflow_command == "cate-cutpoint":
+            state = manager.set_cate_cutpoint(
+                args.run_id, args.covariate_name, args.cutpoint, args.reviewer,
+            )
+        elif args.workflow_command == "cate":
+            state = manager.run_cate(args.run_id, random_seed=args.seed)
+        elif args.workflow_command == "causal-report":
+            report = manager.build_causal_report(args.run_id)
+            print(report)
+            return 0
+        elif args.workflow_command == "narrative":
+            resolved_llm = build_hypothesis_llm(model=args.model)
+            state = manager.run_results_narrative(
+                args.run_id, resolved_llm.call,
+                model=resolved_llm.model, provider=resolved_llm.provider,
+            )
+        elif args.workflow_command == "narrative-review":
+            state = manager.review_results_narrative(
+                args.run_id, args.decision, args.reviewer, args.note
+            )
         elif args.workflow_command == "cohort-profile":
             state = manager.run_cohort_profile_mcp(
                 args.run_id,
