@@ -8,6 +8,7 @@ only then should variables be operationalized against an observational CDM.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from itertools import combinations
 from typing import Any
 
@@ -26,6 +27,16 @@ NODE_ROLES = {
 }
 NODE_TIMINGS = ("baseline", "treatment", "post_treatment", "outcome")
 _TIMING_ORDER = {name: index for index, name in enumerate(NODE_TIMINGS)}
+
+#: Single source of truth for `CausalDAG.minimum_adjustment_sets`'s search
+#: cap. `causal.agents.dag_identification` re-exports this rather than
+#: defining its own copy, and `CausalStudySpecification` below relies on
+#: `minimum_adjustment_sets`'s *default* picking this up implicitly -- two
+#: different literal defaults here and there previously let the
+#: identification_estimand gate reject a DAG that the read-only "Causal DAG
+#: & identification" tab (which does pass this constant explicitly, via
+#: `assess_identification`) reported as already identified.
+DEFAULT_MAX_ADJUSTMENT_CANDIDATES = 24
 
 # Evidence-provenance status (CausalEdge.status) answers "how was this edge
 # authorized?". EDGE_CERTAINTY answers a different question: "how settled is
@@ -414,11 +425,14 @@ class CausalDAG:
             blockers=tuple(dict.fromkeys(blockers)),
         )
 
-    def minimum_adjustment_sets(self, max_candidates: int = 16) -> tuple[tuple[str, ...], ...]:
-        """Return minimum-cardinality valid baseline adjustment sets.
-
-        The bounded exhaustive search is intended for reviewable study DAGs,
-        not high-dimensional variable-selection graphs.
+    def adjustment_candidate_ids(self) -> tuple[str, ...]:
+        """Adjustment-role node ids actually worth searching over: observed,
+        baseline-timing, adjustment-eligible roles, minus any pruned as
+        provably absent from every backdoor path (see
+        `_isolated_non_confounder_candidates`). Shared by
+        `minimum_adjustment_sets` and by UI/reporting code that wants to
+        show or compare against this count without duplicating the pruning
+        logic or paying for the combinatorial search below.
         """
         candidates = tuple(
             node.node_id
@@ -427,6 +441,27 @@ class CausalDAG:
             and node.timing == "baseline"
             and node.role in {"confounder", "prognostic", "effect_modifier", "other"}
         )
+        isolated = self._isolated_non_confounder_candidates(candidates)
+        return tuple(node_id for node_id in candidates if node_id not in isolated)
+
+    @lru_cache(maxsize=32)
+    def minimum_adjustment_sets(
+        self, max_candidates: int = DEFAULT_MAX_ADJUSTMENT_CANDIDATES
+    ) -> tuple[tuple[str, ...], ...]:
+        """Return minimum-cardinality valid baseline adjustment sets.
+
+        The bounded exhaustive search is intended for reviewable study DAGs,
+        not high-dimensional variable-selection graphs. Memoized (`self` is
+        hashable: `CausalDAG` and its `nodes`/`edges` are frozen dataclasses
+        of hashable fields) because the identification_estimand gate builds
+        two value-equal `CausalDAG`s moments apart -- one in `_block_if_
+        not_identified`, one inside `CausalStudySpecification.to_dict()` via
+        `_write_study_specification_if_hypothesis_exists` -- and both used to
+        pay for this same combinatorial search in full while holding
+        `WorkflowManager`'s per-run file lock, widening the window for a
+        concurrent action on the same run to hit the lock's 10s timeout.
+        """
+        candidates = self.adjustment_candidate_ids()
         if len(candidates) > max_candidates:
             raise ValueError(
                 f"DAG has {len(candidates)} adjustment candidates; maximum is {max_candidates}"
@@ -440,6 +475,41 @@ class CausalDAG:
             if valid:
                 return valid
         return ()
+
+    def _isolated_non_confounder_candidates(self, candidate_ids: tuple[str, ...]) -> set[str]:
+        """Candidates that are provably absent from every backdoor path, and
+        so are safe to drop from the combinatorial search below regardless
+        of `max_candidates` or how many literature-grounded covariates a DAG
+        draft happens to propose.
+
+        A `confounder` always has an edge to *both* exposure and outcome by
+        construction (see `causal.agents.dag_identification._ROLE_MAP`), so
+        it always sits on at least one backdoor path and is never pruned
+        here. Every other adjustment-eligible role (`prognostic`,
+        `effect_modifier`, `other`/treatment_cause_only) gets only a single
+        fixed edge to one endpoint. Unless a `covariate_relations` edge
+        connects it to something else, that single edge makes it a
+        degree-one node in the whole graph -- and a degree-one node can
+        never be an *interior* vertex of a path connecting two other nodes
+        (exposure and outcome), so conditioning on it can never open or
+        close a backdoor path. This is checked by total edge degree, not
+        role alone, so a node this same role that *does* carry a
+        `covariate_relations` edge into the rest of the graph is correctly
+        left in the search (its relevance is no longer provable by this
+        argument).
+        """
+        candidate_set = set(candidate_ids)
+        degree = {node_id: 0 for node_id in candidate_set}
+        for edge in self.edges:
+            if edge.source in degree:
+                degree[edge.source] += 1
+            if edge.target in degree:
+                degree[edge.target] += 1
+        node_map = self.node_map
+        return {
+            node_id for node_id in candidate_set
+            if node_map[node_id].role != "confounder" and degree[node_id] <= 1
+        }
 
     def _is_backdoor_blocked(self, conditioned: set[str]) -> bool:
         # Backdoor graph: remove arrows emanating from the exposure.
@@ -538,10 +608,16 @@ class CausalStudySpecification:
         return bool(self.dag.minimum_adjustment_sets())
 
     def to_dict(self) -> dict[str, Any]:
+        # Computed once and reused for both fields below -- this is the
+        # same bounded-but-still-combinatorial search `assess_identification`
+        # runs (see `DEFAULT_MAX_ADJUSTMENT_CANDIDATES`), so paying for it
+        # twice on every identification_estimand gate approval was a real,
+        # avoidable cost, not just a style nit.
+        adjustment_sets = self.dag.minimum_adjustment_sets()
         result = asdict(self)
         result["identification"] = {
-            "identified_by_backdoor_adjustment": self.identified_by_backdoor_adjustment,
-            "minimum_adjustment_sets": self.dag.minimum_adjustment_sets(),
+            "identified_by_backdoor_adjustment": bool(adjustment_sets),
+            "minimum_adjustment_sets": adjustment_sets,
             "counterfactual_contrast": self.estimand.counterfactual_contrast,
         }
         return result

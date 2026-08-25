@@ -38,7 +38,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from causal.agents.dag_identification import review_dag
+from causal.agents.dag_identification import (
+    DEFAULT_MAX_ADJUSTMENT_CANDIDATES,
+    RECOMMENDED_MAX_CONFOUNDERS,
+    review_dag,
+)
 from causal.agents.dag_metrics import (
     max_structural_hamming_distance,
     max_structural_intervention_distance,
@@ -746,6 +750,22 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         border=True,
     )
     metric_cols[3].metric("Adjustment sets", len(identification.minimum_adjustment_sets), border=True)
+
+    adjustment_candidate_count = len(identification.dag.adjustment_candidate_ids())
+    if identification.confounder_count > RECOMMENDED_MAX_CONFOUNDERS:
+        st.warning(
+            f"{identification.confounder_count} confounders (recommended limit "
+            f"{RECOMMENDED_MAX_CONFOUNDERS}) — unlike other roles, confounders can never be "
+            "excluded from the backdoor search, and it gets combinatorially slower per "
+            "confounder. Past this point, checking identification can take well over a minute. "
+            "Consider whether every confounder here is actually load-bearing."
+        )
+    if adjustment_candidate_count >= DEFAULT_MAX_ADJUSTMENT_CANDIDATES:
+        st.error(
+            f"{adjustment_candidate_count}/{DEFAULT_MAX_ADJUSTMENT_CANDIDATES} adjustment "
+            "candidates — at the hard cap, the identification_estimand gate will refuse to "
+            "approve until a candidate is reclassified or rejected."
+        )
 
     with st.container(border=True):
         st.markdown("**Candidate causal DAG**")

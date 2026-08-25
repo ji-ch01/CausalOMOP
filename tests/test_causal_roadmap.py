@@ -87,6 +87,61 @@ class CausalRoadmapTests(unittest.TestCase):
         self.assertTrue(dag.assess_adjustment_set(("severity",)).valid)
         self.assertEqual(dag.minimum_adjustment_sets(), (("severity",),))
 
+    def test_isolated_prognostic_nodes_are_pruned_from_the_search(self):
+        # `troponin` etc. are `prognostic` (outcome_cause_only): a single
+        # fixed edge to `mortality` and nothing else, exactly like a
+        # literature-grounded covariate the DAG-drafting LLM proposes beyond
+        # the reviewer's first-pass list. None of them can sit on a backdoor
+        # path (no edge into `albumin` at all), so they must not count
+        # against `max_candidates` or be searched over.
+        isolated_prognostic = tuple(f"prognostic_{i}" for i in range(20))
+        dag = CausalDAG(
+            nodes=(
+                node("severity", "confounder"),
+                node("albumin", "exposure", "treatment"),
+                node("mortality", "outcome", "outcome"),
+                *(node(label, "prognostic") for label in isolated_prognostic),
+            ),
+            edges=(
+                edge("severity", "albumin"),
+                edge("severity", "mortality"),
+                edge("albumin", "mortality"),
+                *(edge(label, "mortality") for label in isolated_prognostic),
+            ),
+            exposure_id="albumin",
+            outcome_id="mortality",
+        )
+
+        # 21 adjustment-role nodes (1 confounder + 20 prognostic) would trip
+        # a max_candidates=16 guard if the isolated ones were not pruned.
+        self.assertEqual(dag.minimum_adjustment_sets(max_candidates=16), (("severity",),))
+
+    def test_prognostic_node_linked_into_the_confounder_network_is_not_pruned(self):
+        # Same `prognostic` role as above, but this one carries an extra
+        # edge into `severity` (the `covariate_relations` case) -- so it is
+        # no longer degree-one and must stay in the search rather than being
+        # silently assumed irrelevant.
+        dag = CausalDAG(
+            nodes=(
+                node("severity", "confounder"),
+                node("albumin", "exposure", "treatment"),
+                node("mortality", "outcome", "outcome"),
+                node("linked_prognostic", "prognostic"),
+            ),
+            edges=(
+                edge("severity", "albumin"),
+                edge("severity", "mortality"),
+                edge("albumin", "mortality"),
+                edge("linked_prognostic", "mortality"),
+                edge("linked_prognostic", "severity"),
+            ),
+            exposure_id="albumin",
+            outcome_id="mortality",
+        )
+
+        pruned = dag._isolated_non_confounder_candidates(("severity", "linked_prognostic"))
+        self.assertEqual(pruned, set())
+
     def test_rejects_adjustment_for_post_treatment_mediator(self):
         dag = CausalDAG(
             nodes=(

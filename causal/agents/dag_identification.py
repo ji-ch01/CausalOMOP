@@ -31,6 +31,7 @@ from typing import Any
 
 from causal.agents.hypothesis import DAGVariable, HypothesisArtifact
 from causal.roadmap import (
+    DEFAULT_MAX_ADJUSTMENT_CANDIDATES,
     CausalDAG,
     CausalEdge,
     CausalEstimand,
@@ -488,7 +489,31 @@ def build_study_specification(protocol: dict[str, Any], hypothesis: HypothesisAr
     )
 
 
-def assess_identification(hypothesis: HypothesisArtifact, max_candidates: int = 24) -> DAGIdentificationResult:
+# `DEFAULT_MAX_ADJUSTMENT_CANDIDATES` above is imported, not redefined here:
+# it is `CausalDAG.minimum_adjustment_sets`'s own default in `causal.roadmap`
+# (the actual source of truth), so every caller that omits `max_candidates`
+# -- including `CausalStudySpecification`, used when the
+# identification_estimand gate writes `study_specification.json` -- agrees
+# with this module's `assess_identification`/`review_dag` on what "too many
+# candidates" means. Two independent literal defaults here and there
+# previously let the gate reject a DAG that `assess_identification` reported
+# as already identified.
+
+#: Soft, UI-only guardrail on `confounder`-role variables specifically, not
+#: enforced by any gate. Unlike `prognostic`/`effect_modifier`/`other`
+#: candidates, a `confounder` always has edges to *both* exposure and
+#: outcome (see `_ROLE_MAP`) and so can never be pruned by
+#: `CausalDAG._isolated_non_confounder_candidates` -- confounder count is
+#: therefore what actually drives the combinatorial search's runtime.
+#: Empirically, 18 confounders (all individually necessary, i.e. the
+#: minimum valid adjustment set was the full set) took ~90s to verify;
+#: kept well below `DEFAULT_MAX_ADJUSTMENT_CANDIDATES` for headroom.
+RECOMMENDED_MAX_CONFOUNDERS = 15
+
+
+def assess_identification(
+    hypothesis: HypothesisArtifact, max_candidates: int = DEFAULT_MAX_ADJUSTMENT_CANDIDATES
+) -> DAGIdentificationResult:
     """Answer only the graph-theoretic question: does this DAG, as declared, identify the effect?
 
     Contains no clinical judgment: it does not know or care whether a first-
@@ -604,7 +629,9 @@ def assess_clinical_completeness(hypothesis: HypothesisArtifact) -> ClinicalVali
     return ClinicalValidationResult(blocking_issues=tuple(blocking), advisory_notes=tuple(advisory))
 
 
-def review_dag(hypothesis: HypothesisArtifact, max_candidates: int = 24) -> DAGReviewResult:
+def review_dag(
+    hypothesis: HypothesisArtifact, max_candidates: int = DEFAULT_MAX_ADJUSTMENT_CANDIDATES
+) -> DAGReviewResult:
     """Convenience entry point bundling the graph-theoretic, clinical, and descriptive-metric checks for review/UI use."""
     identification = assess_identification(hypothesis, max_candidates=max_candidates)
     evidence = evidence_summary(hypothesis)
