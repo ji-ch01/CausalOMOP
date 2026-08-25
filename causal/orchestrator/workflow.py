@@ -741,6 +741,7 @@ def _gather_assumptions(
     dataset_manifest: dict[str, Any],
     diagnostics: dict[str, Any],
     estimand_block: dict[str, Any],
+    cate: dict[str, Any] | None = None,
 ) -> list[str]:
     """Deduplicated assumptions/limitations for the causal report and the
     results narrative -- shared by `WorkflowManager.build_causal_report` and
@@ -764,12 +765,20 @@ def _gather_assumptions(
         assumptions.extend(artifact.get(key, ()) if artifact else ())
     assumptions.extend(estimand_block.get("warnings", ()) if estimand_block else ())
     assumptions = list(dict.fromkeys(assumptions))
+    if cate and cate.get("estimand"):
+        assumptions.append(
+            "CATE/effect-modification estimates are reported above for the prespecified "
+            "subgroup family only; the population ATE remains this study's primary estimand."
+        )
+    else:
+        assumptions.append(
+            "Out of scope (docs/causal_roadmap.md milestone #4): CATE/effect-modification "
+            "estimation -- this run's estimator reports the population ATE only."
+        )
     assumptions.append(
-        "Out of scope (docs/causal_roadmap.md milestone #4): CATE/effect-modification "
-        "estimation -- both implemented estimators (g-computation, TMLE) report the "
-        "population ATE only. Censoring-aware (IPCW) adjustment is implemented for "
-        "single-interval administrative censoring only, and only for the g-computation "
-        "estimator -- see the statistical estimand's censoring_strategy above."
+        "Censoring-aware (IPCW) adjustment is implemented for single-interval administrative "
+        "censoring only, and only for the g-computation estimator -- see the statistical "
+        "estimand's censoring_strategy above."
     )
     return assumptions
 
@@ -950,6 +959,8 @@ class WorkflowManager:
                 self._block_if_analysis_plan_incomplete(run_id)
             if gate == "statistical_estimand" and status == "approved":
                 self._write_statistical_estimand(run_id)
+            if gate == "results" and status == "approved":
+                self._block_if_results_incomplete(run_id)
             state.gates[gate].decide(status, reviewer, comment)  # type: ignore[arg-type]
             state.record("gate_decided", f"{gate}={status} by {reviewer}")
             if gate == "identification_estimand" and status == "approved":
@@ -1014,6 +1025,37 @@ class WorkflowManager:
             "Cannot approve the analysis_plan gate while the plan is incomplete "
             f"({'; '.join(details)})."
         )
+
+    def _block_if_results_incomplete(self, run_id: str) -> None:
+        """The `results` gate (roadmap stage 9: results review) is the
+        final, most consequential sign-off in the pipeline, but unlike every
+        gate before it, `REQUIRED_GATES` has no entry for the `execution` or
+        `diagnostics` phases -- `run_estimation` is an agent action a
+        reviewer triggers, not a human review decision with its own gate,
+        so nothing upstream forces it to have actually run before a run
+        reaches `results_review`. Without this check, `results` could be
+        approved -- a rubber stamp -- on a run that never fit a causal
+        effect at all: `build_causal_report` degrades gracefully when
+        `estimation.json` is absent (its `interpretation` section just says
+        so), but that is a report-rendering fallback, not a substitute for
+        this gate actually blocking -- the one rubber-stamp gap every other
+        gate in this file (`_block_if_target_trial_incomplete`,
+        `_block_if_major_confounders_unresolved`, `_block_if_not_identified`,
+        `_block_if_analysis_plan_incomplete`) was already written to close.
+
+        Deliberately does not also require `diagnostics.json`/
+        `sensitivity_analysis.json`/CATE/negative controls: those are
+        explicitly optional elsewhere in this module (`run_diagnostics` can
+        run before or after `run_estimation`, see its own docstring) --
+        widening this gate to require them would fight that existing design
+        for no real gain, since the actual risk this closes is a study
+        marked "approved" with no estimate at all.
+        """
+        if not (self.runs_dir / run_id / "estimation.json").is_file():
+            raise ValueError(
+                "Cannot approve the results gate: run_estimation has not been run for this "
+                "run (estimation.json is missing) -- there is no estimate to approve"
+            )
 
     def advance(self, run_id: str) -> RunState:
         run_dir = self.runs_dir / run_id
@@ -2051,6 +2093,87 @@ class WorkflowManager:
         except (ValueError, TypeError) as exc:
             raise ValueError(f"Cannot approve the target_trial gate: {exc}") from exc
 
+    def set_target_trial_estimand(
+        self,
+        run_id: str,
+        *,
+        primary_estimand: str,
+        secondary_estimands: tuple[str, ...] = (),
+        reviewer: str,
+        comment: str,
+    ) -> RunState:
+        """Let a reviewer directly correct `target_trial.primary_estimand`/
+        `secondary_estimands` in place, for when the LLM draft got the
+        estimand wrong and the reviewer already knows the fix -- an
+        alternative to `_render_target_trial_regenerate`'s LLM round-trip
+        (streamlit_app.py), which is slower and, being a fresh LLM call, not
+        guaranteed to land on the same correction twice.
+
+        Scoped to just these two fields, not the full `target_trial` object:
+        population/treatment/comparator/outcome free text also seeds
+        `literature_search` terms and `first_pass_covariates` (see
+        `causal.agents.user_question.UserQuestionHypothesisService.generate`),
+        so hand-editing those here would silently desynchronize
+        already-generated downstream artifacts in a way the estimand fields,
+        which nothing else derives from at this stage, do not.
+
+        `primary_estimand` is restricted to `{"ATE", "ATT", "CATE"}` --
+        looser at the LLM-drafting stage (`REQUIRED_TARGET_TRIAL_FIELDS` only
+        checks non-empty), but this is exactly the set `roadmap.
+        CausalEstimand.__post_init__` requires later at the
+        `identification_estimand` gate, so accepting anything looser here
+        would just defer the same rejection.
+
+        Only allowed while `target_trial` is not yet `approved`: once
+        approved, `dag_review` and later stages may already be under way, and
+        retroactively changing the estimand would need a wider invalidation
+        cascade than the single-gate reset `_invalidate_gate` does here
+        (regenerate a new run instead, or reject the gate first).
+        """
+        if primary_estimand not in {"ATE", "ATT", "CATE"}:
+            raise ValueError("primary_estimand must be one of ATE, ATT, CATE")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if not comment.strip():
+            raise ValueError("comment is required to record why this was corrected")
+        secondary_estimands = tuple(str(item).strip() for item in secondary_estimands if str(item).strip())
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+        if state.gates["target_trial"].status == "approved":
+            raise ValueError(
+                "Cannot manually edit the estimand after the target_trial gate is approved -- "
+                "reject it first, or regenerate a new run."
+            )
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            target = protocol.get("target_trial")
+            if not isinstance(target, dict):
+                raise ValueError("Cannot correct the estimand: protocol.json has no target_trial object")
+            before = {
+                "primary_estimand": target.get("primary_estimand"),
+                "secondary_estimands": target.get("secondary_estimands"),
+            }
+            target["primary_estimand"] = primary_estimand
+            target["secondary_estimands"] = list(secondary_estimands)
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+        state.record(
+            "target_trial_estimand_corrected",
+            f"primary_estimand set to {primary_estimand} by {reviewer}: {comment.strip()}",
+            changes={
+                "before": before,
+                "after": {"primary_estimand": primary_estimand, "secondary_estimands": list(secondary_estimands)},
+            },
+        )
+        self._invalidate_gate(state, "target_trial", f"estimand manually corrected by {reviewer}")
+        self.save(state)
+        return state
+
     def _block_if_major_confounders_unresolved(self, run_id: str) -> None:
         """The `dag_review` gate (roadmap stage 2: causal DAG and clinical
         completeness) cannot be approved while a major confounder is still
@@ -2248,8 +2371,20 @@ class WorkflowManager:
         concept_lookup: OMCPClient | None = None,
     ) -> RunState:
         state = self.load(run_id)
-        if state.phase not in {"concept_mapping", "feasibility", "analysis_plan"}:
-            raise RuntimeError("Data Science Agent requires concept_mapping, feasibility, or analysis_plan phase")
+        # Same rationale as `build_cohort_plan`/`run_cate` etc.: regenerating
+        # analysis_plan.json never needs OMCP and is derived purely from
+        # hypothesis.json/protocol.json (see this method's own docstring),
+        # so it must stay callable to pick up a post-hoc covariate reject/
+        # remap even after `advance()` has moved the phase well past
+        # analysis_plan.
+        if state.phase not in {
+            "concept_mapping", "feasibility", "analysis_plan",
+            "estimand_review", "execution", "diagnostics", "results_review", "report",
+        }:
+            raise RuntimeError(
+                "Data Science Agent requires concept_mapping, feasibility, analysis_plan, "
+                "estimand_review, execution, diagnostics, results_review, or report phase"
+            )
         run_dir = self.runs_dir / run_id
         hypothesis_path = run_dir / "hypothesis.json"
         if not hypothesis_path.is_file():
@@ -2344,10 +2479,18 @@ class WorkflowManager:
         run_dir = self.runs_dir / run_id
         with _RunLock(run_dir):
             state = self.load(run_id)
-            if state.phase not in {"feasibility", "analysis_plan", "estimand_review", "execution"}:
+            # Same rationale as `run_cate`/`materialize_analytic_dataset`/
+            # `run_estimation`: a pure policy re-check over already-loaded
+            # JSON, not phase-specific state, so it must stay callable after
+            # `advance()` moves the phase past `execution` without an
+            # estimate ever having been computed.
+            if state.phase not in {
+                "feasibility", "analysis_plan", "estimand_review",
+                "execution", "diagnostics", "results_review", "report",
+            }:
                 raise RuntimeError(
-                    "Execution readiness requires feasibility, analysis_plan, estimand_review, or "
-                    "execution phase"
+                    "Execution readiness requires feasibility, analysis_plan, estimand_review, "
+                    "execution, diagnostics, results_review, or report phase"
                 )
             plan_path = run_dir / "analysis_plan.json"
             if not plan_path.is_file():
@@ -2398,7 +2541,13 @@ class WorkflowManager:
     ) -> RunState:
         """Write cohort SQL and its governance manifest without executing it."""
         state = self.load(run_id)
-        if state.phase not in {"analysis_plan", "estimand_review", "execution"}:
+        # Same rationale as `run_cate` etc.: purely re-derived from protocol/
+        # analysis_plan.json, so must stay callable to rebuild cohort.sql
+        # after a covariate is rejected/remapped post-hoc (a real, common
+        # need) even once `advance()` has moved the phase past execution.
+        if state.phase not in {
+            "analysis_plan", "estimand_review", "execution", "diagnostics", "results_review", "report",
+        }:
             raise RuntimeError("Cohort planning requires analysis_plan, estimand_review, or execution phase")
         run_dir = self.runs_dir / run_id
         self.run_execution_readiness(run_id)
@@ -2482,8 +2631,16 @@ class WorkflowManager:
         OMCP's signed path.
         """
         state = self.load(run_id)
-        if state.phase != "execution":
-            raise RuntimeError("Dataset materialization requires the execution phase")
+        # See `run_cate`'s identical comment: `advance()` can move the phase
+        # past `execution`/`diagnostics` without ever having called this
+        # method (nothing gates "advance" on an estimate actually existing),
+        # which would otherwise permanently strand a run that got advanced
+        # ahead of itself -- phases only move forward, never back.
+        if state.phase not in {"execution", "diagnostics", "results_review", "report"}:
+            raise RuntimeError(
+                "Dataset materialization requires the execution, diagnostics, results_review, "
+                "or report phase"
+            )
         run_dir = self.runs_dir / run_id
         cohort_sql_path = run_dir / "cohort.sql"
         manifest_path = run_dir / "cohort_manifest.json"
@@ -2555,8 +2712,14 @@ class WorkflowManager:
         not a second, independently-computed list that could drift from it.
         """
         state = self.load(run_id)
-        if state.phase not in {"execution", "diagnostics"}:
-            raise RuntimeError("Estimation requires the execution or diagnostics phase")
+        # See `run_cate`'s identical comment: re-derived entirely from
+        # already-materialized files, so it must stay callable even after
+        # `advance()` has moved the phase past diagnostics without an
+        # estimate ever having been computed.
+        if state.phase not in {"execution", "diagnostics", "results_review", "report"}:
+            raise RuntimeError(
+                "Estimation requires the execution, diagnostics, results_review, or report phase"
+            )
         run_dir = self.runs_dir / run_id
         dataset_path = run_dir / "analytic_dataset.parquet"
         manifest_path = run_dir / "cohort_manifest.json"
@@ -2614,8 +2777,14 @@ class WorkflowManager:
         -- only `materialize_analytic_dataset` is a prerequisite.
         """
         state = self.load(run_id)
-        if state.phase not in {"execution", "diagnostics"}:
-            raise RuntimeError("Diagnostics requires the execution or diagnostics phase")
+        # Same rationale as `run_cate`: re-derived entirely from the
+        # materialized dataset, callable "before or after run_estimation"
+        # per this method's own docstring -- must stay callable after
+        # `advance()` moves the phase past diagnostics too.
+        if state.phase not in {"execution", "diagnostics", "results_review", "report"}:
+            raise RuntimeError(
+                "Diagnostics requires the execution, diagnostics, results_review, or report phase"
+            )
         run_dir = self.runs_dir / run_id
         dataset_path = run_dir / "analytic_dataset.parquet"
         manifest_path = run_dir / "cohort_manifest.json"
@@ -2665,8 +2834,15 @@ class WorkflowManager:
         `run_diagnostics`.
         """
         state = self.load(run_id)
-        if state.phase not in {"execution", "diagnostics"}:
-            raise RuntimeError("Sensitivity analysis requires the execution or diagnostics phase")
+        # Same rationale as `run_cate`/`run_diagnostics`: re-derived from an
+        # already-computed estimation.json, "callable any time after
+        # run_estimation" per this method's own docstring -- must stay
+        # callable after `advance()` moves the phase past diagnostics too.
+        if state.phase not in {"execution", "diagnostics", "results_review", "report"}:
+            raise RuntimeError(
+                "Sensitivity analysis requires the execution, diagnostics, results_review, or "
+                "report phase"
+            )
         run_dir = self.runs_dir / run_id
         estimation_path = run_dir / "estimation.json"
         if not estimation_path.is_file():
@@ -2680,10 +2856,24 @@ class WorkflowManager:
             )
         except ValueError as exc:
             raise RuntimeError(f"Cannot compute a sensitivity analysis: {exc}") from exc
+        artifact = {
+            "metadata": artifact_metadata(
+                "sensitivity_agent", "0.1.0",
+                {
+                    "study_id": state.study_id,
+                    "risk_ratio_point_estimate": estimand["risk_ratio_point_estimate"],
+                    "risk_ratio_ci_lower": estimand["risk_ratio_ci_lower"],
+                    "risk_ratio_ci_upper": estimand["risk_ratio_ci_upper"],
+                },
+            ),
+            "schema_version": "1.0",
+            "study_id": state.study_id,
+            **result.to_dict(),
+        }
         with _RunLock(run_dir):
             state = self.load(run_id)
             (run_dir / "sensitivity_analysis.json").write_text(
-                json.dumps(result.to_dict(), indent=2), encoding="utf-8"
+                json.dumps(artifact, indent=2), encoding="utf-8"
             )
             if "sensitivity_analysis.json" not in state.artifacts:
                 state.artifacts.append("sensitivity_analysis.json")
@@ -2731,8 +2921,20 @@ class WorkflowManager:
         surfaces, never something that blocks or changes any gate decision.
         """
         state = self.load(run_id)
-        if state.phase != "execution":
-            raise RuntimeError("Negative control estimation requires the execution phase")
+        # Same rationale as `materialize_analytic_dataset` (the other method
+        # here that also executes a fresh OMCP/BigQuery call rather than
+        # just re-reading already-materialized files): `advance()` can move
+        # the phase past `execution` without this ever having been called
+        # for a given `control_id`, which would otherwise permanently stop
+        # a reviewer from running a negative control they approved late, or
+        # re-running one after the primary estimate is already in
+        # `results_review`/`report`. A diagnostic side-analysis, not a
+        # phase-specific action -- see this method's own docstring.
+        if state.phase not in {"execution", "diagnostics", "results_review", "report"}:
+            raise RuntimeError(
+                "Negative control estimation requires the execution, diagnostics, "
+                "results_review, or report phase"
+            )
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
         protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
@@ -2873,9 +3075,10 @@ class WorkflowManager:
         diagnostics = self._read_optional_json(run_dir / "diagnostics.json")
         readiness = self._read_optional_json(run_dir / "execution_readiness.json")
         cohort_manifest = self._read_optional_json(run_dir / "cohort_manifest.json")
+        cate = self._read_optional_json(run_dir / "cate.json")
         assumptions = _gather_assumptions(
             study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics,
-            estimation.get("estimand", {}),
+            estimation.get("estimand", {}), cate,
         )
         narrative_input = NarrativeInput(
             study_id=state.study_id,
@@ -3752,7 +3955,8 @@ class WorkflowManager:
                     )
 
         assumptions = _gather_assumptions(
-            study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics, estimand_block
+            study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics, estimand_block,
+            cate,
         )
         lines.extend(["", "## Assumptions and limitations", ""])
         lines.extend(f"- {item}" for item in assumptions)
@@ -3804,7 +4008,7 @@ class WorkflowManager:
         for name in (
             "hypothesis.json", "study_specification.json", "statistical_estimand.json",
             "cohort_manifest.json", "dataset_manifest.json", "estimation.json", "diagnostics.json",
-            "results_narrative.json",
+            "sensitivity_analysis.json", "cate.json", "results_narrative.json",
         ):
             payload = self._read_optional_json(run_dir / name)
             metadata = payload.get("metadata") if payload else None
@@ -3813,6 +4017,14 @@ class WorkflowManager:
             lines.append(
                 f"| {name} | {metadata.get('agent_name', '-')} | {metadata.get('agent_version', '-')} | "
                 f"{metadata.get('generated_at_utc', '-')} |"
+            )
+        for control_id, payload in negative_control_results:
+            metadata = payload.get("metadata") if payload else None
+            if not metadata:
+                continue
+            lines.append(
+                f"| negative_control_estimation_{control_id}.json | {metadata.get('agent_name', '-')} | "
+                f"{metadata.get('agent_version', '-')} | {metadata.get('generated_at_utc', '-')} |"
             )
 
         if estimand_block:
@@ -4188,8 +4400,18 @@ class WorkflowManager:
         from causal.agents.cate import CATEAgent
 
         state = self.load(run_id)
-        if state.phase not in {"execution", "diagnostics"}:
-            raise RuntimeError("CATE estimation requires the execution or diagnostics phase")
+        # Matches `causal.ui.streamlit_app`'s `results_reviewable` -- CATE is
+        # an optional, supplementary analysis (re-derived entirely from
+        # already-materialized files, not from phase-specific state), so it
+        # must stay callable after the primary estimate/report finishes and
+        # advances the phase past diagnostics, not just during
+        # execution/diagnostics. A narrower set here previously let the "Run
+        # CATE analysis" button render enabled (per `results_reviewable`)
+        # in a phase where this call would unconditionally reject it.
+        if state.phase not in {"execution", "diagnostics", "results_review", "report"}:
+            raise RuntimeError(
+                "CATE estimation requires the execution, diagnostics, results_review, or report phase"
+            )
         run_dir = self.runs_dir / run_id
         dataset_path = run_dir / "analytic_dataset.parquet"
         manifest_path = run_dir / "cohort_manifest.json"

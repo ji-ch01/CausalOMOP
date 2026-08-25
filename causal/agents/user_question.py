@@ -293,14 +293,32 @@ class UserQuestionHypothesisService:
         self.dag_prompt_path = Path(dag_prompt_path)
         self.dag_critique_prompt_path = Path(dag_critique_prompt_path)
 
-    def build_prompt(self, question: str) -> str:
+    def build_prompt(self, question: str, reviewer_feedback: str | None = None) -> str:
         question = question.strip()
         if not question:
             raise ValueError("User question is required")
         template = self.prompt_path.read_text(encoding="utf-8")
         if "{{USER_QUESTION}}" not in template:
             raise ValueError("Hypothesis prompt is missing {{USER_QUESTION}}")
-        return template.replace("{{USER_QUESTION}}", question)
+        prompt = template.replace("{{USER_QUESTION}}", question)
+        reviewer_feedback = (reviewer_feedback or "").strip()
+        if reviewer_feedback:
+            # Appended after the template, not folded into {{USER_QUESTION}}:
+            # `parse_response` validates `source_question` against `question`
+            # alone (see `generate`), and a prior version of this regenerate
+            # flow smashed the feedback into the same string the LLM was told
+            # to "preserve...in source_question" -- the LLM correctly treated
+            # the feedback as not part of the question and dropped it, which
+            # made the exact-match check fail on every retry, not just
+            # occasionally.
+            prompt += (
+                "\n\nA previous draft of this protocol was rejected by a human reviewer. "
+                "Revise target_trial (and any other field) to address the feedback below, but "
+                "still preserve the USER QUESTION above verbatim in source_question -- this "
+                "feedback is reviewer guidance, not part of the question itself.\n\n"
+                f"REVIEWER FEEDBACK ON THE PREVIOUS DRAFT:\n{reviewer_feedback}"
+            )
+        return prompt
 
     def generate(
         self,
@@ -313,12 +331,13 @@ class UserQuestionHypothesisService:
         enable_critique: bool = True,
         max_critique_rounds: int = _MAX_CRITIQUE_ROUNDS,
         tournament_size: int = 1,
+        reviewer_feedback: str | None = None,
     ) -> GeneratedHypothesis:
         if max_critique_rounds < 1:
             raise ValueError("max_critique_rounds must be at least 1")
         if not 1 <= tournament_size <= MAX_TOURNAMENT_SIZE:
             raise ValueError(f"tournament_size must be between 1 and {MAX_TOURNAMENT_SIZE}")
-        raw = llm(self.build_prompt(question))
+        raw = llm(self.build_prompt(question, reviewer_feedback))
         first_output = LLMRawOutput("target_trial_draft", raw)
         llm_outputs = [first_output]
         if on_llm_output is not None:

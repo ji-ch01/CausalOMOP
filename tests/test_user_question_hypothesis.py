@@ -260,6 +260,39 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.parse_response(QUESTION, json.dumps(response))
 
+    def test_build_prompt_appends_reviewer_feedback_without_touching_user_question(self):
+        prompt = self.service.build_prompt(QUESTION, reviewer_feedback="Use ATE, not CATE.")
+        self.assertIn(QUESTION, prompt)
+        self.assertIn("Use ATE, not CATE.", prompt)
+        self.assertIn("REVIEWER FEEDBACK ON THE PREVIOUS DRAFT:", prompt)
+        # blank/whitespace-only feedback must not add an empty section
+        self.assertEqual(self.service.build_prompt(QUESTION), self.service.build_prompt(QUESTION, ""))
+
+    def test_generate_with_reviewer_feedback_validates_against_original_question_only(self):
+        """Regression test: a prior version folded the reviewer's comment into the
+        same string the LLM was told to preserve verbatim in `source_question`,
+        so an LLM that (correctly) echoed back only the clinical question --
+        not the appended "Reviewer feedback on the previous draft: ..." text --
+        failed `parse_response`'s exact-match check on every regeneration
+        attempt. `source_question` must still equal the plain original question,
+        not a string containing the feedback.
+        """
+        response = valid_response()
+        response["target_trial"]["primary_estimand"] = "ATE"
+
+        def llm(prompt: str) -> str:
+            self.assertIn("Use ATE, not CATE: no effect-modifier subgroups are prespecified.", prompt)
+            return json.dumps(response)
+
+        result = self.service.generate(
+            QUESTION,
+            llm,
+            data_source="project.dataset",
+            reviewer_feedback="Use ATE, not CATE: no effect-modifier subgroups are prespecified.",
+        )
+        self.assertEqual(result.protocol["source_question"], QUESTION)
+        self.assertEqual(result.hypothesis.primary_estimand, "ATE")
+
     def test_normalizes_mixed_case_study_id_instead_of_rejecting(self):
         response = valid_response()
         response["study_id"] = "Sepsis_ICU_Albumin_vs_Crystalloid_Mortality"

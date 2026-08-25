@@ -339,8 +339,14 @@ _REVIEWER_FIELD_KEY_PREFIXES = (
     "covariate_window_reviewer_",
     "covariate_aggregation_reviewer_",
     "covariate_map_reviewer_",
+    "covariate_reject_reviewer_",
+    "statistical_estimand_reviewer_",
+    "estimand_fix_reviewer_",
     "add_pop_reviewer_",
     "remove_pop_reviewer_",
+    "censoring_definition_reviewer_",
+    "narrative_reviewer_",
+    "negative_control_reviewer_",
 )
 
 
@@ -541,6 +547,103 @@ def _render_phase_tracker(state: RunState) -> None:
         st.caption("A locked step may require an approval decision before the workflow can continue.")
 
 
+def _render_study_summary(state: RunState, run_dir: Path) -> None:
+    """Research-facing overview of the study's question, evidence, and review state.
+
+    This is intentionally read-only: it orients a reviewer before they enter
+    the detailed workspaces that own each workflow decision.
+    """
+    protocol = _read_json(run_dir / "protocol.json") or {}
+    target_trial = protocol.get("target_trial") or {}
+    estimation = _read_json(run_dir / "estimation.json") or {}
+    diagnostics = _read_json(run_dir / "diagnostics.json") or {}
+    sensitivity = _read_json(run_dir / "sensitivity_analysis.json") or {}
+    cate = _read_json(run_dir / "cate.json") or {}
+    narrative_raw = _read_json(run_dir / "results_narrative.json")
+    narrative = normalize_narrative_artifact(narrative_raw) if narrative_raw else None
+    report_ready = (run_dir / "causal_report.md").is_file()
+    rejected_gates = [name for name, gate in state.gates.items() if gate.status == "rejected"]
+    flagged_balance = sum(1 for entry in diagnostics.get("balance", ()) if entry.get("flagged"))
+
+    st.subheader("Study summary")
+    st.caption(
+        "A read-only overview of the scientific question, reviewed design, available evidence, and next decision."
+    )
+
+    if report_ready:
+        st.success("Report ready for audit.", icon=":material/verified:")
+    elif rejected_gates:
+        rejected_titles = ", ".join(_GATE_INFO.get(name, {}).get("title", name) for name in rejected_gates)
+        st.warning(f"Review blocked: {rejected_titles} require resolution.", icon=":material/warning:")
+    elif not estimation:
+        st.info("Evidence incomplete: a primary causal estimate is not available yet.", icon=":material/pending:")
+    elif flagged_balance:
+        st.warning(
+            f"Results require diagnostic review: {flagged_balance} covariate(s) exceed the SMD review threshold.",
+            icon=":material/warning:",
+        )
+    else:
+        st.info("Ready for results review. Confirm the interpretation and complete the final review gate.", icon=":material/rate_review:")
+
+    with st.container(border=True):
+        st.markdown("**Clinical question**")
+        st.write(_source_question(run_dir) or "No clinical question is recorded for this study.")
+
+    design_col, evidence_col = st.columns(2)
+    with design_col:
+        with st.container(border=True):
+            st.markdown("**Reviewed study design**")
+            if target_trial:
+                st.markdown(f"**Population**  \n{target_trial.get('population', '—')}")
+                st.markdown(f"**Treatment**  \n{target_trial.get('treatment', '—')}")
+                st.markdown(f"**Comparator**  \n{target_trial.get('comparator', '—')}")
+                st.markdown(f"**Outcome**  \n{target_trial.get('outcome', '—')}")
+                st.markdown(f"**Estimand**  \n{target_trial.get('effect_measure', '—')}")
+            else:
+                st.caption("The target-trial specification has not been generated yet.")
+    with evidence_col:
+        with st.container(border=True):
+            st.markdown("**Primary evidence**")
+            estimand = estimation.get("estimand") or {}
+            if estimand:
+                st.metric(
+                    _humanize(estimand.get("effect_measure")),
+                    f"{estimand.get('point_estimate', 0):.4f}",
+                )
+                st.caption(
+                    f"{int(estimand.get('ci_level', 0.95) * 100)}% CI: "
+                    f"[{estimand.get('ci_lower', 0):.4f}, {estimand.get('ci_upper', 0):.4f}] "
+                    f"· N = {estimand.get('n_total', '—')}"
+                )
+                st.caption(estimand.get("method", ""))
+            else:
+                st.caption("No primary causal estimate is available yet.")
+
+    st.markdown("**Evidence and review status**")
+    with st.container(horizontal=True):
+        st.metric("Approved gates", f"{sum(g.status == 'approved' for g in state.gates.values())} / {len(state.gates)}", border=True)
+        st.metric("Balance flags", flagged_balance if diagnostics else "Not run", border=True)
+        st.metric("Sensitivity", "Complete" if sensitivity else "Not run", border=True)
+        st.metric("LLM interpretation", (narrative or {}).get("review_status", "Not generated").replace("_", " ").capitalize(), border=True)
+        st.metric("CATE", "Complete" if cate else "Not run", border=True)
+
+    with st.expander("Scientific context and audit trail", icon=":material/fact_check:"):
+        if sensitivity:
+            st.markdown(
+                f"**Sensitivity analysis**  \nE-value (point estimate): "
+                f"{sensitivity.get('e_value_point', '—')} · E-value (CI limit): {sensitivity.get('e_value_ci', '—')}"
+            )
+        if cate:
+            cate_estimand = cate.get("estimand") or {}
+            st.markdown(
+                f"**Prespecified subgroup analysis**  \n{cate_estimand.get('n_prespecified_subgroups_tested', 0)} "
+                "prespecified subgroup(s) tested."
+            )
+        st.markdown("**Next step**")
+        st.write(_next_action_text(state))
+        st.caption("Use the detailed workspaces to inspect assumptions, approve decisions, and download audit artifacts.")
+
+
 def _render_target_trial_summary(run_dir: Path) -> None:
     """Read-only view of `protocol["target_trial"]` -- what the `target_trial`
     gate actually approves (see `WorkflowManager._block_if_target_trial_
@@ -553,7 +656,7 @@ def _render_target_trial_summary(run_dir: Path) -> None:
     protocol = _read_json(run_dir / "protocol.json")
     target = (protocol or {}).get("target_trial")
     if not isinstance(target, dict):
-        st.info("No target_trial object in protocol.json yet.")
+        st.caption("No target_trial object in protocol.json yet.")
         return
     with st.expander("Target trial & estimand (target_trial gate content)", expanded=False):
         col1, col2 = st.columns(2)
@@ -746,7 +849,204 @@ def _render_statistical_estimand_review(manager: WorkflowManager, state: RunStat
                     st.error(str(exc))
 
 
-def _render_gate_card(manager: WorkflowManager, state: RunState, gate_name: str) -> None:
+def _render_target_trial_regenerate(manager: WorkflowManager, state: RunState) -> None:
+    """Turn a rejected first gate into a new draft instead of a dead end.
+
+    `protocol.json` already stores `source_question` (validated at generation
+    time, see `UserQuestionHypothesisService.parse_response`), so the original
+    question can be recovered without asking the reviewer to retype it. This
+    mirrors `_render_new_question_section`'s own generate -> start_generated
+    call exactly; `start_generated` always creates a fresh run directory (no
+    in-place protocol editor exists), so regenerating produces a new, separate
+    run rather than mutating the rejected one.
+
+    The reviewer's comment is passed to `generate` as `reviewer_feedback`, kept
+    out of the `question` string itself -- an earlier version concatenated it
+    into one string and asked the LLM to echo the whole thing back verbatim in
+    `source_question`, which failed the exact-match check in `parse_response`
+    almost every time: the LLM (correctly, per the prompt's own wording)
+    treated "Reviewer feedback on the previous draft: ..." as guidance, not
+    part of the question, and dropped it when asked to preserve "the original
+    question".
+    """
+    protocol = _read_json(Path(state.protocol_path)) or {}
+    source_question = protocol.get("source_question")
+    gate = state.gates["target_trial"]
+    if not source_question or not gate.comment:
+        return
+    st.space("small")
+    if st.button(
+        "Regenerate with this feedback",
+        icon=":material/autorenew:",
+        key=f"regenerate_target_trial_{state.run_id}",
+    ):
+        status = st.status(
+            "Regenerating the target-trial draft with reviewer feedback...", expanded=True
+        )
+        try:
+            resolved_llm = build_hypothesis_llm()
+            status.write(f"Using provider `{resolved_llm.provider}:{resolved_llm.model}`.")
+            literature = LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
+            generated = UserQuestionHypothesisService().generate(
+                source_question,
+                resolved_llm.call,
+                data_source=BigQueryDatasets.from_env().describe(),
+                literature=literature,
+                on_llm_output=lambda output: status.write(f"Received `{output.stage}` from the LLM."),
+                reviewer_feedback=gate.comment,
+            )
+            new_state = manager.start_generated(
+                generated, state.mode, f"{resolved_llm.provider}:{resolved_llm.model}"
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            status.update(label="Regeneration failed", state="error")
+            st.error(str(exc))
+            return
+        status.update(label=f"Created run {new_state.run_id}", state="complete")
+        st.session_state["_pending_run_selection"] = new_state.run_id
+        st.rerun()
+    st.caption(
+        "Drafts a new run from the original question plus your comment above. "
+        "This rejected run is kept as-is for reference."
+    )
+
+
+_ESTIMAND_CHOICES = ("ATE", "ATT", "CATE")
+
+
+def _render_target_trial_manual_estimand_fix(manager: WorkflowManager, state: RunState) -> None:
+    """Directly correct `target_trial.primary_estimand`/`secondary_estimands`
+    on the current (rejected) run, for when the reviewer already knows the
+    right answer and does not need another LLM round-trip (see
+    `WorkflowManager.set_target_trial_estimand`).
+
+    Scoped to just the estimand fields, not the full `target_trial` object:
+    population/treatment/comparator/outcome also seed literature search terms
+    and `first_pass_covariates` (see `UserQuestionHypothesisService.generate`),
+    so hand-editing those in place would silently desynchronize
+    already-generated downstream artifacts in a way the estimand fields do
+    not.
+    """
+    protocol = _read_json(Path(state.protocol_path)) or {}
+    target = protocol.get("target_trial")
+    if not isinstance(target, dict):
+        return
+    run_id = state.run_id
+    with st.expander("Or manually correct the estimand", expanded=False):
+        st.caption(
+            "Directly overrides target_trial.primary_estimand/secondary_estimands on this run "
+            "instead of asking the LLM to redraft -- use this when you already know the fix."
+        )
+        with st.form(key=f"target_trial_estimand_fix_{run_id}"):
+            current_primary = target.get("primary_estimand")
+            primary_estimand = st.selectbox(
+                "Primary estimand",
+                _ESTIMAND_CHOICES,
+                index=(
+                    _ESTIMAND_CHOICES.index(current_primary)
+                    if current_primary in _ESTIMAND_CHOICES else 0
+                ),
+                key=f"primary_estimand_fix_{run_id}",
+            )
+            secondary_text = st.text_input(
+                "Secondary estimands (comma-separated, e.g. \"ATT, CATE by age_group\")",
+                value=", ".join(str(item) for item in target.get("secondary_estimands", ())),
+                key=f"secondary_estimands_fix_{run_id}",
+            )
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"estimand_fix_reviewer_{run_id}"
+            )
+            comment = st.text_area(
+                "Reason for the correction (required)", key=f"estimand_fix_comment_{run_id}"
+            )
+            if st.form_submit_button("Save estimand correction"):
+                secondary_estimands = tuple(
+                    item.strip() for item in secondary_text.split(",") if item.strip()
+                )
+                try:
+                    manager.set_target_trial_estimand(
+                        run_id,
+                        primary_estimand=primary_estimand,
+                        secondary_estimands=secondary_estimands,
+                        reviewer=reviewer,
+                        comment=comment,
+                    )
+                    st.success("Estimand corrected -- re-review and approve the gate below.")
+                    st.rerun()
+                except (ValueError, RuntimeError) as exc:
+                    st.error(str(exc))
+
+
+def _render_gate_readiness_hint(gate_name: str, run_dir: Path) -> None:
+    """Best-effort, read-only "is this actually ready to approve?" summary
+    shown inline on a gate card, so a reviewer does not have to visit another
+    tab to find out. Reuses data other tabs already compute (no new checks);
+    silently shows nothing on any missing/unreadable artifact -- this is
+    advisory context, not a second source of truth for what the gate itself
+    enforces (`WorkflowManager.decide_gate`/`_block_if_*` remain authoritative).
+    identification_estimand and statistical_estimand already get an
+    equivalent inline summary elsewhere in `_render_gates_tab`, so they are
+    not handled here.
+    """
+    try:
+        if gate_name == "dag_review":
+            hypothesis = _read_json(run_dir / "hypothesis.json")
+            if hypothesis is None:
+                return
+            clinical = review_dag(_hypothesis_artifact_from_dict(hypothesis)).clinical
+            if clinical.approved_for_dag_gate:
+                st.success("Clinical review has no blocking issues.", icon=":material/check_circle:")
+            else:
+                st.warning(
+                    f"{len(clinical.blocking_issues)} blocking issue(s) remain (see Study design).",
+                    icon=":material/warning:",
+                )
+        elif gate_name == "clinical_mapping":
+            protocol = _read_json(run_dir / "protocol.json") or {}
+            concept_sets = protocol.get("concept_sets") or {}
+            unmapped = [
+                name for name, definition in concept_sets.items()
+                if isinstance(definition, dict) and definition.get("status") != "approved"
+            ]
+            if concept_sets:
+                if unmapped:
+                    st.warning(
+                        f"Not yet approved: {', '.join(unmapped)} (see Mapping & plan).",
+                        icon=":material/warning:",
+                    )
+                else:
+                    st.success("All concept sets are approved.", icon=":material/check_circle:")
+        elif gate_name == "analysis_plan":
+            plan = _read_json(run_dir / "analysis_plan.json")
+            if plan is None:
+                st.warning("No analysis_plan.json yet (see Mapping & plan).", icon=":material/warning:")
+            else:
+                pending = [
+                    c.get("name") for c in plan.get("covariates", ())
+                    if c.get("status") == "definition_pending"
+                ]
+                if pending:
+                    st.warning(
+                        f"{len(pending)} covariate(s) still pending mapping/aggregation: "
+                        f"{', '.join(pending)} (see Mapping & plan).",
+                        icon=":material/warning:",
+                    )
+                else:
+                    st.success("Analysis plan exists with no pending covariates.", icon=":material/check_circle:")
+        elif gate_name == "results":
+            if (run_dir / "estimation.json").is_file():
+                st.success("A causal effect estimate has been computed.", icon=":material/check_circle:")
+            else:
+                st.warning(
+                    "No estimation.json yet -- approving is blocked until run_estimation has "
+                    "run (see Estimation & report).",
+                    icon=":material/warning:",
+                )
+    except (KeyError, ValueError):
+        pass
+
+
+def _render_gate_card(manager: WorkflowManager, state: RunState, gate_name: str, run_dir: Path) -> None:
     gate = state.gates[gate_name]
     info = _GATE_INFO.get(gate_name, {"title": gate_name, "phase": "—", "description": ""})
     with st.container(border=True):
@@ -755,11 +1055,21 @@ def _render_gate_card(manager: WorkflowManager, state: RunState, gate_name: str)
         badge_col.markdown(_badge(gate.status), unsafe_allow_html=True)
         phase_label = _PHASE_LABELS.get(info["phase"], info["phase"])
         st.caption(f"Gates leaving the {phase_label} phase. {info['description']}")
+        _render_gate_readiness_hint(gate_name, run_dir)
         if gate.reviewer:
             st.caption(
                 f"Last decision by {html.escape(gate.reviewer)} at {gate.decided_at}"
                 + (f" — {html.escape(gate.comment)}" if gate.comment else "")
             )
+        if gate.status == "rejected":
+            if gate_name == "target_trial":
+                _render_target_trial_regenerate(manager, state)
+                _render_target_trial_manual_estimand_fix(manager, state)
+            else:
+                st.caption(
+                    "Rejected -- this blocks advancing until the underlying artifact is "
+                    "corrected and resubmitted for approval."
+                )
         with st.form(key=f"gate_form_{state.run_id}_{gate_name}"):
             reviewer = st.text_input(
                 "Reviewer", value=_reviewer_default(), key=f"reviewer_{state.run_id}_{gate_name}"
@@ -804,7 +1114,7 @@ def _render_gates_tab(manager: WorkflowManager, state: RunState, run_dir: Path) 
     else:
         if current_gate_name == "statistical_estimand":
             _render_statistical_estimand_review(manager, state, run_dir)
-        _render_gate_card(manager, state, current_gate_name)
+        _render_gate_card(manager, state, current_gate_name, run_dir)
         current_gate = state.gates[current_gate_name]
         may_advance = current_gate.status == "approved" or (
             current_gate_name == "clinical_mapping"
@@ -849,13 +1159,13 @@ def _render_gates_tab(manager: WorkflowManager, state: RunState, run_dir: Path) 
     with st.expander("All approval gates", icon=":material/fact_check:"):
         for gate_name in ordered_gate_names + remaining_gate_names:
             if gate_name != current_gate_name:
-                _render_gate_card(manager, state, gate_name)
+                _render_gate_card(manager, state, gate_name, run_dir)
 
 
 def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
     hypothesis = _read_json(run_dir / "hypothesis.json")
     if hypothesis is None:
-        st.info("No hypothesis.json for this run yet.")
+        st.caption("No hypothesis.json for this run yet.")
         return
 
     st.subheader("Normalized causal question")
@@ -873,7 +1183,6 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
     if unresolved:
         st.warning("Unresolved hypothesis issues:\n" + "\n".join(f"- `{issue}`" for issue in unresolved))
 
-    st.divider()
     st.subheader("Causal DAG & identification")
     try:
         artifact = _hypothesis_artifact_from_dict(hypothesis)
@@ -947,7 +1256,7 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                     f"{', '.join(adjustment.alternative_variable_labels) or '—'}."
                 )
         else:
-            st.info("No minimum adjustment set is available for this DAG.", icon=":material/info:")
+            st.caption("No minimum adjustment set is available for this DAG.")
         if adjustment.unused_confounder_labels:
             st.warning(
                 "Review these declared confounders; they do not appear in a minimum adjustment set: "
@@ -965,7 +1274,14 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         if clinical.blocking_issues:
             st.error("\n".join(f"- {issue}" for issue in clinical.blocking_issues))
         if clinical.advisory_notes:
-            st.warning("\n".join(f"- {note}" for note in clinical.advisory_notes))
+            # One line per not-yet-classified/rejected first-pass covariate --
+            # can run to 15-25+ entries on a real DAG, so it's collapsed by
+            # default rather than always expanded (was the single biggest
+            # contributor to this tab's page length).
+            with st.expander(
+                f"Advisory notes ({len(clinical.advisory_notes)})", icon=":material/info:"
+            ):
+                st.markdown("\n".join(f"- {note}" for note in clinical.advisory_notes))
         if identification.technical_notes:
             with st.expander("Identification notes", icon=":material/functions:"):
                 st.caption("Graph-theoretic checks only; not a clinical judgment.")
@@ -1014,14 +1330,25 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
 
     dag_unresolved = (_read_json(run_dir / "protocol.json") or {}).get("candidate_dag_unresolved") or []
     if dag_unresolved:
-        st.markdown("**Flagged unresolved by the drafting model**")
-        st.caption(
-            "The DAG-drafting step itself could not confidently classify these — distinct "
-            "from the human covariate review below."
-        )
-        st.json(dag_unresolved)
+        with st.expander(
+            f"Flagged unresolved by the drafting model ({len(dag_unresolved)})",
+            icon=":material/help:",
+        ):
+            st.caption(
+                "The DAG-drafting step itself could not confidently classify these — distinct "
+                "from the human covariate review below."
+            )
+            st.json(dag_unresolved)
 
     tournament = (_read_json(run_dir / "protocol.json") or {}).get("dag_tournament")
+    if not isinstance(tournament, dict):
+        st.caption(
+            "No draft DAG comparison (SHD/SID) for this run — it needs 2+ independently "
+            "drafted candidate DAGs to compare against each other, and this run drafted only "
+            "1. Set \"Candidate DAGs to draft\" to 2 or more in **New causal study** to get "
+            "this comparison.",
+            help="Not an error: a single-draft run has nothing to compare its DAG against.",
+        )
     if isinstance(tournament, dict):
         st.markdown("**Draft DAG comparison**")
         st.caption(
@@ -1195,7 +1522,6 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                     )
 
     if artifact.unresolved_covariates:
-        st.divider()
         st.subheader("Unresolved covariate review")
         st.caption(
             "These first-pass covariates have no assigned causal role yet, so they are "
@@ -1339,13 +1665,30 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                                 role=decision_choice, temporal_classification=temporal_choice,
                                 domain=domain_choice or None,
                             )
-                        st.success(f"'{label}' reviewed")
-                        st.rerun()
+                        succeeded.append(label)
                     except ValueError as exc:
-                        st.error(str(exc))
+                        errors.append(f"'{label}': {exc}")
+                if succeeded:
+                    # Same "analysis_plan.json is a stale snapshot otherwise"
+                    # rationale as every other covariate-review save action in
+                    # `_render_covariate_card` -- regenerated once for the
+                    # whole batch instead of once per row. Swallowed when the
+                    # phase is still before concept_mapping/feasibility/
+                    # analysis_plan (this form is also reachable from
+                    # dag_review, where analysis_plan.json does not exist yet
+                    # -- nothing to regenerate, and `run_data_science_agent`
+                    # correctly refuses to run there).
+                    try:
+                        manager.run_data_science_agent(run_id)
+                    except RuntimeError:
+                        pass
+                    st.success(f"{len(succeeded)} covariate(s) reviewed: {', '.join(succeeded)}")
+                if errors:
+                    st.error("Some decisions were not saved:\n" + "\n".join(f"- {e}" for e in errors))
+                if succeeded:
+                    st.rerun()
 
     if artifact.rejected_covariates:
-        st.divider()
         with st.expander(f"Reviewed exclusions ({len(artifact.rejected_covariates)})"):
             for rejection in artifact.rejected_covariates:
                 detail = f" — {rejection.comment}" if rejection.comment else ""
@@ -1353,7 +1696,6 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                 st.markdown(f"- **{rejection.label}** rejected by {rejection.reviewer}{detail}{when}")
 
     if artifact.design_constraints:
-        st.divider()
         st.subheader("Generation notes")
         st.caption(
             "Auditable notes recorded while this draft was generated, including whether an "
@@ -1364,7 +1706,6 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
 
     llm_outputs = _read_json(run_dir / "llm_outputs.json")
     if llm_outputs and llm_outputs.get("outputs"):
-        st.divider()
         with st.expander(f"Generation audit trail ({len(llm_outputs['outputs'])} LLM call(s))"):
             st.caption(
                 f"Model `{llm_outputs.get('model', 'unknown')}`, prompt version "
@@ -1464,6 +1805,16 @@ def _render_omcp_concept_search(*, state_key: str, domain: str, default_term: st
     from the previous one instead of showing a mismatched list.
     """
     term = st.text_input("Search term", value=default_term, key=f"{state_key}_term")
+    # NOT auto-fired on first render: every `_render_omcp_concept_search`
+    # call site on a tab (4+ concept-set roles, plus a covariate's own
+    # Mapping tab) executes on every script rerun regardless of whether its
+    # expander is visually collapsed -- Streamlit only hides the DOM, it
+    # still runs the Python. An earlier version of this function auto-fired
+    # a search the first time each `state_key` appeared; live-tested against
+    # the real OMCP/BigQuery path, that meant every visit to a tab with
+    # several concept sets paid for several sequential ~10-15s cold OMCP/
+    # BigQuery connections before the page finished rendering at all -- worse
+    # than the manual click it was meant to remove. Kept opt-in per role.
     if st.button("Search", key=f"{state_key}_btn"):
         try:
             datasets = BigQueryDatasets.from_env()
@@ -1556,12 +1907,19 @@ def _render_concept_set_mapping_forms(
                 ))
                 name_by_id = {c["concept_id"]: _concept_option_label(c) for c in candidates}
                 option_ids = list(dict.fromkeys([c["concept_id"] for c in candidates] + existing_ids))
+                # Pre-select the best-scoring match when nothing is approved
+                # yet -- `candidates` is already best-match-first
+                # (`_sorted_by_match_score`), and the reviewer still has to
+                # confirm/change it and click Save, so this only removes
+                # "scan the dropdown for the right one" for the common case
+                # where the top match is already correct.
+                default_ids = existing_ids or ([candidates[0]["concept_id"]] if candidates else [])
             with st.form(key=f"concept_set_map_form_{run_id}_{name}"):
                 if domain_choice == "death":
                     chosen_ids: list[int] = []
                 else:
                     chosen_ids = st.multiselect(
-                        "Approve OMOP concept(s)", options=option_ids, default=existing_ids,
+                        "Approve OMOP concept(s)", options=option_ids, default=default_ids,
                         format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
                         key=f"concept_set_map_ids_{run_id}_{name}",
                     )
@@ -1682,7 +2040,6 @@ def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_d
     )
 
     exposure_contrast = _render_exposure_contrast_selector(manager, run_id, protocol or {})
-    st.divider()
 
     st.caption(
         "OMOP concept(s) are shown as numeric codes here because their matched clinical names "
@@ -1776,6 +2133,122 @@ def _render_population_concept_set_manager(manager: WorkflowManager, run_id: str
                     st.rerun()
                 except (ValueError, RuntimeError) as exc:
                     st.error(str(exc))
+
+
+def _render_negative_control_mapping_section(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
+    """Negative controls (`docs/causal_roadmap.md` milestone 6, `causal.
+    queries.negative_controls`) fold into the same `clinical_mapping` gate
+    as `concept_sets`/covariates above -- propose via LLM, then map/approve
+    each candidate to a real OMOP concept, the same "propose a label, map
+    concepts separately" split `_render_concept_set_mapping_forms` already
+    uses. *Estimating* an already-approved control is a separate action,
+    in the Estimation & report tab's "Robustness & heterogeneity" section
+    (`_render_advanced_analyses`) alongside sensitivity/CATE -- this
+    section only covers propose/map, mirroring `causalomop workflow
+    negative-controls-propose`/`negative-control-map` on the CLI.
+
+    Before this existed, negative controls had no Streamlit surface at all
+    beyond a read-only results table once a control had already been
+    proposed, mapped, *and* estimated by hand on the CLI -- a reviewer
+    working only in the app could never actually exercise this milestone.
+    """
+    protocol = _read_json(run_dir / "protocol.json") or {}
+    concept_sets = protocol.get("concept_sets") or {}
+    negative_controls = protocol.get("negative_controls") or {}
+    if not concept_sets:
+        return
+
+    st.subheader("Negative controls")
+    st.caption(
+        "Optional diagnostic checks: substitute a treatment or outcome believed to have no true "
+        "causal effect, then fit this study's same reviewed estimator against it once approved and "
+        "run (Estimation & report tab). A null result is evidence *for* the adjustment set; a "
+        "non-null result is a warning of possible unaddressed confounding -- never a blocking gate."
+    )
+
+    if negative_controls:
+        st.dataframe(
+            [
+                {
+                    "Control": entry.get("label", control_id),
+                    "Type": _humanize(entry.get("control_type", "")),
+                    "OMOP domain": entry.get("domain") or "—",
+                    "Status": _humanize(entry.get("mapping_status")),
+                    "OMOP concept(s)": ", ".join(str(c) for c in entry.get("concept_ids", ())) or "none yet",
+                }
+                for control_id, entry in negative_controls.items()
+                if isinstance(entry, dict)
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+    if st.button(
+        "Propose negative controls (LLM)",
+        icon=":material/auto_awesome:",
+        key=f"propose_negative_controls_{run_id}",
+    ):
+        status = st.status("Requesting negative-control candidates...", expanded=True)
+        try:
+            status.write("Started -- this can take a moment.")
+            resolved_llm = build_hypothesis_llm()
+            status.write(f"Calling `{resolved_llm.provider}:{resolved_llm.model}`...")
+            manager.propose_negative_controls(run_id, resolved_llm.call)
+            status.write("Done -- saving the result.")
+            status.update(label="Negative-control candidates proposed.", state="complete")
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001 - an optional, advisory step; never break the tab
+            status.update(label="Proposal failed.", state="error")
+            st.error(f"Negative-control proposal failed: {exc}")
+
+    for control_id, entry in negative_controls.items():
+        if not isinstance(entry, dict):
+            continue
+        with st.expander(
+            f"Map '{entry.get('label', control_id)}' ({_humanize(entry.get('control_type', ''))})",
+            expanded=entry.get("mapping_status") != "approved",
+        ):
+            st.caption(entry.get("rationale", ""))
+            current_domain = entry.get("domain") or ""
+            domain_choice = st.selectbox(
+                "OMOP domain", DAG_VARIABLE_DOMAINS,
+                index=DAG_VARIABLE_DOMAINS.index(current_domain) if current_domain in DAG_VARIABLE_DOMAINS else 0,
+                key=f"negative_control_domain_{run_id}_{control_id}",
+            )
+            existing_ids = [int(c) for c in entry.get("concept_ids", ())]
+            candidates = _sorted_by_match_score(_render_omcp_concept_search(
+                state_key=f"negative_control_candidates_{run_id}_{control_id}_{domain_choice}",
+                domain=domain_choice,
+                default_term=str(entry.get("label", control_id)).replace("_", " "),
+            ))
+            name_by_id = {c["concept_id"]: _concept_option_label(c) for c in candidates}
+            option_ids = list(dict.fromkeys([c["concept_id"] for c in candidates] + existing_ids))
+            default_ids = existing_ids or ([candidates[0]["concept_id"]] if candidates else [])
+            with st.form(key=f"negative_control_map_form_{run_id}_{control_id}"):
+                chosen_ids = st.multiselect(
+                    "Approve OMOP concept(s)", options=option_ids, default=default_ids,
+                    format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
+                    key=f"negative_control_map_ids_{run_id}_{control_id}",
+                )
+                status_choice = st.selectbox(
+                    "Status", ("approved", "not_clinically_defensible", "pending_omop_mapping"),
+                    key=f"negative_control_status_{run_id}_{control_id}",
+                    format_func=_humanize,
+                )
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"negative_control_reviewer_{run_id}_{control_id}"
+                )
+                submitted = st.form_submit_button("Save mapping")
+                if submitted:
+                    try:
+                        with st.spinner("Saving..."):
+                            manager.map_negative_control(
+                                run_id, control_id, domain_choice, chosen_ids, reviewer, status=status_choice,
+                            )
+                        st.success(f"Mapping saved for '{control_id}'")
+                        st.rerun()
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
 
 
 def _render_regenerate_plan_section(manager: WorkflowManager, run_id: str) -> None:
@@ -1909,9 +2382,9 @@ def _format_covariate_window(window_start_hours: Any, window_end_hours: Any) -> 
 
 def _render_covariate_card(manager: WorkflowManager, run_id: str, c: dict[str, Any]) -> None:
     """One collapsible card per covariate: current state (badges), why a
-    decision is required (if any), and the four review actions as tabs --
-    domain, window, aggregation, and concept mapping. Replaces what used to
-    be four stacked `st.form`s per covariate so a run with several covariates
+    decision is required (if any), and five review actions as tabs -- domain,
+    window, aggregation, concept mapping, and reject. Replaces what used to
+    be stacked `st.form`s per covariate so a run with several covariates
     doesn't turn the tab into one long scroll of near-identical forms.
 
     Each tab's save action also calls `manager.run_data_science_agent(run_id)`
@@ -1921,6 +2394,17 @@ def _render_covariate_card(manager: WorkflowManager, run_id: str, c: dict[str, A
     snapshot until a reviewer separately clicked "Regenerate analysis plan",
     which read as "my save didn't take" even though the underlying
     `candidate_dag` entry in protocol.json/hypothesis.json was updated fine.
+
+    The `Reject` tab is this card's only path to excluding an already-role-
+    classified covariate: `_render_hypothesis_tab`'s "Unresolved covariate
+    review" section only ever lists covariates with no role yet (see
+    `HypothesisArtifact.unresolved_covariates`) -- a covariate that reached
+    this card (already `causal_role`-classified) but then turned out
+    structurally unmappable (e.g. a facility-level statistic, a derived
+    ratio -- no OMOP concept can ever represent either, regardless of
+    vocabulary completeness) previously had no in-app way to be excluded at
+    all, only `WorkflowManager.review_covariate` called directly (the CLI's
+    `covariate-review` subcommand, or a script).
     """
     name = c.get("name")
     domain = c.get("domain")
@@ -1945,8 +2429,8 @@ def _render_covariate_card(manager: WorkflowManager, run_id: str, c: dict[str, A
         if reasons:
             st.caption("Why a decision is required: " + " ".join(reasons))
 
-        domain_tab, window_tab, aggregation_tab, mapping_tab = st.tabs(
-            ["Domain", "Window", "Aggregation", "Mapping"]
+        domain_tab, window_tab, aggregation_tab, mapping_tab, reject_tab = st.tabs(
+            ["Domain", "Window", "Aggregation", "Mapping", "Reject"]
         )
 
         with domain_tab, st.form(key=f"covariate_domain_form_{run_id}_{name}"):
@@ -2053,15 +2537,25 @@ def _render_covariate_card(manager: WorkflowManager, run_id: str, c: dict[str, A
                             st.error(str(exc))
 
         with mapping_tab:
-            candidates = c.get("concept_candidates") or []
-            if not candidates:
-                st.caption(
-                    "No OMOP concept candidates yet. First set and save a domain, then click "
-                    "Regenerate analysis plan and select ‘Also refresh OMOP concept suggestions’ "
-                    "to refresh candidates with OMCP."
-                )
+            existing_ids = [int(cid) for cid in c.get("concept_ids", ())]
+            if not domain:
+                st.caption("Set a domain first (see the Domain tab) — needed before searching OMOP concepts.")
+                ranked_candidates: list[dict[str, Any]] = []
             else:
-                ranked_candidates = _sorted_by_match_score(candidates)
+                pending = c.get("concept_candidates") or []
+                searched = _render_omcp_concept_search(
+                    state_key=f"covariate_map_candidates_{run_id}_{name}_{domain}",
+                    domain=domain,
+                    default_term=name.replace("_", " "),
+                )
+                # `searched` starts empty until the reviewer clicks Search in this
+                # card; fall back to candidates a batch "Regenerate analysis plan
+                # -> refresh OMOP concept suggestions" pass already fetched, so
+                # that slower path still works and neither source is required.
+                ranked_candidates = _sorted_by_match_score(searched or pending)
+                if not ranked_candidates and not existing_ids:
+                    st.caption("No results yet — enter a search term above and click Search.")
+            if ranked_candidates:
                 st.caption("Best matches first. Pick the correct OMOP concept(s) below.")
                 with st.expander("Search results (technical detail)", icon=":material/data_object:"):
                     st.caption(_VOCABULARY_CAPTION)
@@ -2079,14 +2573,27 @@ def _render_covariate_card(manager: WorkflowManager, run_id: str, c: dict[str, A
                         hide_index=True,
                         width="stretch",
                     )
+            if ranked_candidates or existing_ids:
                 name_by_id = {
                     candidate.get("concept_id"): _concept_option_label(candidate)
                     for candidate in ranked_candidates
                 }
+                option_ids = list(
+                    dict.fromkeys(
+                        [candidate.get("concept_id") for candidate in ranked_candidates] + existing_ids
+                    )
+                )
+                # See `_render_concept_set_mapping_forms`'s identical comment:
+                # pre-select the best-scoring match when nothing is approved
+                # yet -- reviewer still confirms/changes it and clicks Save.
+                default_ids = existing_ids or (
+                    [ranked_candidates[0]["concept_id"]] if ranked_candidates else []
+                )
                 with st.form(key=f"covariate_map_form_{run_id}_{name}"):
                     chosen_ids = st.multiselect(
                         "Approve OMOP concept(s) for this covariate",
-                        options=[candidate.get("concept_id") for candidate in ranked_candidates],
+                        options=option_ids,
+                        default=default_ids,
                         format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
                         key=f"covariate_map_ids_{run_id}_{name}",
                     )
@@ -2123,19 +2630,48 @@ def _render_covariate_card(manager: WorkflowManager, run_id: str, c: dict[str, A
                         except (ValueError, RuntimeError, OSError) as exc:
                             st.error(str(exc))
 
+        with reject_tab:
+            st.caption(
+                "Exclude this covariate entirely -- for a factor that turned out to be "
+                "structurally unrepresentable in OMOP (a facility- or hospital-level statistic, "
+                "a derived/composite value with no single concept, a niche score absent from "
+                "this vocabulary build) or redundant with a column already adjusted for by "
+                "default (e.g. race/ethnicity, already carried as the fixed race_concept_id "
+                "baseline column), not for a genuine, still-resolvable mapping gap. The "
+                "exclusion is recorded in the audit trail, not silently dropped -- it still "
+                "surfaces as a documented limitation on the final report."
+            )
+            with st.form(key=f"covariate_reject_form_{run_id}_{name}"):
+                reject_comment = st.text_area(
+                    "Reason for exclusion (optional, but recommended for the audit trail)",
+                    key=f"covariate_reject_comment_{run_id}_{name}",
+                )
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"covariate_reject_reviewer_{run_id}_{name}",
+                )
+                submitted = st.form_submit_button(f"Reject '{name}'")
+                if submitted:
+                    try:
+                        manager.review_covariate(run_id, name, "reject", reviewer, reject_comment or None)
+                        manager.run_data_science_agent(run_id)
+                        st.success(f"'{name}' rejected and excluded from the analysis plan")
+                        st.rerun()
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
+
 
 def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
     _render_concept_mapping_section(manager, run_id, run_dir)
+    _render_negative_control_mapping_section(manager, run_id, run_dir)
 
     st.divider()
     _render_regenerate_plan_section(manager, run_id)
 
     plan = _read_json(run_dir / "analysis_plan.json")
     if plan is None:
-        st.info("No analysis_plan.json for this run yet (use the button above to generate it).")
+        st.caption("No analysis_plan.json for this run yet (use the button above to generate it).")
         return
 
-    st.divider()
     st.subheader("Analysis plan")
     col1, col2 = st.columns(2)
     col1.markdown(f"**Data source**  \n`{plan.get('data_source', '—')}`")
@@ -2187,25 +2723,59 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
 
     covariates = plan.get("covariates") or []
     if covariates:
+        # `name` is the DAG variable's `label` verbatim (see
+        # `causal.agents.data_science._build_covariate_plan`), so it's also
+        # the join key back into hypothesis.json's `candidate_dag` for the
+        # literature-evidence columns below -- same evidence fields the DAG
+        # page's "Evidence sources" table already shows (see `evidence_rows`
+        # above), just surfaced here too so a reviewer doesn't have to jump
+        # tabs to see why a covariate's role was asserted.
+        hypothesis_for_evidence = _read_json(run_dir / "hypothesis.json") or {}
+        evidence_by_label = {
+            variable.get("label"): variable
+            for variable in hypothesis_for_evidence.get("candidate_dag", ())
+            if isinstance(variable, dict)
+        }
         st.markdown("**Covariates** (from the reviewed causal DAG)")
+        st.caption(
+            "Role/status/leakage detail lives in each covariate's card below; this table is "
+            "the at-a-glance overview."
+        )
         st.dataframe(
             [
                 {
                     "Name": c.get("name"),
-                    "Causal role": _humanize(c.get("causal_role")),
-                    "Adjustment role": _humanize(c.get("adjustment_role")),
+                    "Role": _humanize(c.get("causal_role"))
+                    + (f" ({_humanize(c.get('adjustment_role'))})" if c.get("adjustment_role") else ""),
                     "Window": _format_covariate_window(
                         c.get("window_start_hours"), c.get("window_end_hours")
                     ),
-                    "Leakage risk": _humanize(c.get("leakage_risk")),
-                    "Status": _humanize(c.get("status")),
-                    "OMOP domain": c.get("domain") or "—",
                     "Mapping status": _humanize(c.get("mapping_status", "unmapped")),
                     "OMOP concept(s)": _format_concept_ids(c.get("concept_ids", ()), c.get("concept_candidates")),
                     "Aggregation": _humanize(c.get("aggregation", "definition_pending")),
+                    "Evidence id": (evidence_by_label.get(c.get("name")) or {}).get("pmid") or "—",
+                    "Evidence level": _humanize(
+                        (evidence_by_label.get(c.get("name")) or {}).get("evidence_level", "unclassified")
+                    ),
+                    "KG corroborated": (
+                        "✓" if (evidence_by_label.get(c.get("name")) or {}).get("kg_evidence_id") else ""
+                    ),
                 }
                 for c in covariates
             ],
+            # OMOP domain dropped from this overview on purpose (still shown
+            # per-covariate in its own card's Domain tab below) -- with the
+            # 3 evidence columns added for item #8, keeping it here pushed
+            # `OMOP concept(s)`/`Aggregation`/the evidence columns off-screen
+            # at a normal laptop width (measured: clipped at 1366px). Explicit
+            # narrow widths below buy back further room for the same reason.
+            column_config={
+                "Role": st.column_config.Column(width="small"),
+                "Window": st.column_config.Column(width="medium"),
+                "Mapping status": st.column_config.Column(width="small"),
+                "Evidence level": st.column_config.Column(width="small"),
+                "KG corroborated": st.column_config.Column(width="small"),
+            },
             hide_index=True,
             width="stretch",
         )
@@ -2225,7 +2795,7 @@ def _render_analysis_plan_tab(manager: WorkflowManager, run_id: str, run_dir: Pa
             st.markdown(f"- {check}")
 
 
-def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_id: str) -> None:
+def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_id: str, run_dir: Path) -> None:
     """Trigger the steps that produce this tab's artifacts -- mirrors `workflow
     feasibility`/`cohort-plan`/`cohort-profile`/`followup-audit` on the CLI.
     All go through OMCP (the CLI's default `--transport mcp`), consistent with
@@ -2233,8 +2803,20 @@ def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_i
     transport is dev/test-only and stays CLI-only.
     """
     datasets = BigQueryDatasets.from_env()
+    # All four actions below call `WorkflowManager.run_execution_readiness`
+    # internally (directly, or via `build_cohort_plan`), which hard-requires
+    # `analysis_plan.json` to exist ("Run the Data Science Agent first",
+    # `workflow.py`'s `run_execution_readiness`) -- but that requirement was
+    # previously only mentioned in the caption text, not actually part of
+    # `ready`, so a button could show green "Ready" and still immediately
+    # fail on click for a run with no analysis plan yet. Checked once here so
+    # every action's `ready` reflects what will actually happen.
+    has_analysis_plan = (run_dir / "analysis_plan.json").is_file()
 
-    def _run(title: str, label: str, ready: bool, requirement: str, spinner: str, action, icon: str) -> None:
+    def _run(
+        title: str, label: str, requirements: list[tuple[bool, str]], spinner: str, action, icon: str
+    ) -> None:
+        ready = all(met for met, _ in requirements)
         with st.container(border=True):
             st.markdown(f"**{title}**")
             st.badge("Ready" if ready else "Not ready", color="green" if ready else "gray", icon=icon)
@@ -2246,24 +2828,38 @@ def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_i
                 key=f"feasibility_action_{label}",
                 width="stretch",
             ):
+                status = st.status(spinner, expanded=True)
                 try:
-                    with st.spinner(spinner):
-                        action()
-                    st.success(f"{label} completed.")
+                    status.write("Started -- this can take a moment.")
+                    action()
+                    status.write("Done -- saving the result.")
+                    status.update(label=f"{label} completed.", state="complete")
                     st.rerun()
                 except (ValueError, RuntimeError, OSError) as exc:
+                    status.update(label=f"{label} failed.", state="error")
                     st.error(str(exc))
-            st.caption("Available now." if ready else requirement)
+            if ready:
+                st.caption("Available now.")
+            else:
+                st.caption(
+                    "Waiting on: " + "; ".join(desc for met, desc in requirements if not met) + "."
+                )
 
+    plan_requirement = (has_analysis_plan, "an existing analysis plan (Mapping & plan tab)")
     col1, col2 = st.columns(2)
     with col1:
         _run(
             "1. Check feasibility",
             "Run feasibility check",
-            state.phase == "feasibility"
-            and state.mode == "exploratory"
-            and state.gates["clinical_mapping"].status == "provisional",
-            "Requires the feasibility phase, exploratory mode, and a provisional clinical-mapping decision.",
+            [
+                (state.phase == "feasibility", "the feasibility phase"),
+                (state.mode == "exploratory", "exploratory mode"),
+                (
+                    state.gates["clinical_mapping"].status == "provisional",
+                    "clinical-mapping gate set to provisional",
+                ),
+                plan_requirement,
+            ],
             "Running feasibility query...",
             lambda: manager.run_feasibility_mcp(run_id, OMCPClient(datasets), datasets),
             ":material/query_stats:",
@@ -2271,8 +2867,10 @@ def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_i
         _run(
             "3. Profile the cohort",
             "Run cohort profile",
-            state.phase in {"feasibility", "analysis_plan"},
-            "Requires the feasibility or analysis-plan phase and an existing analysis plan.",
+            [
+                (state.phase in {"feasibility", "analysis_plan"}, "the feasibility or analysis-plan phase"),
+                plan_requirement,
+            ],
             "Profiling the draft cohort...",
             lambda: manager.run_cohort_profile_mcp(run_id, OMCPClient(datasets), datasets),
             ":material/groups:",
@@ -2281,9 +2879,13 @@ def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_i
         _run(
             "2. Create the cohort plan",
             "Build cohort plan",
-            state.phase in {"analysis_plan", "estimand_review", "execution"},
-            "Requires the analysis-plan, estimand-review, or cohort-execution phase and an "
-            "existing analysis plan.",
+            [
+                (
+                    state.phase in {"analysis_plan", "estimand_review", "execution"},
+                    "the analysis-plan, estimand-review, or cohort-execution phase",
+                ),
+                plan_requirement,
+            ],
             "Building governed cohort SQL...",
             lambda: manager.build_cohort_plan(run_id, datasets),
             ":material/description:",
@@ -2291,11 +2893,35 @@ def _render_feasibility_actions(manager: WorkflowManager, state: RunState, run_i
         _run(
             "4. Audit follow-up",
             "Run follow-up audit",
-            state.phase in {"feasibility", "analysis_plan"},
-            "Requires the feasibility or analysis-plan phase and an existing analysis plan.",
+            [
+                (state.phase in {"feasibility", "analysis_plan"}, "the feasibility or analysis-plan phase"),
+                plan_requirement,
+            ],
             "Checking follow-up completeness...",
             lambda: manager.run_followup_audit_mcp(run_id, OMCPClient(datasets), datasets),
             ":material/fact_check:",
+        )
+        _run(
+            "5. Audit positivity",
+            "Run positivity audit",
+            [
+                (state.phase in {"analysis_plan", "execution"}, "the analysis-plan or execution phase"),
+                plan_requirement,
+            ],
+            "Checking univariate treatment-arm overlap...",
+            lambda: manager.run_positivity_audit_mcp(run_id, OMCPClient(datasets), datasets),
+            ":material/balance:",
+        )
+        _run(
+            "6. Audit covariate missingness",
+            "Run covariate missingness audit",
+            [
+                (state.phase in {"analysis_plan", "execution"}, "the analysis-plan or execution phase"),
+                plan_requirement,
+            ],
+            "Checking per-covariate missingness...",
+            lambda: manager.run_covariate_missingness_audit_mcp(run_id, OMCPClient(datasets), datasets),
+            ":material/rule:",
         )
 
 
@@ -2339,7 +2965,7 @@ def _render_feasibility_tab(manager: WorkflowManager, state: RunState, run_dir: 
 
     st.subheader("Available actions")
     st.caption("Actions are enabled only when the workflow phase and required review decisions permit them.")
-    _render_feasibility_actions(manager, state, state.run_id)
+    _render_feasibility_actions(manager, state, state.run_id, run_dir)
 
     st.subheader("Aggregate results")
 
@@ -2437,7 +3063,7 @@ def _render_feasibility_tab(manager: WorkflowManager, state: RunState, run_dir: 
                         st.error(str(exc))
 
     if not any_rendered:
-        st.info("No aggregate feasibility, cohort, or execution-readiness result is available yet.")
+        st.caption("No aggregate feasibility, cohort, or execution-readiness result is available yet.")
 
 
 # `RunState.record`'s first argument (see `causal/orchestrator/state.py` and
@@ -2474,6 +3100,10 @@ def _format_history_event(event: str) -> str:
 
 def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
     st.subheader("Demo report")
+    st.caption(
+        "A quick, always-regeneratable walkthrough for demos -- not the auditable causal report. "
+        "Build that one from the **Estimation & report** workspace instead."
+    )
     if st.button("Regenerate demo report"):
         manager.build_demo_report(state.run_id)
         st.rerun()
@@ -2484,9 +3114,8 @@ def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path)
         st.download_button("Download demo_report.md", report_text, file_name="demo_report.md")
         st.markdown(report_text)
     else:
-        st.info("No demo report generated yet.")
+        st.caption("No demo report generated yet.")
 
-    st.divider()
     st.subheader("History")
     if state.history:
         st.dataframe(
@@ -2498,9 +3127,8 @@ def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path)
             width="stretch",
         )
     else:
-        st.info("No history recorded yet.")
+        st.caption("No history recorded yet.")
 
-    st.divider()
     st.subheader("Artifacts")
     for artifact_name in state.artifacts:
         artifact_path = run_dir / artifact_name
@@ -2524,6 +3152,17 @@ def _render_estimation_actions(manager: WorkflowManager, state: RunState, run_id
     readiness = _read_json(run_dir / "execution_readiness.json") or {}
     dataset_ready = (run_dir / "analytic_dataset.parquet").is_file()
 
+    def _not_ready_reason(fallback: str) -> str:
+        # `execution_readiness.json`'s own `blockers` (already computed by
+        # `ExecutionAgent`, same list the "Can this study proceed?" card on
+        # the Feasibility tab renders via `_format_blocker`) names the actual
+        # reason a build/estimate is disallowed far more specifically than a
+        # static phase-requirement sentence can.
+        blockers = readiness.get("blockers") or []
+        if blockers:
+            return "Waiting on: " + " ".join(_format_blocker(b) for b in blockers)
+        return fallback
+
     def _run(title: str, label: str, ready: bool, requirement: str, spinner: str, action, icon: str) -> None:
         with st.container(border=True):
             st.markdown(f"**{title}**")
@@ -2536,14 +3175,17 @@ def _render_estimation_actions(manager: WorkflowManager, state: RunState, run_id
                 key=f"estimation_action_{label}",
                 width="stretch",
             ):
+                status = st.status(spinner, expanded=True)
                 try:
-                    with st.spinner(spinner):
-                        action()
-                    st.success(f"{label} completed.")
+                    status.write("Started -- this can take a moment.")
+                    action()
+                    status.write("Done -- saving the result.")
+                    status.update(label=f"{label} completed.", state="complete")
                     st.rerun()
                 except (ValueError, RuntimeError, OSError) as exc:
+                    status.update(label=f"{label} failed.", state="error")
                     st.error(str(exc))
-            st.caption("Available now." if ready else requirement)
+            st.caption("Available now." if ready else _not_ready_reason(requirement))
 
     st.subheader("Prepare deterministic results")
     st.caption(
@@ -2607,16 +3249,23 @@ def _render_estimation_actions(manager: WorkflowManager, state: RunState, run_id
             key=f"estimation_action_{procedure}_{run_id}",
             width="stretch",
         ):
+            status = st.status(estimator_spinner, expanded=True)
             try:
-                with st.spinner(estimator_spinner):
-                    manager.run_estimation(run_id, n_bootstrap=int(n_bootstrap))
-                st.success(f"{estimator_label} completed.")
+                status.write("Started -- this can take a moment.")
+                manager.run_estimation(run_id, n_bootstrap=int(n_bootstrap))
+                status.write("Done -- saving the result.")
+                status.update(label=f"{estimator_label} completed.", state="complete")
                 st.rerun()
             except (ValueError, RuntimeError, OSError) as exc:
+                status.update(label=f"{estimator_label} failed.", state="error")
                 st.error(str(exc))
         st.caption(estimator_description)
         if not estimate_ready:
-            st.caption("Requires a materialized dataset and an allowed causal estimation.")
+            st.caption(
+                _not_ready_reason("Requires a materialized dataset and an allowed causal estimation.")
+                if dataset_ready
+                else "Waiting on: a materialized analytic dataset (step 1 above)."
+            )
 
 
 def _render_advanced_analyses(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
@@ -2661,12 +3310,15 @@ def _render_advanced_analyses(manager: WorkflowManager, state: RunState, run_dir
                 key=f"run_sensitivity_{state.run_id}",
                 width="stretch",
             ):
+                status = st.status("Computing the E-value sensitivity analysis...", expanded=True)
                 try:
-                    with st.spinner("Computing the E-value sensitivity analysis..."):
-                        manager.run_sensitivity_analysis(state.run_id)
-                    st.success("Sensitivity analysis completed.")
+                    status.write("Started -- this can take a moment.")
+                    manager.run_sensitivity_analysis(state.run_id)
+                    status.write("Done -- saving the result.")
+                    status.update(label="Sensitivity analysis completed.", state="complete")
                     st.rerun()
                 except (ValueError, RuntimeError, OSError) as exc:
+                    status.update(label="Sensitivity analysis failed.", state="error")
                     st.error(str(exc))
 
     with cate_col:
@@ -2697,29 +3349,69 @@ def _render_advanced_analyses(manager: WorkflowManager, state: RunState, run_dir
                 key=f"run_cate_{state.run_id}",
                 width="stretch",
             ):
+                status = st.status("Fitting the causal forest for prespecified subgroups...", expanded=True)
                 try:
-                    with st.spinner("Fitting the causal forest for prespecified subgroups..."):
-                        manager.run_cate(state.run_id)
-                    st.success("CATE analysis completed.")
+                    status.write("Started -- this can take a moment.")
+                    manager.run_cate(state.run_id)
+                    status.write("Done -- saving the result.")
+                    status.update(label="CATE analysis completed.", state="complete")
                     st.rerun()
                 except (ValueError, RuntimeError, OSError) as exc:
+                    status.update(label="CATE analysis failed.", state="error")
                     st.error(str(exc))
 
     if negative_controls:
         with st.expander("Negative-control checks", icon=":material/compare_arrows:"):
             rows = []
+            runnable: list[tuple[str, dict[str, Any]]] = []
             for control_id, control in negative_controls.items():
+                if not isinstance(control, dict):
+                    continue
                 result = _read_json(run_dir / f"negative_control_estimation_{control_id}.json")
                 rows.append(
                     {
+                        # Persisted key is "control_type" (see
+                        # causal.queries.negative_controls) -- "control_role"
+                        # never appears in protocol.json, so reading it always
+                        # produced an empty "Role" column.
                         "Control": control.get("label", control_id),
-                        "Role": control.get("control_role", "").replace("_", " "),
+                        "Type": control.get("control_type", "").replace("_", " "),
                         "Mapping": control.get("mapping_status", "pending").replace("_", " "),
                         "Estimate": "Complete" if result else "Not run",
                     }
                 )
+                if control.get("mapping_status") == "approved" and result is None:
+                    runnable.append((control_id, control))
             st.dataframe(rows, hide_index=True, width="stretch")
-            st.caption("Negative controls are diagnostic checks and require separate clinical mapping and review.")
+            st.caption(
+                "Negative controls are diagnostic checks and require separate clinical mapping and "
+                "review (Analysis plan tab)."
+            )
+            if runnable:
+                datasets = BigQueryDatasets.from_env()
+                for control_id, control in runnable:
+                    if st.button(
+                        f"Run '{control.get('label', control_id)}'",
+                        disabled=not results_reviewable,
+                        icon=":material/compare_arrows:",
+                        key=f"run_negative_control_{state.run_id}_{control_id}",
+                        width="stretch",
+                    ):
+                        status = st.status(
+                            f"Estimating negative control '{control.get('label', control_id)}'...",
+                            expanded=True,
+                        )
+                        try:
+                            status.write("Started -- this can take a moment.")
+                            manager.run_negative_control_estimation(
+                                state.run_id, control_id, OMCPClient(datasets),
+                            )
+                            status.write("Done -- saving the result.")
+                            status.update(label="Negative control estimation completed.", state="complete")
+                            st.rerun()
+                        except (ValueError, RuntimeError, OSError) as exc:
+                            status.update(label="Negative control estimation failed.", state="error")
+                            st.error(str(exc))
 
 
 def _render_balance_chart(balance: list[dict[str, Any]]) -> None:
@@ -2814,137 +3506,171 @@ def _narrative_blocks_report(narrative: dict[str, Any] | None) -> bool:
     return True
 
 
+def _generate_results_narrative(manager: WorkflowManager, run_id: str, *, status_label: str) -> bool:
+    """Calls the configured LLM to (re)build `results_narrative.json`.
+    Returns True on success. Any provider/network/parsing failure here must
+    degrade this one optional action, not the rest of the tab."""
+    status = st.status(status_label, expanded=True)
+    try:
+        status.write("Resolving the configured LLM provider...")
+        resolved_llm = build_hypothesis_llm()
+        status.write(f"Calling `{resolved_llm.provider}:{resolved_llm.model}`...")
+        manager.run_results_narrative(
+            run_id, resolved_llm.call,
+            model=resolved_llm.model, provider=resolved_llm.provider,
+        )
+        status.write("Done -- saving the result.")
+        status.update(label="Interpretation generated.", state="complete")
+        return True
+    except Exception as exc:
+        status.update(label="Interpretation generation failed.", state="error")
+        st.error(f"Interpretation generation failed (the causal report is unaffected): {exc}")
+        return False
+
+
 def _render_results_narrative_section(manager: WorkflowManager, state: RunState, run_dir: Path) -> dict[str, Any] | None:
-    """Steps 2-4 of the estimation/report flow: generate the optional LLM
-    interpretation, show its deterministic faithfulness verification, and
-    let a human approve or exclude it. Returns the normalized artifact (or
-    `None` if none exists yet) so the caller can gate "Build causal report"
-    on it via `_narrative_blocks_report`."""
+    """Steps 2-4 of the estimation/report flow: automatically produce a
+    plain-language interpretation of the finished estimate the moment it's
+    ready, show it front and center, and let a human approve or exclude it
+    (deterministic faithfulness verification and the underlying claims stay
+    available but tucked into a secondary "Review & audit" expander so they
+    don't compete with the readable summary). Returns the normalized
+    artifact (or `None` if none exists yet) so the caller can gate "Build
+    causal report" on it via `_narrative_blocks_report`."""
     run_id = state.run_id
-    st.subheader("LLM-assisted interpretation")
-    st.caption(
-        "Advisory only -- reads the already-computed estimate, diagnostics, and gate history, "
-        "never the patient-level dataset. It cannot approve the results gate or change the estimate."
-    )
     narrative_raw = _read_json(run_dir / "results_narrative.json")
     narrative = normalize_narrative_artifact(narrative_raw) if narrative_raw else None
-
     narrative_ready = state.phase in {"results_review", "report"} and (run_dir / "estimation.json").is_file()
-    label = "Regenerate interpretation" if narrative else "Generate interpretation"
-    if st.button(
-        label,
-        disabled=not narrative_ready,
-        type="primary" if narrative_ready else "secondary",
-        icon=":material/smart_toy:",
-        key=f"generate_narrative_{run_id}",
-        width="stretch",
-    ):
-        try:
-            with st.spinner("Requesting an interpretive narrative..."):
-                resolved_llm = build_hypothesis_llm()
-                manager.run_results_narrative(
-                    run_id, resolved_llm.call,
-                    model=resolved_llm.model, provider=resolved_llm.provider,
-                )
-            st.success("Interpretation generated.")
-            st.rerun()
-        except Exception as exc:
-            # Any provider/network/parsing failure here must degrade this one
-            # optional action, not the rest of the tab.
-            st.error(f"Interpretation generation failed (the causal report is unaffected): {exc}")
-    if not narrative_ready:
-        st.caption("Requires the results-review or report phase and an existing estimate.")
 
-    if not narrative:
-        st.info("No LLM interpretation has been generated for this run yet.")
+    autogen_key = f"_narrative_autogen_attempted_{run_id}"
+    if narrative_ready and narrative is None and not st.session_state.get(autogen_key):
+        st.session_state[autogen_key] = True
+        if _generate_results_narrative(manager, run_id, status_label="Interpreting the estimate automatically..."):
+            st.rerun()
+
+    st.subheader("What this result means", anchor=False)
+    st.caption(
+        "Generated automatically from the finished estimate, diagnostics, and gate history -- never the "
+        "patient-level dataset. Advisory only: it cannot approve the results gate or change the estimate."
+    )
+
+    if narrative:
+        review_status = narrative.get("review_status", "pending")
+        status_color = {"approved": "green", "excluded": "orange"}.get(review_status, "gray")
+        with st.container(border=True):
+            header_col, badge_col = st.columns([5, 2], vertical_alignment="center")
+            with header_col:
+                st.markdown(":material/smart_toy: **AI-assisted interpretation**")
+            with badge_col:
+                st.badge(review_status.replace("_", " ").capitalize(), color=status_color)
+            st.markdown(narrative.get("narrative", ""))
+            st.caption(narrative.get("boundary_statement", ""))
+        st.caption(f"Model: {narrative.get('provider', 'unknown')}:{narrative.get('model', 'unknown')}")
+        if st.button(
+            "Regenerate interpretation",
+            icon=":material/refresh:",
+            disabled=not narrative_ready,
+            key=f"generate_narrative_{run_id}",
+        ):
+            if _generate_results_narrative(manager, run_id, status_label="Regenerating the interpretation..."):
+                st.rerun()
+        if not narrative_ready:
+            st.caption("Requires the results-review or report phase and an existing estimate.")
+    elif narrative_ready:
+        st.info("No LLM interpretation could be generated for this run yet.")
+        if st.button(
+            "Retry",
+            icon=":material/smart_toy:",
+            key=f"generate_narrative_{run_id}",
+        ):
+            if _generate_results_narrative(manager, run_id, status_label="Interpreting the estimate..."):
+                st.rerun()
+    else:
+        st.caption("An interpretation will be generated automatically once an estimate is available.")
         return None
 
-    with st.container(border=True):
-        st.markdown(narrative.get("narrative", ""))
-    st.caption(narrative.get("boundary_statement", ""))
-    st.caption(f"Model: {narrative.get('provider', 'unknown')}:{narrative.get('model', 'unknown')}")
+    if not narrative:
+        return None
 
     claims = narrative.get("claims", [])
-    st.markdown("**Structured claims**")
-    if claims:
-        st.dataframe(
-            [
-                {
-                    "Claim": claim.get("text", ""),
-                    "Type": claim.get("claim_type", ""),
-                    "Source fields": ", ".join(claim.get("source_fields", [])),
-                }
-                for claim in claims
-            ],
-            hide_index=True,
-            width="stretch",
-        )
-    else:
-        st.caption("No structured claims (this artifact predates faithfulness verification).")
-
-    st.markdown("**Faithfulness verification**")
-    st.caption("Deterministic checks only -- no second LLM is used to grade this narrative.")
     verification = narrative.get("verification") or {"status": "not_run", "checks": []}
     verification_status = verification.get("status", "not_run")
     checks = verification.get("checks", [])
-    if verification_status == "failed":
-        st.error("At least one faithfulness check failed. This interpretation cannot be auto-approved.")
-    elif verification_status == "warning":
-        st.warning("Faithfulness verification has warning(s) to review before approval.")
-    elif verification_status == "passed":
-        st.success("All deterministic faithfulness checks passed.")
-    else:
-        st.warning(
-            "This interpretation predates faithfulness verification -- regenerate it to enable review."
-        )
-    if checks:
-        st.dataframe(
-            [
-                {
-                    "Subject": check.get("subject", ""),
-                    "Claim type": check.get("claim_type", ""),
-                    "Status": check.get("status", ""),
-                    "Reason": check.get("reason", ""),
-                    "Evidence": check.get("evidence", ""),
-                }
-                for check in checks
-            ],
-            hide_index=True,
-            width="stretch",
-        )
-
-    st.markdown("**Human review**")
     review_status = narrative.get("review_status", "pending")
-    st.badge(
-        review_status.replace("_", " ").capitalize(),
-        color={"approved": "green", "excluded": "orange"}.get(review_status, "gray"),
-    )
-    if narrative.get("reviewer"):
-        note_suffix = f" -- {narrative['review_note']}" if narrative.get("review_note") else ""
-        st.caption(f"Last decision by {narrative['reviewer']} on {narrative.get('reviewed_at', '-')}{note_suffix}")
-
     can_approve = verification_status in {"passed", "warning"} and not any(
         check.get("status") == "failed" for check in checks
     )
     review_phase_ok = state.phase in {"results_review", "report"}
-    with st.form(key=f"narrative_review_form_{run_id}", border=False):
-        reviewer = st.text_input("Reviewer", value=_reviewer_default(), key=f"narrative_reviewer_{run_id}")
-        note = st.text_area("Review note (optional)", key=f"narrative_review_note_{run_id}")
-        with st.container(horizontal=True):
-            approve_clicked = st.form_submit_button(
-                "Approve", type="primary", disabled=not (can_approve and review_phase_ok),
+    needs_attention = review_status == "pending" or verification_status == "failed"
+
+    with st.expander("Review & audit details", icon=":material/fact_check:", expanded=needs_attention):
+        st.markdown("**Faithfulness verification**")
+        st.caption("Deterministic checks only -- no second LLM is used to grade this narrative.")
+        if verification_status == "failed":
+            st.error("At least one faithfulness check failed. This interpretation cannot be auto-approved.")
+        elif verification_status == "warning":
+            st.warning("Faithfulness verification has warning(s) to review before approval.")
+        elif verification_status == "passed":
+            st.success("All deterministic faithfulness checks passed.")
+        else:
+            st.warning(
+                "This interpretation predates faithfulness verification -- regenerate it to enable review."
             )
-            exclude_clicked = st.form_submit_button("Exclude from report", disabled=not review_phase_ok)
-        if approve_clicked or exclude_clicked:
-            decision = "approved" if approve_clicked else "excluded"
-            try:
-                manager.review_results_narrative(run_id, decision, reviewer, note or None)
-                st.success(f"Interpretation {decision}.")
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
-    if not can_approve:
-        st.caption("Approval is disabled while a faithfulness check has failed or has not run yet.")
+        if checks:
+            st.dataframe(
+                [
+                    {
+                        "Subject": check.get("subject", ""),
+                        "Claim type": check.get("claim_type", ""),
+                        "Status": check.get("status", ""),
+                        "Reason": check.get("reason", ""),
+                        "Evidence": check.get("evidence", ""),
+                    }
+                    for check in checks
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+
+        st.markdown("**Structured claims**")
+        if claims:
+            st.dataframe(
+                [
+                    {
+                        "Claim": claim.get("text", ""),
+                        "Type": claim.get("claim_type", ""),
+                        "Source fields": ", ".join(claim.get("source_fields", [])),
+                    }
+                    for claim in claims
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No structured claims (this artifact predates faithfulness verification).")
+
+        st.markdown("**Human review**")
+        if narrative.get("reviewer"):
+            note_suffix = f" -- {narrative['review_note']}" if narrative.get("review_note") else ""
+            st.caption(f"Last decision by {narrative['reviewer']} on {narrative.get('reviewed_at', '-')}{note_suffix}")
+        with st.form(key=f"narrative_review_form_{run_id}", border=False):
+            reviewer = st.text_input("Reviewer", value=_reviewer_default(), key=f"narrative_reviewer_{run_id}")
+            note = st.text_area("Review note (optional)", key=f"narrative_review_note_{run_id}")
+            with st.container(horizontal=True):
+                approve_clicked = st.form_submit_button(
+                    "Approve", type="primary", disabled=not (can_approve and review_phase_ok),
+                )
+                exclude_clicked = st.form_submit_button("Exclude from report", disabled=not review_phase_ok)
+            if approve_clicked or exclude_clicked:
+                decision = "approved" if approve_clicked else "excluded"
+                try:
+                    manager.review_results_narrative(run_id, decision, reviewer, note or None)
+                    st.success(f"Interpretation {decision}.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+        if not can_approve:
+            st.caption("Approval is disabled while a faithfulness check has failed or has not run yet.")
 
     return narrative
 
@@ -3028,7 +3754,7 @@ def _render_estimation_report_tab(manager: WorkflowManager, state: RunState, run
         with st.expander("Raw data (JSON)", icon=":material/data_object:"):
             st.json(estimand)
     else:
-        st.info("No causal effect has been estimated yet.")
+        st.caption("No causal effect has been estimated yet.")
 
     if diagnostics:
         st.subheader("Covariate balance (SMD)")
@@ -3070,12 +3796,15 @@ def _render_estimation_report_tab(manager: WorkflowManager, state: RunState, run
         key=f"build_causal_report_{state.run_id}",
         width="stretch",
     ):
+        status = st.status("Assembling the auditable causal report...", expanded=True)
         try:
-            with st.spinner("Assembling the auditable causal report..."):
-                manager.build_causal_report(state.run_id)
-            st.success("Causal report built.")
+            status.write("Started -- this can take a moment.")
+            manager.build_causal_report(state.run_id)
+            status.write("Done -- saving the result.")
+            status.update(label="Causal report built.", state="complete")
             st.rerun()
         except (ValueError, RuntimeError, OSError) as exc:
+            status.update(label="Causal report build failed.", state="error")
             st.error(str(exc))
     if narrative_blocks:
         st.caption(
@@ -3091,7 +3820,7 @@ def _render_estimation_report_tab(manager: WorkflowManager, state: RunState, run
         with st.expander("Preview", icon=":material/description:"):
             st.markdown(report_text)
     else:
-        st.info("No causal report generated yet.")
+        st.caption("No causal report generated yet.")
 
 
 def _render_new_question_section(manager: WorkflowManager, *, expanded: bool = False) -> None:
@@ -3101,6 +3830,132 @@ def _render_new_question_section(manager: WorkflowManager, *, expanded: bool = F
             "and may incur API costs. Can take up to a couple of minutes — longer with "
             "more review rounds or more than one candidate DAG."
         )
+
+        def _run_generation(
+            question: str,
+            *,
+            mode: str,
+            model_override: str,
+            skip_question_gate: bool,
+            skip_literature: bool,
+            skip_critique: bool,
+            max_critique_rounds: int,
+            tournament_size: int,
+        ) -> None:
+            status_log = st.status("Generating hypothesis draft...", expanded=True)
+
+            def _on_llm_output(output: LLMRawOutput) -> None:
+                status_log.write(f"Received `{output.stage}` from the LLM.")
+
+            try:
+                resolved_llm = build_hypothesis_llm(model=model_override.strip() or None)
+                status_log.write(f"Using provider `{resolved_llm.provider}:{resolved_llm.model}`.")
+                if not skip_question_gate:
+                    gate_result = parse_gate_response(
+                        resolved_llm.call(build_gate_prompt(DEFAULT_GATE_PROMPT_PATH, question))
+                    )
+                    if gate_result.category == "descriptive":
+                        status_log.update(label="Not a causal question", state="error")
+                        st.session_state.pop("_pending_clarification", None)
+                        st.warning(
+                            "This looks like a descriptive/retrieval question, not a causal one -- "
+                            "FastOMOP (agno_fastomop) handles this, not the causal target-trial pipeline.\n\n"
+                            f"Reasoning: {gate_result.reasoning}"
+                        )
+                        return
+                    if gate_result.category == "needs_clarification":
+                        status_log.update(label="Needs clarification", state="error")
+                        # Keep the question and the LLM's own follow-up alive across
+                        # the rerun so the user can answer it instead of retyping the
+                        # whole question from scratch -- previously this was a dead
+                        # end (the warning was shown and everything below discarded).
+                        st.session_state["_pending_clarification"] = {
+                            "question": question,
+                            "clarifying_question": gate_result.clarifying_question,
+                            "reasoning": gate_result.reasoning,
+                            "mode": mode,
+                            "model_override": model_override,
+                            "skip_literature": skip_literature,
+                            "skip_critique": skip_critique,
+                            "max_critique_rounds": max_critique_rounds,
+                            "tournament_size": tournament_size,
+                        }
+                        st.warning(
+                            "This question needs to be sharpened before drafting a causal study.\n\n"
+                            f"Reasoning: {gate_result.reasoning}\n\n"
+                            f"Clarifying question: {gate_result.clarifying_question}"
+                        )
+                        st.rerun()
+                        return
+                    status_log.write(f"Causal-question gate: {gate_result.category} -- {gate_result.reasoning}")
+                st.session_state.pop("_pending_clarification", None)
+                literature = (
+                    None
+                    if skip_literature
+                    else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
+                )
+                generated = UserQuestionHypothesisService().generate(
+                    question,
+                    resolved_llm.call,
+                    data_source=BigQueryDatasets.from_env().describe(),
+                    literature=literature,
+                    on_llm_output=_on_llm_output,
+                    enable_critique=not skip_critique,
+                    max_critique_rounds=int(max_critique_rounds),
+                    tournament_size=int(tournament_size),
+                )
+                state = manager.start_generated(
+                    generated, mode, f"{resolved_llm.provider}:{resolved_llm.model}"
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+                status_log.update(label="Failed", state="error")
+                st.error(str(exc))
+                return
+
+            status_log.update(label=f"Created run {state.run_id}", state="complete")
+            # The `run_selector` widget is already instantiated earlier in this same
+            # script run, so it can't be reassigned directly here (Streamlit raises
+            # StreamlitAPIException). Stash the target run id and apply it at the
+            # top of the next run, before the widget is (re-)created.
+            st.session_state["_pending_run_selection"] = state.run_id
+            st.rerun()
+
+        pending = st.session_state.get("_pending_clarification")
+        if pending:
+            st.warning(
+                "This question needs to be sharpened before drafting a causal study.\n\n"
+                f"Reasoning: {pending['reasoning']}\n\n"
+                f"Clarifying question: {pending['clarifying_question']}"
+            )
+            with st.form(key="clarification_form"):
+                answer = st.text_area("Your answer", key="clarification_answer")
+                answer_col, restart_col = st.columns(2)
+                answer_submitted = answer_col.form_submit_button(
+                    "Submit clarification", type="primary"
+                )
+                start_over = restart_col.form_submit_button("Start over with a new question")
+            if start_over:
+                st.session_state.pop("_pending_clarification", None)
+                st.rerun()
+            if answer_submitted:
+                if not answer.strip():
+                    st.error("An answer is required")
+                else:
+                    combined_question = (
+                        f"{pending['question']}\n\nClarification: {answer.strip()}"
+                    )
+                    _run_generation(
+                        combined_question,
+                        mode=pending["mode"],
+                        model_override=pending["model_override"],
+                        skip_question_gate=False,
+                        skip_literature=pending["skip_literature"],
+                        skip_critique=pending["skip_critique"],
+                        max_critique_rounds=pending["max_critique_rounds"],
+                        tournament_size=pending["tournament_size"],
+                    )
+            return
+
         with st.form(key="new_question_form"):
             question = st.text_area("Clinical question", key="new_question_text")
             mode = st.selectbox("Mode", ("exploratory", "final"), key="new_question_mode")
@@ -3131,11 +3986,13 @@ def _render_new_question_section(manager: WorkflowManager, *, expanded: bool = F
                 "Candidate DAGs to draft",
                 min_value=1,
                 max_value=MAX_TOURNAMENT_SIZE,
-                value=1,
+                value=2,
                 key="new_question_tournament_size",
                 help=(
                     "Draft this many DAGs independently, then automatically combine them into "
-                    "one (1 = today's default, a single draft)."
+                    "one. 2+ also unlocks the SHD/SID draft-agreement comparison below the DAG "
+                    "on the Study design tab; 1 skips that comparison entirely (no independent "
+                    "draft to compare against)."
                 ),
             )
             submitted = st.form_submit_button("Generate hypothesis draft")
@@ -3146,65 +4003,16 @@ def _render_new_question_section(manager: WorkflowManager, *, expanded: bool = F
             st.error("Clinical question is required")
             return
 
-        status_log = st.status("Generating hypothesis draft...", expanded=True)
-
-        def _on_llm_output(output: LLMRawOutput) -> None:
-            status_log.write(f"Received `{output.stage}` from the LLM.")
-
-        try:
-            resolved_llm = build_hypothesis_llm(model=model_override.strip() or None)
-            status_log.write(f"Using provider `{resolved_llm.provider}:{resolved_llm.model}`.")
-            if not skip_question_gate:
-                gate_result = parse_gate_response(
-                    resolved_llm.call(build_gate_prompt(DEFAULT_GATE_PROMPT_PATH, question))
-                )
-                if gate_result.category == "descriptive":
-                    status_log.update(label="Not a causal question", state="error")
-                    st.warning(
-                        "This looks like a descriptive/retrieval question, not a causal one -- "
-                        "FastOMOP (agno_fastomop) handles this, not the causal target-trial pipeline.\n\n"
-                        f"Reasoning: {gate_result.reasoning}"
-                    )
-                    return
-                if gate_result.category == "needs_clarification":
-                    status_log.update(label="Needs clarification", state="error")
-                    st.warning(
-                        "This question needs to be sharpened before drafting a causal study.\n\n"
-                        f"Reasoning: {gate_result.reasoning}\n\n"
-                        f"Clarifying question: {gate_result.clarifying_question}"
-                    )
-                    return
-                status_log.write(f"Causal-question gate: {gate_result.category} -- {gate_result.reasoning}")
-            literature = (
-                None
-                if skip_literature
-                else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
-            )
-            generated = UserQuestionHypothesisService().generate(
-                question,
-                resolved_llm.call,
-                data_source=BigQueryDatasets.from_env().describe(),
-                literature=literature,
-                on_llm_output=_on_llm_output,
-                enable_critique=not skip_critique,
-                max_critique_rounds=int(max_critique_rounds),
-                tournament_size=int(tournament_size),
-            )
-            state = manager.start_generated(
-                generated, mode, f"{resolved_llm.provider}:{resolved_llm.model}"
-            )
-        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
-            status_log.update(label="Failed", state="error")
-            st.error(str(exc))
-            return
-
-        status_log.update(label=f"Created run {state.run_id}", state="complete")
-        # The `run_selector` widget is already instantiated earlier in this same
-        # script run, so it can't be reassigned directly here (Streamlit raises
-        # StreamlitAPIException). Stash the target run id and apply it at the
-        # top of the next run, before the widget is (re-)created.
-        st.session_state["_pending_run_selection"] = state.run_id
-        st.rerun()
+        _run_generation(
+            question,
+            mode=mode,
+            model_override=model_override,
+            skip_question_gate=skip_question_gate,
+            skip_literature=skip_literature,
+            skip_critique=skip_critique,
+            max_critique_rounds=int(max_critique_rounds),
+            tournament_size=int(tournament_size),
+        )
 
 
 def main() -> None:
@@ -3229,7 +4037,6 @@ def main() -> None:
             on_change=_sync_reviewer_fields,
             help="Pre-fills the reviewer field on every gate and covariate decision below.",
         )
-        st.divider()
         st.header("Study runs")
         run_ids = _list_runs()
         run_id = (
@@ -3271,9 +4078,10 @@ def main() -> None:
             st.caption("Clinical question")
             st.write(source_question)
     _render_phase_tracker(state)
-    workspace = st.radio(
+    workspace = st.segmented_control(
         "Study workspace",
         (
+            "Study summary",
             "Current task",
             "Study design",
             "Mapping & plan",
@@ -3281,13 +4089,16 @@ def main() -> None:
             "Estimation & report",
             "Report & audit",
         ),
+        default="Study summary",
+        required=True,
         key=f"workspace_{run_id}",
-        horizontal=True,
         label_visibility="collapsed",
         width="stretch",
     )
 
-    if workspace == "Current task":
+    if workspace == "Study summary":
+        _render_study_summary(state, run_dir)
+    elif workspace == "Current task":
         _render_gates_tab(manager, state, run_dir)
     elif workspace == "Study design":
         _render_hypothesis_tab(manager, run_id, run_dir)

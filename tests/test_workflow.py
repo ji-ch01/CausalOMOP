@@ -13,6 +13,7 @@ import pandas as pd
 from causal.config import BigQueryDatasets
 from causal.mcp_client import MCPToolResponse
 from causal.orchestrator import WorkflowManager
+from causal.provenance import artifact_metadata
 from causal.orchestrator.workflow import (
     _LOCK_STALE_SECONDS,
     _RunLock,
@@ -104,6 +105,49 @@ class WorkflowTests(unittest.TestCase):
         for _ in range(3):
             state = self.manager.advance(state.run_id)
         self.assertEqual(state.phase, "concept_mapping")
+
+    def test_set_target_trial_estimand_corrects_primary_estimand(self):
+        state = self.manager.start(self._full_protocol_path())
+        self.manager.decide_gate(state.run_id, "target_trial", "rejected", "tester", "Should be CATE, not ATE")
+
+        updated = self.manager.set_target_trial_estimand(
+            state.run_id,
+            primary_estimand="CATE",
+            secondary_estimands=("ATE", ""),
+            reviewer="tester",
+            comment="Study prespecifies age-group subgroups",
+        )
+
+        protocol = json.loads(
+            (Path(self.temp.name) / "runs" / state.run_id / "protocol.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(protocol["target_trial"]["primary_estimand"], "CATE")
+        self.assertEqual(protocol["target_trial"]["secondary_estimands"], ["ATE"])
+        # `_invalidate_gate` is a no-op on an already-`rejected` gate: the reviewer still has to
+        # explicitly re-decide the gate after fixing the estimand, same as any other correction.
+        self.assertEqual(updated.gates["target_trial"].status, "rejected")
+
+    def test_set_target_trial_estimand_rejects_invalid_value(self):
+        state = self.manager.start(self._full_protocol_path())
+        with self.assertRaises(ValueError):
+            self.manager.set_target_trial_estimand(
+                state.run_id, primary_estimand="RISK_RATIO", reviewer="tester", comment="typo"
+            )
+
+    def test_set_target_trial_estimand_requires_comment(self):
+        state = self.manager.start(self._full_protocol_path())
+        with self.assertRaises(ValueError):
+            self.manager.set_target_trial_estimand(
+                state.run_id, primary_estimand="ATE", reviewer="tester", comment=""
+            )
+
+    def test_set_target_trial_estimand_blocked_once_approved(self):
+        state = self.manager.start(self._full_protocol_path())
+        self.manager.decide_gate(state.run_id, "target_trial", "approved", "tester")
+        with self.assertRaises(ValueError):
+            self.manager.set_target_trial_estimand(
+                state.run_id, primary_estimand="CATE", reviewer="tester", comment="change of mind"
+            )
 
     def _protocol_path_with_approved_concept_sets(self):
         """`_full_protocol_path` plus an approved population/treatment/
@@ -1763,6 +1807,11 @@ class WorkflowConcurrentGateDecisionTests(unittest.TestCase):
         self.manager = WorkflowManager(root / "runs")
         state = self.manager.start(protocol)
         self.run_id = state.run_id
+        # `_block_if_results_incomplete` requires estimation.json to exist
+        # before the `results` gate can be approved; this test exercises
+        # `_RunLock` concurrency, not results-completeness, so stub it in.
+        run_dir = root / "runs" / self.run_id
+        (run_dir / "estimation.json").write_text("{}", encoding="utf-8")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -2179,6 +2228,173 @@ class WorkflowBuildCohortPlanCovariateTests(unittest.TestCase):
         self.manager.build_cohort_plan(self.run_id, self.datasets)
         sql = (self.run_dir / "cohort.sql").read_text(encoding="utf-8")
         self.assertNotIn("cov_sofa_score", sql)
+
+
+class WorkflowCovariateRejectAfterMappingFailureTests(unittest.TestCase):
+    """Regression coverage for the exact support scenario that motivated
+    `_render_covariate_card`'s `Reject` tab (`causal.ui.streamlit_app`): an
+    already role-classified covariate (accepted, with a domain) that then
+    fails OMOP concept mapping (`no_standard_concept` -- a facility-level
+    statistic with no representable OMOP concept, not a genuine vocabulary
+    gap) must be rejectable from that stage, and rejecting it must actually
+    unblock the `analysis_plan` gate rather than leave a stale
+    `analysis_plan.json` snapshot still listing it as not ready. Also checks
+    that mapping a *different*, genuinely mappable covariate afterward still
+    works normally -- the reject path must not interfere with it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
+            },
+            "data_source": "project.dataset",
+            "first_pass_covariates": ["hospital_quality_process_measures", "SOFA score"],
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "approved",
+                    "domain": "condition", "concept_ids": [132797],
+                },
+                "treatment": {
+                    "role": "treatment", "status": "approved",
+                    "domain": "drug", "concept_ids": [1],
+                },
+                "comparator": {
+                    "role": "comparator", "status": "approved",
+                    "domain": "drug", "concept_ids": [2],
+                },
+                "outcome": {
+                    "role": "outcome", "status": "approved",
+                    "domain": "condition", "concept_ids": [316866],
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        state = self.manager.run_hypothesis_agent(state.run_id)
+        self.run_id = state.run_id
+        self.run_dir = root / "runs" / self.run_id
+
+        self.manager.review_covariate(
+            self.run_id, "hospital_quality_process_measures", "accept", "Dr. Chen",
+            "AMI process-measure performance correlates with mortality and aspirin use.",
+            role="confounder", temporal_classification="pre_treatment",
+            domain="observation",
+        )
+        self.manager.map_covariate_concepts(
+            self.run_id, "hospital_quality_process_measures", [], "Dr. Chen",
+            mapping_status="no_standard_concept",
+        )
+        self.manager.review_covariate(
+            self.run_id, "SOFA score", "accept", "Dr. Chen",
+            "Higher SOFA is associated with treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            domain="measurement",
+        )
+        _approve_pre_mapping_gates(self.manager, self.run_id)
+        for _ in range(3):
+            state = self.manager.advance(self.run_id)
+        state = self.manager.run_data_science_agent(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _plan(self) -> dict:
+        return json.loads((self.run_dir / "analysis_plan.json").read_text(encoding="utf-8"))
+
+    def test_unmappable_covariate_blocks_the_gate_before_rejection(self):
+        plan = self._plan()
+        entry = next(c for c in plan["covariates"] if c["name"] == "hospital_quality_process_measures")
+        self.assertEqual(entry["mapping_status"], "no_standard_concept")
+        self.assertNotEqual(entry["status"], "ready")
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "tester")
+
+    def test_rejecting_then_regenerating_removes_it_from_the_plan(self):
+        """Exactly the two calls `_render_covariate_card`'s Reject tab makes."""
+        self.manager.review_covariate(
+            self.run_id, "hospital_quality_process_measures", "reject", "tester",
+            "Facility-level statistic, not representable as an OMOP concept_id.",
+        )
+        self.manager.run_data_science_agent(self.run_id)
+        plan = self._plan()
+        self.assertFalse(
+            any(c["name"] == "hospital_quality_process_measures" for c in plan["covariates"])
+        )
+        rejected = json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))["rejected_covariates"]
+        self.assertTrue(any(item["label"] == "hospital_quality_process_measures" for item in rejected))
+
+    def test_rejecting_without_regenerating_leaves_the_plan_stale(self):
+        """Regression guard for the bug this whole class exists to prevent:
+        without the `run_data_science_agent` call, `review_covariate`'s
+        reject is fully recorded in protocol.json/hypothesis.json, but
+        analysis_plan.json -- what the gate actually reads -- is untouched,
+        so the covariate keeps blocking approval even though it was, from
+        the reviewer's point of view, already rejected."""
+        self.manager.review_covariate(
+            self.run_id, "hospital_quality_process_measures", "reject", "tester",
+            "Facility-level statistic, not representable as an OMOP concept_id.",
+        )
+        plan = self._plan()
+        self.assertTrue(
+            any(c["name"] == "hospital_quality_process_measures" for c in plan["covariates"])
+        )
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "tester")
+
+    def test_gate_approves_once_the_unmappable_covariate_is_rejected(self):
+        """Both covariates stop blocking once the unmappable one is rejected
+        and the mappable one is fully reviewed, and the gate approves
+        outright -- this fixture's protocol never declares a `time_zero`
+        concept set, but the auto-scaffolded `index_event` fallback
+        (`DataScienceAgent.run`) resolves via a standard OMOP table, exactly
+        like its `all_cause_death` sibling, so it does not block either."""
+        self.manager.review_covariate(
+            self.run_id, "hospital_quality_process_measures", "reject", "tester",
+            "Facility-level statistic, not representable as an OMOP concept_id.",
+        )
+        self.manager.run_data_science_agent(self.run_id)
+        self.manager.map_covariate_concepts(
+            self.run_id, "SOFA score", [4301868], "tester",
+        )
+        self.manager.review_covariate_aggregation(
+            self.run_id, "SOFA score", "last_value_before_index", "tester",
+        )
+        self.manager.run_data_science_agent(self.run_id)
+        plan = self._plan()
+        self.assertFalse(plan["unresolved_issues"])
+        sofa = next(c for c in plan["covariates"] if c["name"] == "SOFA score")
+        self.assertEqual(sofa["status"], "ready")
+        self.assertTrue(all(c["status"] == "ready" for c in plan["covariates"]))
+        state = self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "tester")
+        self.assertEqual(state.gates["analysis_plan"].status, "approved")
+
+    def test_mapping_a_different_covariate_after_a_rejection_still_works(self):
+        """The reject path must not interfere with concept mapping for an
+        unrelated covariate reviewed afterward."""
+        self.manager.review_covariate(
+            self.run_id, "hospital_quality_process_measures", "reject", "tester",
+            "Facility-level statistic, not representable as an OMOP concept_id.",
+        )
+        self.manager.run_data_science_agent(self.run_id)
+        self.manager.map_covariate_concepts(
+            self.run_id, "SOFA score", [4301868], "tester",
+        )
+        self.manager.run_data_science_agent(self.run_id)
+        plan = self._plan()
+        sofa = next(c for c in plan["covariates"] if c["name"] == "SOFA score")
+        self.assertEqual(sofa["mapping_status"], "approved")
+        self.assertEqual(sofa["concept_ids"], [4301868])
 
 
 class _FakeCohortRowsClient:
@@ -2614,7 +2830,6 @@ class WorkflowRunEstimationTests(WorkflowMaterializeAnalyticDatasetTests):
         with self.assertRaises(RuntimeError):
             self.manager.run_estimation(self.run_id)
 
-
 class WorkflowRunEstimationTMLETests(WorkflowRunEstimationTests):
     """`run_estimation` must dispatch to `TMLEAgent` -- not `EstimationAgent`
     -- when the reviewed `statistical_estimand.json` names
@@ -2875,6 +3090,25 @@ class WorkflowRunNegativeControlEstimationTests(WorkflowRunEstimationTests):
                 self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
             )
 
+    def test_remains_callable_after_advancing_to_results_review(self):
+        """Regression test: `run_negative_control_estimation` used to be
+        pinned to `phase == "execution"` only, unlike its siblings
+        (`run_estimation`/`run_diagnostics`/`run_sensitivity_analysis`/
+        `run_cate`), so a reviewer who approved a negative control late
+        could never estimate it once the primary estimate had already
+        advanced the run past `diagnostics`."""
+        self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        state = self.manager.run_negative_control_estimation(
+            self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            n_bootstrap=30, random_seed=1,
+        )
+        result_path = self.run_dir / f"negative_control_estimation_{self.control_id}.json"
+        self.assertTrue(result_path.is_file())
+        self.assertIn(f"negative_control_estimation_{self.control_id}.json", state.artifacts)
+
     def test_causal_report_includes_a_negative_controls_section(self):
         self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
         self.manager.run_negative_control_estimation(
@@ -2955,6 +3189,22 @@ class WorkflowRunSensitivityAnalysisTests(WorkflowRunEstimationTests):
         self.assertIn("sensitivity_analysis.json", state.artifacts)
         self.assertTrue(any(entry["event"] == "sensitivity_analysis_completed" for entry in state.history))
 
+    def test_sensitivity_analysis_artifact_carries_provenance_metadata(self):
+        """Regression test: `sensitivity_analysis.json` used to be written
+        straight from `EValueResult.to_dict()`, with no `metadata`/
+        `study_id` -- unlike every other artifact this workflow writes --
+        so it could never appear in `build_causal_report`'s Provenance
+        table. `causal.sensitivity.e_value` itself stays a pure function
+        (deliberately no `study_id`/metadata surface of its own); the
+        wrapping happens here, at the call site, the same way
+        `run_results_narrative` wraps `results_narrative.json`."""
+        state = self.manager.run_sensitivity_analysis(self.run_id)
+        artifact = json.loads((self.run_dir / "sensitivity_analysis.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["schema_version"], "1.0")
+        self.assertEqual(artifact["study_id"], state.study_id)
+        self.assertEqual(artifact["metadata"]["agent_name"], "sensitivity_agent")
+        self.assertTrue(artifact["metadata"]["generated_at_utc"])
+
     def test_requires_estimation_to_have_run_first(self):
         (self.run_dir / "estimation.json").unlink()
         with self.assertRaises(RuntimeError):
@@ -3007,6 +3257,41 @@ class WorkflowCausalReportTests(WorkflowRunEstimationTests):
         self.assertIn("causal_report.md", self.manager.load(self.run_id).artifacts)
         self.assertIn("An average treatment effect has been estimated", text)
 
+    def test_results_gate_approves_once_estimation_exists(self):
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        state = self.manager.decide_gate(self.run_id, "results", "approved", "Dr. Lee")
+        self.assertEqual(state.gates["results"].status, "approved")
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "report")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("Results gate approved by Dr. Lee", text)
+        self.assertNotIn("PROVISIONAL", text)
+
+    def test_provenance_table_includes_sensitivity_and_cate_when_present(self):
+        """Regression test: the Provenance table's artifact list was a
+        hard-coded tuple that never included `sensitivity_analysis.json` or
+        `cate.json`, even though both are written with the same `metadata`
+        block every other listed artifact has. `cate.json` is faked directly
+        here rather than run through a real `CATEAgent` fit -- exercising
+        the real agent is covered far more cheaply in
+        `tests/test_cate_agent.py`; this test only needs an artifact with a
+        `metadata` key to exist on disk."""
+        self.manager.run_sensitivity_analysis(self.run_id)
+        (self.run_dir / "cate.json").write_text(json.dumps({
+            "metadata": artifact_metadata("cate_agent", "0.1.0", {"study_id": "test_study"}),
+            "schema_version": "1.0",
+        }), encoding="utf-8")
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("| sensitivity_analysis.json | sensitivity_agent |", text)
+        self.assertIn("| cate.json | cate_agent |", text)
+
 
 class WorkflowCausalReportWithoutEstimateTests(WorkflowMaterializeAnalyticDatasetTests):
     """A report built before `run_estimation` ever runs (e.g. a legacy run,
@@ -3031,13 +3316,43 @@ class WorkflowCausalReportWithoutEstimateTests(WorkflowMaterializeAnalyticDatase
         self.assertEqual(state.phase, "results_review")
         with self.assertRaises(RuntimeError):
             self.manager.advance(self.run_id)
-        self.manager.decide_gate(self.run_id, "results", "approved", "Dr. Lee")
+
+    def test_results_gate_cannot_be_approved_without_estimation(self):
+        """Regression test for the governance gap where `results` -- the
+        final, most consequential sign-off in the pipeline -- could be
+        rubber-stamped "approved" on a run that never called
+        `run_estimation` at all (`REQUIRED_GATES` has no gate for the
+        `execution`/`diagnostics` phases, so nothing upstream forced it to
+        run). See `_block_if_results_incomplete`."""
+        self.manager.advance(self.run_id)
         state = self.manager.advance(self.run_id)
-        self.assertEqual(state.phase, "report")
-        report_path = self.manager.build_causal_report(self.run_id)
-        text = report_path.read_text(encoding="utf-8")
-        self.assertIn("Results gate approved by Dr. Lee", text)
-        self.assertNotIn("PROVISIONAL", text)
+        self.assertEqual(state.phase, "results_review")
+        with self.assertRaises(ValueError):
+            self.manager.decide_gate(self.run_id, "results", "approved", "Dr. Lee")
+        self.assertEqual(self.manager.load(self.run_id).gates["results"].status, "pending")
+
+
+class WorkflowResultsGateDiagnosticsOptionalTests(WorkflowMaterializeAnalyticDatasetTests):
+    """`_block_if_results_incomplete` only requires `estimation.json` --
+    `run_diagnostics` is explicitly optional elsewhere in this module (it
+    "can run before or after `run_estimation`", per its own docstring), so
+    the `results` gate must not force it either. A standalone fixture
+    (rather than a test method on the shared `WorkflowRunEstimationTests`
+    base) because several of that class's subclasses run `run_diagnostics`
+    in their own `setUp`, which would make an inherited "diagnostics is
+    absent" precondition false for them."""
+
+    def test_results_gate_approves_without_diagnostics(self):
+        self.manager.materialize_analytic_dataset(
+            self.run_id, _FakeCohortRowsClient(_synthetic_cohort_csv())
+        )
+        self.manager.run_estimation(self.run_id, n_bootstrap=30, random_seed=1)
+        self.assertFalse((self.run_dir / "diagnostics.json").is_file())
+        self.manager.advance(self.run_id)
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "results_review")
+        state = self.manager.decide_gate(self.run_id, "results", "approved", "Dr. Lee")
+        self.assertEqual(state.gates["results"].status, "approved")
 
 
 class _ResultsNarrativeFixture:

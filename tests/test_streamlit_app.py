@@ -11,11 +11,15 @@ imports, something `python -c "import ..."` isn't otherwise checked for by
 this test suite.
 """
 
+import inspect
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import streamlit as st
 
 from causal.roadmap import CausalDAG, CausalEdge, CausalNode
 from causal.ui import streamlit_app as app
@@ -383,6 +387,69 @@ class NarrativeBlocksReportTests(unittest.TestCase):
     def test_approved_but_verification_never_ran_blocks(self):
         narrative = {"review_status": "approved", "verification": {"status": "not_run", "checks": []}}
         self.assertTrue(app._narrative_blocks_report(narrative))
+
+
+_REVIEWER_TEXT_INPUT_KEY_RE = re.compile(
+    r'"Reviewer".*?key=f?"([a-zA-Z0-9_]*?_reviewer_)', re.DOTALL,
+)
+
+
+class ReviewerFieldSyncTests(unittest.TestCase):
+    """`_sync_reviewer_fields` (wired as the sidebar Reviewer-name field's
+    `on_change`, see `main`) only pushes the sidebar name into
+    `st.session_state` keys matching `_REVIEWER_FIELD_KEY_PREFIXES` --
+    `st.text_input(value=...)` otherwise only seeds a widget's session_state
+    the first time its key is created (`_sync_reviewer_fields`'s own
+    docstring). A per-form Reviewer field whose key prefix is missing from
+    that tuple silently stops following the sidebar name after its first
+    render -- exactly the bug this class exists to catch, discovered live
+    when a newly added "Reject" tab's own Reviewer field (`causal_reject_
+    reviewer_`) turned out not to be registered.
+
+    `test_every_reviewer_field_key_prefix_is_registered` is the regression
+    guard against this happening again: it scans the module's own source for
+    every `st.text_input("Reviewer", ..., key=...)` call and asserts each
+    one's static key prefix is in `_REVIEWER_FIELD_KEY_PREFIXES`, rather than
+    hand-listing the current set of forms (which would need updating, and
+    could silently drift, every time a new one is added -- the same failure
+    mode this test exists to prevent)."""
+
+    def test_every_reviewer_field_key_prefix_is_registered(self):
+        source = inspect.getsource(app)
+        found_prefixes = set(_REVIEWER_TEXT_INPUT_KEY_RE.findall(source))
+        self.assertTrue(found_prefixes, "expected to find at least one Reviewer text_input in the module")
+        unregistered = {
+            prefix for prefix in found_prefixes
+            if not any(prefix.startswith(p) or p.startswith(prefix) for p in app._REVIEWER_FIELD_KEY_PREFIXES)
+        }
+        self.assertFalse(
+            unregistered,
+            f"Reviewer field key prefix(es) {unregistered} are not in _REVIEWER_FIELD_KEY_PREFIXES -- "
+            "these fields will not follow the sidebar Reviewer name after their first render",
+        )
+
+    def test_sync_pushes_the_sidebar_name_into_every_registered_prefix(self):
+        keys = [f"{prefix}some_run_id" for prefix in app._REVIEWER_FIELD_KEY_PREFIXES]
+        try:
+            st.session_state["reviewer_name"] = "Dr. Rivera"
+            for key in keys:
+                st.session_state[key] = "stale text from an earlier render"
+            app._sync_reviewer_fields()
+            for key in keys:
+                self.assertEqual(st.session_state[key], "Dr. Rivera")
+        finally:
+            for key in keys + ["reviewer_name"]:
+                st.session_state.pop(key, None)
+
+    def test_sync_does_not_touch_an_unrelated_key(self):
+        try:
+            st.session_state["reviewer_name"] = "Dr. Rivera"
+            st.session_state["some_other_widget"] = "untouched"
+            app._sync_reviewer_fields()
+            self.assertEqual(st.session_state["some_other_widget"], "untouched")
+        finally:
+            for key in ("reviewer_name", "some_other_widget"):
+                st.session_state.pop(key, None)
 
 
 if __name__ == "__main__":
