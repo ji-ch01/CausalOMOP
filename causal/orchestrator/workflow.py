@@ -285,7 +285,7 @@ _ROLE_FALLBACK_ROLES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
+def _load_concept_specs(protocol: dict) -> dict[str, Any]:
     """Resolve the human-approved, per-question concept sets a cohort/
     feasibility query is built from -- population/treatment/comparator/
     outcome -- from `OMOPVariableRegistry.from_protocol(protocol)`, by role
@@ -335,7 +335,7 @@ def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
         raise RuntimeError(str(exc)) from exc
 
     exposure_contrast = _load_exposure_contrast(protocol)
-    specs: dict[str, ConceptSetSpec] = {}
+    specs: dict[str, Any] = {}
     for role in QUERY_ROLES:
         fallback_roles = _ROLE_FALLBACK_ROLES.get(role, ())
         matched = registry.resolve_role(role, *fallback_roles)
@@ -392,6 +392,47 @@ def _load_concept_specs(protocol: dict) -> dict[str, ConceptSetSpec]:
                 f"concept_sets role '{role}' must be approved with a domain before a query can be "
                 f"generated for it ({exc})"
             ) from exc
+
+    # `additional_population_concept_sets` (see `WorkflowManager.
+    # add_population_concept_set`): names of further, independently-required
+    # population-defining concept sets, ANDed onto `specs["population"]` by
+    # `causal.queries.feasibility._cohort_ctes`'s `additional_population`
+    # kwarg. Resolved by looking each name up directly in `registry.
+    # variables` (matching `dag_node_label`, the raw `concept_sets` key) --
+    # deliberately NOT via `registry.resolve_role`, which raises if two
+    # variables share one `causal_role` and would wrongly reject a second
+    # population-defining entry. Always present in `specs`, even when empty,
+    # so callers can uniformly do `specs.get("population_additional", ())`.
+    additional_names: list[str] = []
+    additional_specs: list[ConceptSetSpec] = []
+    for name in protocol.get("additional_population_concept_sets", ()) or ():
+        name = str(name).strip()
+        if not name:
+            continue
+        variable = next((v for v in registry.variables if v.dag_node_label == name), None)
+        if variable is None:
+            raise RuntimeError(
+                f"additional_population_concept_sets entry '{name}' has no matching concept_sets entry"
+            )
+        try:
+            if is_fixed_domain(variable.domain):
+                spec = fixed_domain_to_concept_set_spec(variable)
+            else:
+                spec = extraction_plan_to_concept_set_spec(build_extraction_plan(variable))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"additional_population_concept_sets entry '{name}' must be approved with a domain "
+                f"before a query can be generated for it ({exc})"
+            ) from exc
+        additional_names.append(name)
+        additional_specs.append(spec)
+    specs["population_additional"] = tuple(additional_specs)
+    # Kept alongside (not folded into) `population_additional` so
+    # `_mapping_coverage_roles` can label each extra concept set by its
+    # `concept_sets` key for coverage-check error messages, without every
+    # other reader of `specs["population_additional"]` (the 8 SQL-generation
+    # call sites) having to unwrap a `(name, spec)` pair it doesn't need.
+    specs["population_additional_names"] = tuple(additional_names)
     return specs
 
 
@@ -485,14 +526,19 @@ _MAPPING_COVERAGE_MIN_RATIO = 0.05
 
 
 def _mapping_coverage_roles(
-    specs: dict[str, ConceptSetSpec], exposure_contrast: str
+    specs: dict[str, Any], exposure_contrast: str
 ) -> list[tuple[str, ConceptSetSpec]]:
     """Which query roles the mapping-coverage gate should check: every role
     whose spec actually resolves to a concept-based domain with concept_ids
     to query. Excludes `outcome` when it defaults to the `death` table (no
     concept_ids involved) and `comparator` under `"vs_unexposed"` (see
     `causal.queries.feasibility.EXPOSURE_CONTRASTS`; there is no OMOP concept
-    for "absence of a drug" to check coverage for)."""
+    for "absence of a drug" to check coverage for).
+
+    Also covers every `additional_population_concept_sets` entry (see
+    `_load_concept_specs`'s `population_additional`/`population_additional_names`),
+    labeled by its own `concept_sets` key rather than a query role -- these
+    entries have no single shared role name, unlike the four fixed ones."""
     roles: list[tuple[str, ConceptSetSpec]] = []
     for role in QUERY_ROLES:
         if role == "comparator" and exposure_contrast == "vs_unexposed":
@@ -500,6 +546,11 @@ def _mapping_coverage_roles(
         spec = specs.get(role)
         if spec is not None and spec.domain in DOMAIN_TABLES and spec.concept_ids:
             roles.append((role, spec))
+    for name, spec in zip(
+        specs.get("population_additional_names", ()), specs.get("population_additional", ())
+    ):
+        if spec.domain in DOMAIN_TABLES and spec.concept_ids:
+            roles.append((name, spec))
     return roles
 
 
@@ -1112,6 +1163,135 @@ class WorkflowManager:
         )
         self._invalidate_gate(state, "clinical_mapping", f"concept_sets['{name}'] changed")
         self._invalidate_gate(state, "analysis_plan", f"concept_sets['{name}'] changed")
+        self.save(state)
+        return state
+
+    def add_population_concept_set(
+        self,
+        run_id: str,
+        *,
+        name: str,
+        label: str,
+        lookup_term: str = "",
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Declare a second (or further) independently-required population-
+        defining diagnosis -- e.g. a study whose population is "adults with
+        type 2 diabetes AND COPD" needs both diagnoses separately OMOP-mapped
+        and ANDed together, which the single `concept_sets["population"]`
+        role cannot express on its own (see `causal.queries.feasibility.
+        _cohort_ctes`'s `additional_population` kwarg and `_load_concept_specs`'s
+        `population_additional` resolution, which is what actually ANDs it in).
+
+        Scaffolds a new `concept_sets[name]` entry in the same
+        `status="pending_omop_mapping"` shape `causal.agents.user_question.
+        UserQuestionHypothesisService._pending_concept_sets` seeds for the
+        primary four roles (`role="population_secondary"`, cosmetic --
+        resolved by direct lookup in `_load_concept_specs`, never through
+        `OMOPVariableRegistry.resolve_role`'s one-entry-per-role invariant),
+        and lists `name` in `additional_population_concept_sets` so
+        `_load_concept_specs` picks it up. The reviewer then maps/approves it
+        through the existing, unmodified `map_concept_set` +
+        `_render_concept_set_mapping_forms` UI, exactly like population/
+        treatment/comparator/outcome today -- this method only creates the
+        entry, it does not map it.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("name is required")
+        if not label.strip():
+            raise ValueError("label is required")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before adding a population concept set")
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            concept_sets = protocol.get("concept_sets", {})
+            if name in concept_sets:
+                raise ValueError(f"concept_sets already has an entry named '{name}'")
+            protocol["concept_sets"] = {
+                **concept_sets,
+                name: {
+                    "status": "pending_omop_mapping",
+                    "concept_ids": [],
+                    "label": label.strip(),
+                    "lookup_term": lookup_term.strip(),
+                    "role": "population_secondary",
+                    "domain": "",
+                },
+            }
+            existing_additional = tuple(protocol.get("additional_population_concept_sets", ()) or ())
+            protocol["additional_population_concept_sets"] = list(existing_additional) + [name]
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            self._write_hypothesis(run_id, protocol)
+        detail = f"'{name}' ({label.strip()}) added by {reviewer} as a required population concept set"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record("population_concept_set_added", detail)
+        self._invalidate_gate(state, "clinical_mapping", f"additional population concept set '{name}' added")
+        self._invalidate_gate(state, "analysis_plan", f"additional population concept set '{name}' added")
+        self.save(state)
+        return state
+
+    def remove_population_concept_set(
+        self, run_id: str, name: str, reviewer: str, comment: str | None = None,
+    ) -> RunState:
+        """Undo an `add_population_concept_set` call -- e.g. added by mistake,
+        or the reviewer decides the second diagnosis should not gate
+        population eligibility after all.
+
+        Deletes `concept_sets[name]` outright (not merely unlisted from
+        `additional_population_concept_sets`): an entry this method targets
+        was always scaffolded by `add_population_concept_set` and is
+        `status="pending_omop_mapping"` far more often than not, so there is
+        rarely a real mapping worth preserving, and leaving a dangling,
+        never-required entry around only invites confusion later. A reviewer
+        who *has* already mapped it and wants to keep the mapping for
+        reference should not call this -- there is currently no "required or
+        not" toggle short of removal.
+        """
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        name = name.strip()
+        if not name:
+            raise ValueError("name is required")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            existing_additional = tuple(protocol.get("additional_population_concept_sets", ()) or ())
+            if name not in existing_additional:
+                raise ValueError(f"'{name}' is not a declared additional population concept set")
+            protocol["additional_population_concept_sets"] = [
+                item for item in existing_additional if item != name
+            ]
+            concept_sets = protocol.get("concept_sets", {})
+            protocol["concept_sets"] = {key: value for key, value in concept_sets.items() if key != name}
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            if (run_dir / "hypothesis.json").is_file():
+                self._write_hypothesis(run_id, protocol)
+        detail = f"'{name}' removed by {reviewer} as a required population concept set"
+        if comment and comment.strip():
+            detail += f" ({comment.strip()})"
+        state.record("population_concept_set_removed", detail)
+        self._invalidate_gate(state, "clinical_mapping", f"additional population concept set '{name}' removed")
+        self._invalidate_gate(state, "analysis_plan", f"additional population concept set '{name}' removed")
         self.save(state)
         return state
 
@@ -2224,6 +2404,7 @@ class WorkflowManager:
             exposure_contrast=exposure_contrast,
             covariates=covariates,
             censoring_definition_approved=censoring_definition_approved,
+            additional_population=specs.get("population_additional", ()),
             **settings,
         )
         validation = QueryValidationAgent().run(sql, purpose="person_level_dataset")
@@ -2587,6 +2768,7 @@ class WorkflowManager:
             exposure_contrast=exposure_contrast,
             covariates=covariates,
             censoring_definition_approved=censoring_definition_approved,
+            additional_population=substituted.get("population_additional", ()),
             **settings,
         )
         validation = QueryValidationAgent().run(sql, purpose="person_level_dataset")
@@ -2811,6 +2993,7 @@ class WorkflowManager:
                 grace_period_hours=hypothesis["grace_period_hours"],
                 follow_up_days=hypothesis["follow_up_days"],
                 exposure_contrast=exposure_contrast,
+                additional_population=specs.get("population_additional", ()),
                 **settings,
             ),
             "aggregate_feasibility",
@@ -2879,6 +3062,7 @@ class WorkflowManager:
                 grace_period_hours=hypothesis["grace_period_hours"],
                 follow_up_days=hypothesis["follow_up_days"],
                 exposure_contrast=exposure_contrast,
+                additional_population=specs.get("population_additional", ()),
                 **settings,
             ),
             "aggregate_feasibility",
@@ -2958,6 +3142,7 @@ class WorkflowManager:
                 follow_up_days=hypothesis["follow_up_days"],
                 exposure_contrast=exposure_contrast,
                 covariates=covariates,
+                additional_population=specs.get("population_additional", ()),
                 **settings,
             ),
             "aggregate_feasibility",
@@ -3034,6 +3219,7 @@ class WorkflowManager:
                 follow_up_days=hypothesis["follow_up_days"],
                 exposure_contrast=exposure_contrast,
                 covariates=covariates,
+                additional_population=specs.get("population_additional", ()),
                 **settings,
             ),
             "aggregate_feasibility",
@@ -3991,6 +4177,7 @@ class WorkflowManager:
             grace_period_hours=hypothesis["grace_period_hours"],
             follow_up_days=hypothesis["follow_up_days"],
             exposure_contrast=exposure_contrast,
+            additional_population=specs.get("population_additional", ()),
             **settings,
         )
         artifact_path = run_dir / "feasibility.json"
@@ -4053,6 +4240,7 @@ class WorkflowManager:
             grace_period_hours=grace_period_hours,
             follow_up_days=follow_up_days,
             exposure_contrast=exposure_contrast,
+            additional_population=specs.get("population_additional", ()),
             **settings,
         )
         validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")

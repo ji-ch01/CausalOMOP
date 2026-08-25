@@ -34,6 +34,13 @@ Required JSON shape:
     "comparator_terms": ["0 to 3 short comparator terms"],
     "outcome_terms": ["1 to 3 short outcome terms"]
   },
+  "additional_population_diagnoses": [
+    {
+      "name": "short_snake_case_key, distinct from every other name/study_id here",
+      "label": "the diagnosis/condition, e.g. 'Chronic obstructive pulmonary disease'",
+      "lookup_term": "1 short clinical noun phrase for OMOP vocabulary search"
+    }
+  ],
   "first_pass_covariates": ["one short clinical label per plausible covariate"],
   "design_constraints": [],
   "assumptions_requiring_review": []
@@ -48,6 +55,14 @@ Rules:
   comparison against a published study. Only set primary_estimand to ATE or ATT instead
   of CATE if the user question explicitly asks for a single population-average effect
   and rejects subgroup/heterogeneity analysis.
+- population must describe the study's eligibility population in full, but when it
+  requires more than one independently-verifiable diagnosis/condition (e.g. "adults
+  with type 2 diabetes AND COPD"), list every diagnosis beyond the first in
+  additional_population_diagnoses instead of relying on population's free text alone --
+  each entry there becomes its own separately-mapped, independently-required OMOP
+  concept set, which a single free-text population description cannot become. Leave
+  additional_population_diagnoses empty (the common case) when population is already
+  one single verifiable diagnosis/condition.
 - Never invent OMOP concept IDs or claim that a variable is available.
 - Use explicit time zero, exposure grace period, and follow-up.
 - If the question is underspecified, choose conservative draft values and list

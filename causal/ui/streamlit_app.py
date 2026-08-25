@@ -258,6 +258,8 @@ _REVIEWER_FIELD_KEY_PREFIXES = (
     "covariate_window_reviewer_",
     "covariate_aggregation_reviewer_",
     "covariate_map_reviewer_",
+    "add_pop_reviewer_",
+    "remove_pop_reviewer_",
 )
 
 
@@ -1461,6 +1463,76 @@ def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_d
         width="stretch",
     )
     _render_concept_set_mapping_forms(manager, run_id, concept_sets, exposure_contrast)
+    _render_population_concept_set_manager(manager, run_id, protocol or {})
+
+
+def _render_population_concept_set_manager(manager: WorkflowManager, run_id: str, protocol: dict[str, Any]) -> None:
+    """A population defined by more than one independently-required
+    diagnosis (e.g. "adults with type 2 diabetes AND COPD") needs more than
+    the single `concept_sets["population"]` entry the table/forms above
+    manage -- see `WorkflowManager.add_population_concept_set`'s docstring
+    for why a second required diagnosis can't just be mapped into that one
+    slot. This adds/removes entries; the new entry then gets mapped/approved
+    through the ordinary, unmodified forms above like any other concept set.
+    """
+    additional_names = tuple(protocol.get("additional_population_concept_sets", ()) or ())
+    if additional_names:
+        st.caption(
+            "Required, ANDed with population: " + ", ".join(additional_names)
+        )
+        for name in additional_names:
+            with st.form(key=f"remove_population_concept_set_{run_id}_{name}"):
+                st.caption(f"Remove '{name}' as a required population diagnosis")
+                reviewer = st.text_input(
+                    "Reviewer", value=_reviewer_default(), key=f"remove_pop_reviewer_{run_id}_{name}"
+                )
+                comment = st.text_area(
+                    "Reason (optional)", key=f"remove_pop_comment_{run_id}_{name}"
+                )
+                if st.form_submit_button(f"Remove '{name}'"):
+                    try:
+                        manager.remove_population_concept_set(run_id, name, reviewer, comment or None)
+                        st.success(f"'{name}' removed")
+                        st.rerun()
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
+
+    with st.expander("+ Add a required population diagnosis", expanded=False):
+        st.caption(
+            "Adds a second (or further) diagnosis that must ALSO be present -- ANDed with "
+            "population, not an alternative to it. Only creates the entry; map/approve it via "
+            "the table above afterward."
+        )
+        with st.form(key=f"add_population_concept_set_{run_id}"):
+            name = st.text_input(
+                "Short key (e.g. 'copd')", key=f"add_pop_name_{run_id}",
+                help="Becomes the concept_sets dict key -- lowercase, no spaces.",
+            )
+            label = st.text_input(
+                "Diagnosis/condition (e.g. 'Chronic obstructive pulmonary disease')",
+                key=f"add_pop_label_{run_id}",
+            )
+            lookup_term = st.text_input(
+                "OMOP search term (optional, e.g. 'COPD')", key=f"add_pop_lookup_{run_id}"
+            )
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"add_pop_reviewer_{run_id}"
+            )
+            comment = st.text_area("Comment (optional)", key=f"add_pop_comment_{run_id}")
+            if st.form_submit_button("Add required diagnosis"):
+                try:
+                    manager.add_population_concept_set(
+                        run_id,
+                        name=name,
+                        label=label,
+                        lookup_term=lookup_term,
+                        reviewer=reviewer,
+                        comment=comment or None,
+                    )
+                    st.success(f"'{name.strip()}' added -- map it to OMOP concepts above")
+                    st.rerun()
+                except (ValueError, RuntimeError) as exc:
+                    st.error(str(exc))
 
 
 def _render_regenerate_plan_section(manager: WorkflowManager, run_id: str) -> None:

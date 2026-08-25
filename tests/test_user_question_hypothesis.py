@@ -208,6 +208,58 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.parse_response(QUESTION, json.dumps(response))
 
+    def test_additional_population_diagnoses_absent_by_default(self):
+        protocol = self.service.parse_response(QUESTION, json.dumps(valid_response()))
+        self.assertEqual(protocol["additional_population_concept_sets"], [])
+        self.assertEqual(sorted(protocol["concept_sets"]), ["comparator", "outcome", "population", "treatment"])
+
+    def test_additional_population_diagnoses_scaffold_a_required_concept_set(self):
+        response = valid_response()
+        response["additional_population_diagnoses"] = [
+            {"name": "copd", "label": "Chronic obstructive pulmonary disease", "lookup_term": "COPD"},
+        ]
+        protocol = self.service.parse_response(QUESTION, json.dumps(response))
+        self.assertEqual(protocol["additional_population_concept_sets"], ["copd"])
+        self.assertEqual(
+            protocol["concept_sets"]["copd"],
+            {
+                "status": "pending_omop_mapping", "concept_ids": [],
+                "label": "Chronic obstructive pulmonary disease", "lookup_term": "COPD",
+                "role": "population_secondary", "domain": "",
+            },
+        )
+        # The primary four roles are unaffected by an additional entry.
+        self.assertEqual(protocol["concept_sets"]["population"]["role"], "population")
+
+    def test_additional_population_diagnoses_name_is_slugified(self):
+        response = valid_response()
+        response["additional_population_diagnoses"] = [
+            {"name": "Chronic Obstructive Pulmonary Disease", "label": "COPD", "lookup_term": ""},
+        ]
+        protocol = self.service.parse_response(QUESTION, json.dumps(response))
+        self.assertEqual(protocol["additional_population_concept_sets"], ["chronic_obstructive_pulmonary_disease"])
+
+    def test_additional_population_diagnoses_rejects_a_name_colliding_with_a_fixed_role(self):
+        response = valid_response()
+        response["additional_population_diagnoses"] = [{"name": "treatment", "label": "x", "lookup_term": ""}]
+        with self.assertRaises(ValueError):
+            self.service.parse_response(QUESTION, json.dumps(response))
+
+    def test_additional_population_diagnoses_rejects_duplicate_names(self):
+        response = valid_response()
+        response["additional_population_diagnoses"] = [
+            {"name": "copd", "label": "COPD", "lookup_term": ""},
+            {"name": "COPD", "label": "duplicate after slugification", "lookup_term": ""},
+        ]
+        with self.assertRaises(ValueError):
+            self.service.parse_response(QUESTION, json.dumps(response))
+
+    def test_additional_population_diagnoses_requires_a_non_empty_label(self):
+        response = valid_response()
+        response["additional_population_diagnoses"] = [{"name": "copd", "label": "", "lookup_term": ""}]
+        with self.assertRaises(ValueError):
+            self.service.parse_response(QUESTION, json.dumps(response))
+
     def test_normalizes_mixed_case_study_id_instead_of_rejecting(self):
         response = valid_response()
         response["study_id"] = "Sepsis_ICU_Albumin_vs_Crystalloid_Mortality"

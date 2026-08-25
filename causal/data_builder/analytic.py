@@ -78,6 +78,7 @@ class AnalyticCohortBuilder:
         exposure_contrast: str = "add_on",
         covariates: tuple[CovariateSpec, ...] = (),
         censoring_definition_approved: bool = False,
+        additional_population: tuple[ConceptSetSpec, ...] = (),
         execution_allowed: bool,
     ) -> tuple[str, CohortBuildManifest]:
         """`covariates` are reviewed, human-approved baseline covariates (see
@@ -92,6 +93,11 @@ class AnalyticCohortBuilder:
         analytic_cohort_sql`'s own docstring for the exact definition and
         `causal.orchestrator.workflow.WorkflowManager.
         approve_censoring_definition` for the human-review gate.
+
+        `additional_population` (see `causal.queries.feasibility._cohort_ctes`)
+        ANDs one or more further independently-required population concept
+        sets onto `population` -- empty by default, unchanged behavior for a
+        study with a single-concept population.
         """
         if not study_id.strip():
             raise ValueError("study_id is required")
@@ -110,6 +116,7 @@ class AnalyticCohortBuilder:
             exposure_contrast=exposure_contrast,
             covariates=covariates,
             censoring_definition_approved=censoring_definition_approved,
+            additional_population=additional_population,
         )
         covariate_columns = tuple(
             AnalyticColumn(
@@ -151,6 +158,7 @@ class AnalyticCohortBuilder:
         min_age_years: int | None = 18,
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
+        additional_population: tuple[ConceptSetSpec, ...] = (),
     ) -> str:
         """Return an aggregate-only query safe for MCP feasibility output."""
         cohort_sql, _ = self.build(
@@ -159,6 +167,7 @@ class AnalyticCohortBuilder:
             grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
+            additional_population=additional_population,
             execution_allowed=False,
         )
         return f"""
@@ -196,6 +205,7 @@ class AnalyticCohortBuilder:
         min_age_years: int | None = 18,
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
+        additional_population: tuple[ConceptSetSpec, ...] = (),
     ) -> str:
         """Audit nominal follow-up observability and return aggregate counts only."""
         cohort_sql, _ = self.build(
@@ -204,6 +214,7 @@ class AnalyticCohortBuilder:
             grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
+            additional_population=additional_population,
             execution_allowed=False,
         )
         return f"""
@@ -267,6 +278,7 @@ class AnalyticCohortBuilder:
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
         covariates: tuple[CovariateSpec, ...] = (),
+        additional_population: tuple[ConceptSetSpec, ...] = (),
     ) -> str:
         """Univariate treatment-arm overlap, one reviewed baseline covariate at
         a time -- a practical proxy for positivity (Hernan & Robins, *Causal
@@ -293,6 +305,7 @@ class AnalyticCohortBuilder:
             grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast, covariates=covariates,
+            additional_population=additional_population,
             execution_allowed=False,
         )
         columns = [
@@ -341,6 +354,7 @@ class AnalyticCohortBuilder:
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
         covariates: tuple[CovariateSpec, ...] = (),
+        additional_population: tuple[ConceptSetSpec, ...] = (),
     ) -> str:
         """Per-covariate missingness across the full analytic cohort,
         generalizing `profile_sql`'s hardcoded age/gender/race-only pattern
@@ -358,6 +372,7 @@ class AnalyticCohortBuilder:
             grace_period_hours=grace_period_hours, follow_up_days=follow_up_days,
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast, covariates=covariates,
+            additional_population=additional_population,
             execution_allowed=False,
         )
         columns = ["COUNT(*) AS cohort_persons"]

@@ -986,6 +986,10 @@ class UserQuestionHypothesisService:
             protocol.get("literature_search")
         )
         protocol["concept_sets"] = self._pending_concept_sets(protocol)
+        protocol["additional_population_concept_sets"] = [
+            name for name, entry in protocol["concept_sets"].items()
+            if entry.get("role") == "population_secondary"
+        ]
         protocol.setdefault("design_constraints", [])
         protocol["design_constraints"] = list(protocol["design_constraints"]) + [
             "LLM-generated draft requires human protocol approval",
@@ -1055,7 +1059,7 @@ class UserQuestionHypothesisService:
         """
         target = protocol.get("target_trial", {})
         literature_search = protocol.get("literature_search") or {}
-        return {
+        concept_sets = {
             role: {
                 "status": "pending_omop_mapping",
                 "concept_ids": [],
@@ -1066,3 +1070,58 @@ class UserQuestionHypothesisService:
             }
             for role in ("population", "treatment", "comparator", "outcome")
         }
+        for item in UserQuestionHypothesisService._additional_population_diagnoses(protocol):
+            concept_sets[item["name"]] = {
+                "status": "pending_omop_mapping",
+                "concept_ids": [],
+                "label": item["label"],
+                "lookup_term": item["lookup_term"],
+                "role": "population_secondary",
+                "domain": "",
+            }
+        return concept_sets
+
+    @staticmethod
+    def _additional_population_diagnoses(protocol: dict) -> list[dict[str, str]]:
+        """Validate `additional_population_diagnoses` (see `causal/prompts/
+        hypothesis.md`): further independently-required population diagnoses
+        beyond `target_trial.population`, each becoming its own
+        `concept_sets` entry (see `_pending_concept_sets`) that
+        `causal.orchestrator.workflow.WorkflowManager.add_population_
+        concept_set` also produces for a human-driven addition. Names are
+        slugified the same way `study_id` is (lowercase, non-alnum -> `_`)
+        and rejected if that collides with the four fixed roles, with
+        another diagnosis's name, or is empty after slugification -- never
+        silently deduplicated or renamed, since that would silently merge or
+        drop a reviewer-meaningful diagnosis.
+        """
+        raw = protocol.get("additional_population_diagnoses", ())
+        if not isinstance(raw, list):
+            return []
+        reserved = {"population", "treatment", "comparator", "outcome"}
+        seen: set[str] = set()
+        diagnoses: list[dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("additional_population_diagnoses entries must be objects")
+            name = item.get("name")
+            label = item.get("label")
+            lookup_term = item.get("lookup_term", "")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("additional_population_diagnoses entry requires a non-empty name")
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError("additional_population_diagnoses entry requires a non-empty label")
+            if not isinstance(lookup_term, str):
+                raise ValueError("additional_population_diagnoses lookup_term must be a string")
+            slug = _STUDY_ID_INVALID_CHARS.sub("_", name.strip().lower()).strip("_")
+            if not slug:
+                raise ValueError(f"additional_population_diagnoses name '{name}' normalizes to empty")
+            if slug in reserved:
+                raise ValueError(
+                    f"additional_population_diagnoses name '{name}' collides with a fixed concept_sets role"
+                )
+            if slug in seen:
+                raise ValueError(f"additional_population_diagnoses defines '{slug}' more than once")
+            seen.add(slug)
+            diagnoses.append({"name": slug, "label": label.strip(), "lookup_term": lookup_term.strip()})
+        return diagnoses

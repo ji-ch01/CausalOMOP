@@ -280,7 +280,12 @@ class HypothesisAgent:
             exposure_contrast_settings.get("exposure_contrast", "add_on")
             if isinstance(exposure_contrast_settings, dict) else "add_on"
         )
-        unresolved = self._unresolved_concept_sets(protocol.get("concept_sets", {}), exposure_contrast)
+        active_population_secondary = tuple(
+            str(name).strip() for name in protocol.get("additional_population_concept_sets", ()) or ()
+        )
+        unresolved = self._unresolved_concept_sets(
+            protocol.get("concept_sets", {}), exposure_contrast, active_population_secondary
+        )
         dag_variables = self._candidate_dag(protocol.get("candidate_dag", ()))
         known_labels = {variable.label for variable in dag_variables}
         covariate_relations = self._covariate_relations(protocol.get("covariate_relations", ()), known_labels)
@@ -582,7 +587,10 @@ class HypothesisAgent:
         return tuple(majors)
 
     @staticmethod
-    def _unresolved_concept_sets(concept_sets: Any, exposure_contrast: str = "add_on") -> tuple[str, ...]:
+    def _unresolved_concept_sets(
+        concept_sets: Any, exposure_contrast: str = "add_on",
+        active_population_secondary: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
         if not isinstance(concept_sets, dict):
             return ("concept_sets: missing",)
         issues = []
@@ -598,6 +606,16 @@ class HypothesisAgent:
                 role == "comparator" and exposure_contrast == "vs_unexposed"
                 and status == "no_standard_concept"
             ):
+                continue
+            # A `role="population_secondary"` entry (see
+            # `WorkflowManager.add_population_concept_set`) is only required
+            # while its name is still listed in
+            # `protocol["additional_population_concept_sets"]` --
+            # `remove_population_concept_set` unlists it without deleting the
+            # entry itself (kept for audit/reuse), so an unlisted one must
+            # stop blocking `executable`/`unresolved_issues` even while still
+            # unmapped.
+            if role == "population_secondary" and name not in active_population_secondary:
                 continue
             if status != "approved":
                 issues.append(f"concept_set:{name}:{status}")

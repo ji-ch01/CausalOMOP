@@ -308,13 +308,30 @@ def _cohort_ctes(
     min_age_years: int | None,
     care_site_names: tuple[str, ...],
     exposure_contrast: str,
+    additional_population: tuple[ConceptSetSpec, ...] = (),
 ) -> str:
     if population.domain not in DOMAIN_TABLES:
         raise ValueError(f"population domain must be one of {tuple(DOMAIN_TABLES)}")
     if outcome.domain not in OUTCOME_DOMAINS:
         raise ValueError(f"outcome domain must be one of {OUTCOME_DOMAINS}")
-    if grace_period_hours <= 0 or follow_up_days <= 0:
-        raise ValueError("Study windows must be positive")
+    # grace_period_hours == 0 passes this check -- roadmap.py's
+    # `TargetTrialProtocol.__post_init__`, `hypothesis.py`'s
+    # `_positive_int(..., allow_zero=True)`, and the drafting prompt's own
+    # example (`causal/prompts/hypothesis.md`) all already treat 0 as a
+    # structurally valid integer. But the treatment-matching window built
+    # below is the half-open interval `[index_datetime, index_datetime +
+    # grace_period_hours)` (see the `t.{trt_dt_col} >=`/`<` pair a few lines
+    # down) -- at grace_period_hours=0 that interval has zero width and can
+    # never contain any timestamp, so `has_treatment` is guaranteed false for
+    # every person regardless of the real drug-exposure data (a silent,
+    # 100%-untreated cohort, not a validation error). A reviewer wanting
+    # "treatment recorded at essentially the same instant as index_datetime"
+    # needs a small positive value (the row's own timestamp precision is
+    # rarely finer than seconds/minutes), not 0. Only follow_up_days must be
+    # strictly positive: a 0-or-negative follow-up window is never
+    # meaningful.
+    if grace_period_hours < 0 or follow_up_days <= 0:
+        raise ValueError("grace_period_hours must be >= 0 and follow_up_days must be positive")
     if min_age_years is not None and min_age_years < 0:
         raise ValueError("min_age_years must be non-negative")
 
@@ -352,11 +369,42 @@ def _cohort_ctes(
       JOIN {datasets.table('omop', 'care_site')} cs USING (care_site_id)"""
         site_filter = f"AND cs.care_site_name IN ({names})"
 
-    age_filter = ""
-    if min_age_years is not None:
-        age_filter = (
-            f"WHERE EXTRACT(YEAR FROM DATE(el.index_datetime)) - p.year_of_birth >= {int(min_age_years)}"
+    # Every additional required population concept set (see `ConceptSetSpec`'s
+    # sibling `additional_population` param -- one entry per independently-
+    # required diagnosis, e.g. "type 2 diabetes AND COPD") is ANDed onto
+    # `eligible` as its own `EXISTS` semi-join, not a plain `JOIN`: a `JOIN`
+    # would fan out one row per matching event in the second domain table
+    # (e.g. multiple COPD diagnosis rows), silently duplicating downstream
+    # aggregate counts and per-person columns. `EXISTS` only ever contributes
+    # a true/false filter. Bounded to `<= el.index_datetime`, the same
+    # baseline-only convention covariates use by default: a diagnosis first
+    # recorded after the population-defining index event must not
+    # retroactively qualify someone (that would be reverse-causation-prone,
+    # not a pre-existing baseline condition).
+    additional_population_ctes: list[str] = []
+    additional_population_filters: list[str] = []
+    for index, spec in enumerate(additional_population):
+        if spec.domain not in DOMAIN_TABLES:
+            raise ValueError(f"additional_population[{index}] domain must be one of {tuple(DOMAIN_TABLES)}")
+        alias = f"population_additional_{index}_concepts"
+        additional_population_ctes.append(
+            _expanded_concepts_cte(alias, spec, f"additional_population[{index}]", datasets)
         )
+        ap_table, ap_concept_col, ap_dt_col = DOMAIN_TABLES[spec.domain]
+        additional_population_filters.append(f"""EXISTS (
+        SELECT 1
+        FROM {datasets.table('omop', ap_table)} ap
+        JOIN {alias} apc ON ap.{ap_concept_col} = apc.concept_id
+        WHERE ap.person_id = el.person_id AND ap.{ap_dt_col} <= el.index_datetime
+      )""")
+
+    eligible_filters: list[str] = []
+    if min_age_years is not None:
+        eligible_filters.append(
+            f"EXTRACT(YEAR FROM DATE(el.index_datetime)) - p.year_of_birth >= {int(min_age_years)}"
+        )
+    eligible_filters.extend(additional_population_filters)
+    eligible_where = f"WHERE {' AND '.join(eligible_filters)}" if eligible_filters else ""
 
     ctes = [
         _expanded_concepts_cte("population_concepts", population, "population", datasets),
@@ -370,11 +418,12 @@ def _cohort_ctes(
         PARTITION BY ev.person_id ORDER BY ev.{pop_dt_col}, ev.{pop_concept_col}
       ) = 1
     )""",
+        *additional_population_ctes,
         f"""eligible AS (
       SELECT el.person_id, el.visit_occurrence_id, el.index_datetime
       FROM first_population_event el
       JOIN {datasets.table('omop', 'person')} p USING (person_id)
-      {age_filter}
+      {eligible_where}
     )""",
         _expanded_concepts_cte("treatment_concepts", treatment, "treatment", datasets),
     ]
@@ -480,6 +529,7 @@ def feasibility_sql(
     min_age_years: int | None = 18,
     care_site_names: tuple[str, ...] = (),
     exposure_contrast: str = "add_on",
+    additional_population: tuple[ConceptSetSpec, ...] = (),
 ) -> str:
     """Aggregate-only feasibility counts for an arbitrary target-trial question.
 
@@ -488,6 +538,11 @@ def feasibility_sql(
     decide whether `comparator` needs to resolve to a real OMOP concept at
     all (see `EXPOSURE_CONTRASTS`'s `"vs_unexposed"`), not to filter these
     counts the way `analytic_cohort_sql`'s inclusion filter does.
+
+    `additional_population` (see `_cohort_ctes`) ANDs one or more further
+    independently-required population concept sets onto `population` --
+    empty by default, unchanged behavior for a study with a single-concept
+    population.
     """
     if exposure_contrast not in EXPOSURE_CONTRASTS:
         raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
@@ -502,6 +557,7 @@ def feasibility_sql(
         min_age_years=min_age_years,
         care_site_names=care_site_names,
         exposure_contrast=exposure_contrast,
+        additional_population=additional_population,
     )
     return f"""
     WITH {ctes}
@@ -535,8 +591,14 @@ def analytic_cohort_sql(
     exposure_contrast: str = "add_on",
     covariates: tuple[CovariateSpec, ...] = (),
     censoring_definition_approved: bool = False,
+    additional_population: tuple[ConceptSetSpec, ...] = (),
 ) -> str:
     """Person-level analytic cohort (A/Y columns) for the same target trial.
+
+    `additional_population` (see `_cohort_ctes`) ANDs one or more further
+    independently-required population concept sets onto `population` --
+    empty by default, unchanged behavior for a study with a single-concept
+    population.
 
     `exposure_contrast` (see `EXPOSURE_CONTRASTS`) selects the inclusion
     filter and the meaning of `A`; it does not change how `treatment`/
@@ -575,6 +637,7 @@ def analytic_cohort_sql(
         min_age_years=min_age_years,
         care_site_names=care_site_names,
         exposure_contrast=exposure_contrast,
+        additional_population=additional_population,
     )
     where_clause = {
         "add_on": "WHERE a.has_comparator",

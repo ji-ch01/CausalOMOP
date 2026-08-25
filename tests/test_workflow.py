@@ -101,6 +101,91 @@ class WorkflowTests(unittest.TestCase):
             state = self.manager.advance(state.run_id)
         self.assertEqual(state.phase, "concept_mapping")
 
+    def _protocol_path_with_approved_concept_sets(self):
+        """`_full_protocol_path` plus an approved population/treatment/
+        comparator, needed as a base for `add_population_concept_set`
+        (requires `hypothesis.json`, which in turn needs `concept_sets`
+        present to run cleanly)."""
+        path = self._full_protocol_path()
+        protocol = json.loads(path.read_text(encoding="utf-8"))
+        protocol["concept_sets"] = {
+            "t2dm": {"role": "population", "status": "approved", "domain": "condition", "concept_ids": [1]},
+            "metformin": {"role": "treatment", "status": "approved", "domain": "drug", "concept_ids": [2]},
+            "no_metformin": {"role": "comparator", "status": "approved", "domain": "drug", "concept_ids": [3]},
+        }
+        path.write_text(json.dumps(protocol), encoding="utf-8")
+        return path
+
+    def test_add_population_concept_set_creates_pending_entry(self):
+        state = self.manager.start(self._protocol_path_with_approved_concept_sets())
+        self.manager.run_hypothesis_agent(state.run_id)
+
+        self.manager.add_population_concept_set(
+            state.run_id, name="copd", label="Chronic obstructive pulmonary disease",
+            lookup_term="COPD", reviewer="tester", comment="second required diagnosis",
+        )
+
+        run_dir = Path(self.temp.name) / "runs" / state.run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            protocol["concept_sets"]["copd"],
+            {
+                "status": "pending_omop_mapping", "concept_ids": [], "label": "Chronic obstructive pulmonary disease",
+                "lookup_term": "COPD", "role": "population_secondary", "domain": "",
+            },
+        )
+        self.assertEqual(protocol["additional_population_concept_sets"], ["copd"])
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        self.assertIn("concept_set:copd:pending_omop_mapping", hypothesis["unresolved_issues"])
+        self.assertFalse(hypothesis["executable"])
+
+    def test_add_population_concept_set_requires_hypothesis_json(self):
+        state = self.manager.start(self._protocol_path_with_approved_concept_sets())
+        with self.assertRaises(RuntimeError):
+            self.manager.add_population_concept_set(
+                state.run_id, name="copd", label="COPD", reviewer="tester",
+            )
+
+    def test_add_population_concept_set_rejects_a_name_already_in_use(self):
+        state = self.manager.start(self._protocol_path_with_approved_concept_sets())
+        self.manager.run_hypothesis_agent(state.run_id)
+        with self.assertRaises(ValueError):
+            self.manager.add_population_concept_set(
+                state.run_id, name="t2dm", label="duplicate", reviewer="tester",
+            )
+
+    def test_add_population_concept_set_requires_name_and_label_and_reviewer(self):
+        state = self.manager.start(self._protocol_path_with_approved_concept_sets())
+        self.manager.run_hypothesis_agent(state.run_id)
+        with self.assertRaises(ValueError):
+            self.manager.add_population_concept_set(state.run_id, name="", label="x", reviewer="tester")
+        with self.assertRaises(ValueError):
+            self.manager.add_population_concept_set(state.run_id, name="copd", label="", reviewer="tester")
+        with self.assertRaises(ValueError):
+            self.manager.add_population_concept_set(state.run_id, name="copd", label="x", reviewer="")
+
+    def test_remove_population_concept_set_deletes_the_entry_and_unblocks_executable(self):
+        state = self.manager.start(self._protocol_path_with_approved_concept_sets())
+        self.manager.run_hypothesis_agent(state.run_id)
+        self.manager.add_population_concept_set(
+            state.run_id, name="copd", label="COPD", reviewer="tester",
+        )
+
+        self.manager.remove_population_concept_set(state.run_id, "copd", "tester", "added by mistake")
+
+        run_dir = Path(self.temp.name) / "runs" / state.run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        self.assertNotIn("copd", protocol["concept_sets"])
+        self.assertEqual(protocol["additional_population_concept_sets"], [])
+        hypothesis = json.loads((run_dir / "hypothesis.json").read_text(encoding="utf-8"))
+        self.assertNotIn("concept_set:copd:pending_omop_mapping", hypothesis["unresolved_issues"])
+
+    def test_remove_population_concept_set_requires_a_declared_name(self):
+        state = self.manager.start(self._protocol_path_with_approved_concept_sets())
+        self.manager.run_hypothesis_agent(state.run_id)
+        with self.assertRaises(ValueError):
+            self.manager.remove_population_concept_set(state.run_id, "never_added", "tester")
+
     def test_provisional_mapping_only_allows_exploration(self):
         exploratory = self.manager.start(self._full_protocol_path(), "exploratory")
         _approve_pre_mapping_gates(self.manager, exploratory.run_id)
@@ -1083,6 +1168,85 @@ class LoadConceptSpecsTests(unittest.TestCase):
     def test_missing_concept_sets_raises(self):
         with self.assertRaises(RuntimeError):
             _load_concept_specs({})
+
+
+class LoadConceptSpecsAdditionalPopulationTests(unittest.TestCase):
+    """`additional_population_concept_sets` (see `WorkflowManager.
+    add_population_concept_set`) ANDs one or more further, independently-
+    required population concept sets onto `specs["population"]` -- resolved
+    directly by name (`dag_node_label`), not via `resolve_role`, since two
+    entries sharing one `causal_role` would otherwise raise (see
+    `test_two_entries_declaring_the_same_role_raises` above)."""
+
+    @staticmethod
+    def _approved(role: str, domain: str, concept_ids: list[int]) -> dict:
+        return {"role": role, "status": "approved", "domain": domain, "concept_ids": concept_ids}
+
+    def _base_concept_sets(self) -> dict:
+        return {
+            "t2dm": self._approved("population", "condition", [1]),
+            "metformin": self._approved("treatment", "drug", [2]),
+            "no_metformin": self._approved("comparator", "drug", [3]),
+        }
+
+    def test_absent_by_default(self):
+        specs = _load_concept_specs({"concept_sets": self._base_concept_sets()})
+        self.assertEqual(specs["population_additional"], ())
+        self.assertEqual(specs["population_additional_names"], ())
+
+    def test_resolves_one_additional_entry(self):
+        concept_sets = self._base_concept_sets()
+        concept_sets["copd"] = self._approved("population_secondary", "condition", [255573])
+        specs = _load_concept_specs({
+            "concept_sets": concept_sets,
+            "additional_population_concept_sets": ["copd"],
+        })
+        self.assertEqual(specs["population_additional"], (ConceptSetSpec(domain="condition", concept_ids=(255573,)),))
+        self.assertEqual(specs["population_additional_names"], ("copd",))
+
+    def test_resolves_multiple_entries_in_declared_order(self):
+        concept_sets = self._base_concept_sets()
+        concept_sets["copd"] = self._approved("population_secondary", "condition", [255573])
+        concept_sets["ckd"] = self._approved("population_secondary", "condition", [46271022])
+        specs = _load_concept_specs({
+            "concept_sets": concept_sets,
+            "additional_population_concept_sets": ["ckd", "copd"],
+        })
+        self.assertEqual(
+            specs["population_additional"],
+            (
+                ConceptSetSpec(domain="condition", concept_ids=(46271022,)),
+                ConceptSetSpec(domain="condition", concept_ids=(255573,)),
+            ),
+        )
+        self.assertEqual(specs["population_additional_names"], ("ckd", "copd"))
+
+    def test_undeclared_name_raises(self):
+        with self.assertRaises(RuntimeError):
+            _load_concept_specs({
+                "concept_sets": self._base_concept_sets(),
+                "additional_population_concept_sets": ["copd"],
+            })
+
+    def test_unapproved_entry_raises(self):
+        concept_sets = self._base_concept_sets()
+        concept_sets["copd"] = {
+            "role": "population_secondary", "status": "pending_omop_mapping", "domain": "", "concept_ids": [],
+        }
+        with self.assertRaises(RuntimeError):
+            _load_concept_specs({
+                "concept_sets": concept_sets,
+                "additional_population_concept_sets": ["copd"],
+            })
+
+    def test_does_not_affect_the_primary_population_role(self):
+        concept_sets = self._base_concept_sets()
+        concept_sets["copd"] = self._approved("population_secondary", "condition", [255573])
+        specs = _load_concept_specs({
+            "concept_sets": concept_sets,
+            "additional_population_concept_sets": ["copd"],
+        })
+        self.assertEqual(specs["population"], ConceptSetSpec(domain="condition", concept_ids=(1,)))
 
 
 class LoadConceptSpecsVsUnexposedComparatorTests(unittest.TestCase):

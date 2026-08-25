@@ -203,6 +203,7 @@ class BigQueryOMOPGateway:
         min_age_years: int | None = 18,
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
+        additional_population: tuple[ConceptSetSpec, ...] = (),
     ) -> dict[str, Any]:
         """Run provisional cohort counts for one target-trial question.
 
@@ -224,6 +225,7 @@ class BigQueryOMOPGateway:
             min_age_years=min_age_years,
             care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
+            additional_population=additional_population,
         )
         validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")
         if not validation.passed:

@@ -193,9 +193,10 @@ class DataScienceAgent:
             ),)
         if "time_zero" not in declared_roles:
             phenotypes += (PhenotypePlan(
-                name="index_event", role="time_zero", status="definition_pending",
+                name="index_event", role="time_zero", status="standard_table",
                 mode="standard", domain="standard",
                 omop_tables=("visit_detail", "visit_occurrence"), concept_ids=(),
+                approval_required=False,
             ),)
 
         if concept_lookup is not None:
@@ -242,10 +243,17 @@ class DataScienceAgent:
         source_fallback_available = all(
             item.mode in {"standard", "source_value_provisional"} for item in phenotypes
         )
+        # `additional_population_concept_sets` (see `WorkflowManager.
+        # add_population_concept_set`) names further, independently-required
+        # population concept sets that ANDed onto `population` -- their role
+        # ("population_secondary") is not itself in `_REQUIRED_PHENOTYPE_ROLES`
+        # since it's not always required (an unlisted, removed entry must not
+        # block this), so active ones are checked here explicitly instead.
+        active_population_secondary = set(protocol.get("additional_population_concept_sets", ()) or ())
         core_definitions_ready = all(
             item.status not in {"missing", "definition_pending"}
             for item in phenotypes
-            if item.role in _REQUIRED_PHENOTYPE_ROLES
+            if item.role in _REQUIRED_PHENOTYPE_ROLES or item.name in active_population_secondary
         )
 
         treatment_name = self._phenotype_name_for_role(phenotypes, "treatment", "treatment_and_comparator")
