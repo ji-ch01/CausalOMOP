@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import random
@@ -7,6 +8,8 @@ import time
 import unittest
 from pathlib import Path
 
+import pandas as pd
+
 from causal.config import BigQueryDatasets
 from causal.mcp_client import MCPToolResponse
 from causal.orchestrator import WorkflowManager
@@ -14,6 +17,7 @@ from causal.orchestrator.workflow import (
     _LOCK_STALE_SECONDS,
     _RunLock,
     _check_mapping_coverage,
+    _dispatch_estimator,
     _load_concept_specs,
     _mapping_coverage_roles,
     _mismatched_concept_domains,
@@ -2393,6 +2397,158 @@ class WorkflowMaterializeAnalyticDatasetTests(unittest.TestCase):
         self.assertEqual(statistical_estimand["outcome_model"], "logistic_regression_unpenalized")
 
 
+def _fake_estimation_procedure_llm(prompt: str) -> str:
+    return json.dumps({
+        "estimation_procedure": "targeted_minimum_loss_based_estimation",
+        "rationale": "Doubly robust given the diagnostics passed in this prompt.",
+    })
+
+
+def _never_call_estimation_procedure_llm(prompt: str) -> str:
+    raise AssertionError("llm() must not be called when population_summary == 'CATE'")
+
+
+class WorkflowProposeEstimationProcedureTests(unittest.TestCase):
+    """`propose_estimation_procedure` sits at the same `estimand_review`
+    gate as `set_statistical_estimand_strategy` (`WorkflowMaterializeAnalyticDatasetTests.
+    setUp` above), but this fixture stops right after `build_cohort_plan`
+    -- before the human strategy/gate/advance calls -- since proposing a
+    suggestion is meant to happen *before* the reviewer has decided
+    anything, not after.
+    """
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+                **_FULL_TARGET_TRIAL_FIELDS,
+            },
+            "data_source": "project.dataset",
+            "first_pass_covariates": ["SOFA score"],
+            "concept_sets": {
+                "population": {
+                    "role": "population", "status": "approved",
+                    "domain": "condition", "concept_ids": [132797],
+                },
+                "treatment": {
+                    "role": "treatment", "status": "approved",
+                    "domain": "drug", "concept_ids": [1],
+                },
+                "comparator": {
+                    "role": "comparator", "status": "approved",
+                    "domain": "drug", "concept_ids": [2],
+                },
+                "outcome": {
+                    "role": "outcome", "status": "approved",
+                    "domain": "condition", "concept_ids": [316866],
+                },
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        state = self.manager.start(self.protocol)
+        state = self.manager.run_hypothesis_agent(state.run_id)
+        self.run_id = state.run_id
+        self.run_dir = root / "runs" / self.run_id
+
+        self.manager.review_covariate(
+            self.run_id, "SOFA score", "accept", "Dr. Chen",
+            "Higher SOFA is associated with treatment choice and outcome.",
+            role="confounder", temporal_classification="pre_treatment",
+            domain="measurement",
+        )
+        self.manager.map_covariate_concepts(self.run_id, "SOFA score", [4301868], "Dr. Lee")
+        self.manager.review_covariate_aggregation(
+            self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
+        )
+        _approve_pre_mapping_gates(self.manager, self.run_id)
+        for _ in range(3):
+            state = self.manager.advance(self.run_id)
+        self.manager.decide_gate(self.run_id, "clinical_mapping", "approved", "Dr. Lee")
+        self.manager.advance(self.run_id)
+        self.manager.run_data_science_agent(self.run_id)
+        self.manager.advance(self.run_id)
+        plan_path = self.run_dir / "analysis_plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan["exploratory_execution_allowed"] = True
+        plan["unresolved_issues"] = []
+        for phenotype in plan["phenotypes"]:
+            phenotype["status"] = "approved"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "Dr. Lee")
+        state = self.manager.advance(self.run_id)
+        self.assertEqual(state.phase, "estimand_review")
+        self.manager.build_cohort_plan(self.run_id, self.datasets)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _protocol(self) -> dict:
+        return json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+
+    def test_proposes_a_draft_under_the_new_key_without_touching_settings(self):
+        state = self.manager.propose_estimation_procedure(self.run_id, _fake_estimation_procedure_llm)
+        protocol = self._protocol()
+        suggestion = protocol["statistical_estimand_suggestion"]
+        self.assertEqual(suggestion["estimation_procedure"], "targeted_minimum_loss_based_estimation")
+        self.assertEqual(suggestion["provenance"], "llm_proposed")
+        self.assertNotIn("statistical_estimand_settings", protocol)
+        self.assertTrue(
+            any(entry["event"] == "estimation_procedure_proposed" for entry in state.history)
+        )
+
+    def test_cate_short_circuit_never_calls_the_llm(self):
+        study_spec_path = self.run_dir / "study_specification.json"
+        study_spec = json.loads(study_spec_path.read_text(encoding="utf-8"))
+        study_spec["estimand"]["population_summary"] = "CATE"
+        study_spec_path.write_text(json.dumps(study_spec), encoding="utf-8")
+
+        self.manager.propose_estimation_procedure(self.run_id, _never_call_estimation_procedure_llm)
+        suggestion = self._protocol()["statistical_estimand_suggestion"]
+        self.assertEqual(suggestion["estimation_procedure"], "causal_forest_dml")
+        self.assertEqual(suggestion["provenance"], "deterministic_cate_rule")
+
+    def test_re_proposing_never_clobbers_an_already_approved_run(self):
+        self.manager.set_statistical_estimand_strategy(
+            self.run_id,
+            missing_data_strategy="complete_case_analysis",
+            censoring_strategy="ignore_censoring_administrative_waiver",
+            censoring_rationale="No informative censoring expected in this synthetic fixture.",
+            reviewer="Dr. Lee",
+            estimation_procedure="plug_in_standardization",
+        )
+        self.manager.decide_gate(self.run_id, "statistical_estimand", "approved", "Dr. Lee")
+        before = self._protocol()["statistical_estimand_settings"]
+
+        self.manager.propose_estimation_procedure(self.run_id, _fake_estimation_procedure_llm)
+        protocol = self._protocol()
+        self.assertEqual(protocol["statistical_estimand_settings"], before)
+        self.assertEqual(
+            protocol["statistical_estimand_suggestion"]["estimation_procedure"],
+            "targeted_minimum_loss_based_estimation",
+        )
+
+    def test_requires_study_specification_to_exist(self):
+        (self.run_dir / "study_specification.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.propose_estimation_procedure(self.run_id, _fake_estimation_procedure_llm)
+
+    def test_rejects_llm_suggesting_causal_forest_dml_for_non_cate_study(self):
+        def _fake_llm(prompt: str) -> str:
+            return json.dumps({"estimation_procedure": "causal_forest_dml", "rationale": "x"})
+
+        with self.assertRaises(ValueError):
+            self.manager.propose_estimation_procedure(self.run_id, _fake_llm)
+
+
 def _synthetic_cohort_csv(n: int = 300, seed: int = 11) -> str:
     """A larger, statistically usable cohort CSV (unlike `_COHORT_ROWS_CSV`,
     which only has 2 rows for the plumbing-only materialization tests) --
@@ -2541,6 +2697,38 @@ class WorkflowCATETests(WorkflowRunEstimationTests):
     def test_set_cate_cutpoint_requires_a_covariate_name(self):
         with self.assertRaises(ValueError):
             self.manager.set_cate_cutpoint(self.run_id, "  ", 5.0, "Dr. Lee")
+
+
+class DispatchEstimatorCausalForestDMLTests(unittest.TestCase):
+    """Regression test for `_dispatch_estimator`'s handling of
+    `estimation_procedure="causal_forest_dml"` -- a CATE study's forced
+    value (`roadmap.StatisticalEstimand.__post_init__`). Exercised directly
+    against `_dispatch_estimator` rather than through
+    `WorkflowManager.run_estimation`/`run_cate`'s full governed pipeline:
+    fitting a real `CausalForestDML` (`tests/test_cate_agent.py`'s job,
+    deliberately not duplicated here or in `WorkflowCATETests`, see that
+    class's own docstring) is not what this checks -- this checks that
+    `run_estimation`'s dispatch does NOT try to route a `"causal_forest_dml"`
+    estimand through `CATEAgent` (whose `CATEEstimate` has no
+    `effect_measure`/`point_estimate`/`ci_lower`/`ci_upper` fields and would
+    make `run_estimation`'s `state.record(...)` call raise `AttributeError`
+    the moment it ran), falling through to the plug-in g-computation
+    baseline instead, same as an unset/default `estimation_procedure`."""
+
+    def test_falls_through_to_plug_in_standardization(self):
+        dataframe = pd.read_csv(io.StringIO(_synthetic_cohort_csv()))
+        statistical_estimand = {
+            "estimation_procedure": "causal_forest_dml",
+            "censoring_strategy": "ignore_censoring_administrative_waiver",
+            "missing_data_strategy": "complete_case_analysis",
+        }
+        artifact = _dispatch_estimator(
+            statistical_estimand, dataframe,
+            study_id="dispatch_test", covariate_columns=("age", "cov_sofa_score"),
+            n_bootstrap=30, random_seed=1,
+        )
+        self.assertEqual(artifact.estimand.method, "g_computation_standardization")
+        self.assertEqual(artifact.estimand.outcome_model, "logistic_regression_unpenalized")
 
 
 def _fake_negative_control_llm(prompt: str) -> str:

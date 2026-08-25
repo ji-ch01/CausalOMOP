@@ -29,6 +29,12 @@ from causal.agents import (
     analysis_plan_blockers,
 )
 from causal.agents.dag_identification import assess_identification, build_study_specification, review_dag
+from causal.agents.estimation_procedure_suggestion import (
+    DEFAULT_ESTIMATION_PROCEDURE_SUGGESTION_PROMPT_PATH,
+    build_estimation_procedure_suggestion_prompt,
+    deterministic_cate_suggestion,
+    parse_estimation_procedure_suggestion_response,
+)
 from causal.agents.hypothesis import DAG_VARIABLE_DOMAINS, DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
 from causal.agents.results_faithfulness import verify_narrative
 from causal.agents.results_narrative import (
@@ -786,6 +792,25 @@ def _dispatch_estimator(
     `n_bootstrap` is ignored when TMLE is the reviewed procedure -- TMLE
     replaces the bootstrap with a closed-form efficient-influence-curve
     variance estimator.
+
+    Only ever returns an `EstimationArtifact` or a `TMLEArtifact` -- never a
+    `CATEArtifact`, even when `estimation_procedure == "causal_forest_dml"`
+    (a CATE study's forced value, `roadmap.StatisticalEstimand.__post_init__
+    `). This is deliberate, not an unhandled case: `causal.agents.cate.
+    CATEEstimate` has no `effect_measure`/`point_estimate`/`ci_lower`/
+    `ci_upper` fields (it reports a subgroup family, not one population
+    contrast), so it cannot satisfy `run_estimation`'s/`run_negative_control_
+    estimation`'s shared `GComputationEstimate`/`TMLEEstimate` contract --
+    `WorkflowManager.run_cate` is the separate, CATE-shaped call path
+    (`cate.json`) for that. Falling through to `EstimationAgent` (plug-in
+    g-computation) here for a `"causal_forest_dml"` estimand instead gives a
+    CATE study the same population-level ATE `estimation.json` every other
+    study gets -- exactly what `build_causal_report`'s CATE section already
+    assumes exists to cross-check `overall_ate_from_forest` against (see
+    "Overall ATE from the forest (cross-check against the primary estimate
+    above)"). `TMLEAgent` is not used for this fallback: TMLE's SuperLearner
+    nuisance fit is materially more expensive, and this ATE is a secondary
+    cross-check for a CATE run, not this run's primary reviewed estimate.
     """
     estimation_procedure = statistical_estimand.get("estimation_procedure", "plug_in_standardization")
     if estimation_procedure == "targeted_minimum_loss_based_estimation":
@@ -3992,6 +4017,101 @@ class WorkflowManager:
         )
         self._invalidate_gate(state, "statistical_estimand", "statistical_estimand_settings changed")
         self.save(state)
+        return state
+
+    def propose_estimation_procedure(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        *,
+        prompt_path: Path = DEFAULT_ESTIMATION_PROCEDURE_SUGGESTION_PROMPT_PATH,
+    ) -> RunState:
+        """LLM-assisted (deterministic for CATE) `estimation_procedure`
+        suggestion for the `statistical_estimand` gate, alongside `set_
+        statistical_estimand_strategy` above -- an assist, never an
+        approval: this only ever writes `protocol["statistical_estimand_
+        suggestion"]`, a key entirely separate from `protocol["statistical_
+        estimand_settings"]` (the human-approved one, written only by
+        `set_statistical_estimand_strategy`), so a fresh suggestion can
+        never clobber an already-approved run's settings, and no phase gate
+        beyond requiring `study_specification.json` to exist is needed --
+        mirrors `set_statistical_estimand_strategy` itself, which has none
+        either, so a reviewer can propose/re-propose at any point this
+        gate's form is open.
+
+        When `study_specification.json`'s `estimand.population_summary ==
+        "CATE"`, `StatisticalEstimand.__post_init__` already forces
+        `estimation_procedure == "causal_forest_dml"` -- `deterministic_
+        cate_suggestion` answers that directly and `llm()` is never called.
+        Otherwise the LLM is asked to choose between `plug_in_
+        standardization` and `targeted_minimum_loss_based_estimation`,
+        grounded only in whichever of `feasibility.json`/`followup_audit.
+        json`/`positivity_audit.json`/`covariate_missingness.json` already
+        exist on disk (each read via `_read_optional_json`, which degrades
+        to `{}`, never raising, when a diagnostic hasn't been run yet).
+        """
+        run_dir = self.runs_dir / run_id
+        study_spec_path = run_dir / "study_specification.json"
+        if not study_spec_path.is_file():
+            raise RuntimeError(
+                "Cannot propose an estimation procedure: study_specification.json is missing "
+                "-- approve the identification_estimand gate first"
+            )
+        study_spec = json.loads(study_spec_path.read_text(encoding="utf-8"))
+        estimand = study_spec.get("estimand", {})
+        population_summary = estimand.get("population_summary")
+
+        if population_summary == "CATE":
+            analysis_plan = self._read_optional_json(run_dir / "analysis_plan.json")
+            ready_effect_modifiers = [
+                covariate.get("name") for covariate in analysis_plan.get("covariates", ())
+                if isinstance(covariate, dict) and covariate.get("causal_role") == "effect_modifier"
+                and covariate.get("status") == "ready"
+            ]
+            suggestion = deterministic_cate_suggestion(len(ready_effect_modifiers))
+        else:
+            feasibility = self._read_optional_json(run_dir / "feasibility.json")
+            followup_audit = self._read_optional_json(run_dir / "followup_audit.json")
+            positivity_audit = self._read_optional_json(run_dir / "positivity_audit.json")
+            covariate_missingness = self._read_optional_json(run_dir / "covariate_missingness.json")
+            prompt = build_estimation_procedure_suggestion_prompt(
+                prompt_path,
+                population_summary=population_summary or "",
+                effect_measure=estimand.get("effect_measure", ""),
+                feasibility=feasibility,
+                followup_audit=followup_audit,
+                positivity_audit=positivity_audit,
+                covariate_missingness=covariate_missingness,
+            )
+            raw = llm(prompt)
+            suggestion = parse_estimation_procedure_suggestion_response(raw)
+            if suggestion.estimation_procedure == "causal_forest_dml":
+                raise ValueError(
+                    "LLM suggested causal_forest_dml but this study's population_summary is "
+                    f"{population_summary!r}, not 'CATE' -- causal_forest_dml would violate "
+                    "StatisticalEstimand's own population_summary cross-check"
+                )
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            protocol["statistical_estimand_suggestion"] = {
+                "estimation_procedure": suggestion.estimation_procedure,
+                "rationale": suggestion.rationale,
+                "provenance": suggestion.provenance,
+                "population_summary_at_proposal": population_summary,
+            }
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+
+            state = self.load(run_id)
+            state.record(
+                "estimation_procedure_proposed",
+                f"suggested {suggestion.estimation_procedure} ({suggestion.provenance})",
+            )
+            self.save(state)
         return state
 
     def set_cate_cutpoint(self, run_id: str, covariate_name: str, cutpoint: float, reviewer: str) -> RunState:

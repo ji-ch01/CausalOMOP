@@ -74,7 +74,7 @@ from causal.mcp_client import OMCPClient
 from causal.orchestrator.state import NEXT_PHASE, PHASES, RunState
 from causal.orchestrator.workflow import WorkflowManager
 from causal.queries import COVARIATE_AGGREGATIONS_BY_DOMAIN, EXPOSURE_CONTRASTS, OUTCOME_DOMAINS
-from causal.roadmap import CENSORING_STRATEGIES, MISSING_DATA_STRATEGIES, CausalDAG
+from causal.roadmap import CENSORING_STRATEGIES, ESTIMATION_PROCEDURES, MISSING_DATA_STRATEGIES, CausalDAG
 
 
 RUNS_DIR = _PROJECT_ROOT / "artifacts" / "runs"
@@ -220,6 +220,82 @@ def _render_count_metrics(counts: dict[str, Any]) -> None:
         for key, value in counts.items():
             display_value = f"{value:.2f}" if isinstance(value, float) else ("—" if value is None else value)
             st.metric(_prettify_metric_key(key), display_value, border=True)
+
+
+def _positivity_zero_cells(counts: dict[str, Any]) -> list[str]:
+    """Covariate base names whose `*_treated_present`/`*_comparator_present`
+    count is exactly 0 in a `positivity_audit.json`. `AnalyticCohortBuilder.
+    positivity_audit_sql`'s own docs call a zero here "an unambiguous
+    positivity violation" for that covariate (a practical proxy, not a
+    joint-positivity test)."""
+    return sorted({
+        key.rsplit("_", 2)[0] for key, value in counts.items()
+        if key.endswith(("_treated_present", "_comparator_present")) and value == 0
+    })
+
+
+def _render_estimation_procedure_diagnostics(run_dir: Path) -> None:
+    """Read-only pre-gate diagnostic summary for the `statistical_estimand`
+    gate: every signal computable before `materialize_analytic_dataset`
+    (phase-gated to `execution`+) is shown here or not shown at all -- SMD
+    covariate balance (`diagnostics.json`) needs the materialized
+    `analytic_dataset.parquet` and is out of scope. `positivity_audit.json`/
+    `covariate_missingness.json` can only be *produced* during the
+    `analysis_plan`/`execution` phase (`run_positivity_audit_mcp`/
+    `run_covariate_missingness_audit_mcp` both reject any other phase), but
+    this gate always renders in the `estimand_review` phase -- so this panel
+    only displays what's already on disk; the "run" actions live in the
+    Feasibility & cohort tab where the phase gate actually allows them.
+    """
+    feasibility = _read_json(run_dir / "feasibility.json")
+    followup_audit = _read_json(run_dir / "followup_audit.json")
+    positivity_audit = _read_json(run_dir / "positivity_audit.json")
+    covariate_missingness = _read_json(run_dir / "covariate_missingness.json")
+    analysis_plan = _read_json(run_dir / "analysis_plan.json") or {}
+
+    st.markdown("**Pre-gate diagnostics**")
+    st.caption(
+        "Aggregate signals only -- none of these estimate a treatment effect. "
+        "Covariate-balance (SMD) diagnostics aren't available until after this "
+        "gate is approved and the analytic dataset is materialized."
+    )
+    not_yet_run = "Not yet run — run from the Feasibility & cohort tab."
+    with st.expander("Sample size (feasibility.json)", expanded=False):
+        if feasibility:
+            _render_count_metrics(feasibility.get("counts", {}))
+        else:
+            st.info(not_yet_run)
+    with st.expander("Follow-up completeness (followup_audit.json)", expanded=False):
+        if followup_audit:
+            _render_count_metrics(followup_audit.get("counts", {}))
+        else:
+            st.info(not_yet_run)
+    with st.expander("Univariate positivity (positivity_audit.json)", expanded=False):
+        if positivity_audit:
+            positivity_counts = positivity_audit.get("counts", {})
+            zero_cells = _positivity_zero_cells(positivity_counts)
+            if zero_cells:
+                st.warning(
+                    "Zero-cell covariate(s) -- unambiguous positivity violation: "
+                    + ", ".join(zero_cells)
+                )
+            else:
+                st.success("No zero-cell covariate in this univariate audit.")
+            _render_count_metrics(positivity_counts)
+        else:
+            st.info(not_yet_run + " (requires the analysis-plan phase)")
+    with st.expander("Covariate missingness (covariate_missingness.json)", expanded=False):
+        if covariate_missingness:
+            _render_count_metrics(covariate_missingness.get("counts", {}))
+        else:
+            st.info(not_yet_run + " (requires the analysis-plan phase)")
+    ready_effect_modifiers = [
+        covariate.get("name") for covariate in analysis_plan.get("covariates", ())
+        if isinstance(covariate, dict)
+        and covariate.get("causal_role") == "effect_modifier"
+        and covariate.get("status") == "ready"
+    ]
+    st.caption(f"Reviewed, ready effect-modifier covariates: {len(ready_effect_modifiers)}")
 
 
 def _badge(status: str) -> str:
@@ -523,6 +599,8 @@ def _render_statistical_estimand_review(manager: WorkflowManager, state: RunStat
     run_id = state.run_id
     protocol = _read_json(run_dir / "protocol.json") or {}
     cohort_manifest = _read_json(run_dir / "cohort_manifest.json")
+    study_spec = _read_json(run_dir / "study_specification.json") or {}
+    population_summary = study_spec.get("estimand", {}).get("population_summary")
     settings = protocol.get("query_settings") or {}
     censoring_definition_approved = bool(settings.get("censoring_definition_approved", False))
     saved = protocol.get("statistical_estimand_settings")
@@ -555,11 +633,57 @@ def _render_statistical_estimand_review(manager: WorkflowManager, state: RunStat
             st.caption(
                 f"Currently saved: missing_data_strategy={saved.get('missing_data_strategy')}, "
                 f"censoring_strategy={saved.get('censoring_strategy')}, "
+                f"estimation_procedure={saved.get('estimation_procedure', 'plug_in_standardization')}, "
                 f"rationale=\"{saved.get('censoring_rationale')}\""
             )
+        if population_summary:
+            st.markdown(f"**Primary estimand (from study_specification.json)**  \n{population_summary}")
+        if population_summary == "CATE":
+            st.caption(
+                "This study's primary estimand is CATE, which only `causal_forest_dml` computes -- "
+                "`plug_in_standardization`/`targeted_minimum_loss_based_estimation` report the ATE "
+                "and will be rejected below."
+            )
+
+        _render_estimation_procedure_diagnostics(run_dir)
 
         missing_data_options = sorted(MISSING_DATA_STRATEGIES)
         censoring_options = sorted(CENSORING_STRATEGIES)
+        estimation_procedure_options = sorted(ESTIMATION_PROCEDURES)
+
+        if st.button(
+            "Suggest estimation procedure (LLM)",
+            icon=":material/auto_awesome:",
+            key=f"suggest_estimation_procedure_{run_id}",
+        ):
+            status = st.status("Requesting an estimation-procedure suggestion...", expanded=True)
+            try:
+                status.write("Started -- this can take a moment.")
+                resolved_llm = build_hypothesis_llm()
+                status.write(f"Calling `{resolved_llm.provider}:{resolved_llm.model}`...")
+                manager.propose_estimation_procedure(run_id, resolved_llm.call)
+                status.write("Done -- saving the result.")
+                status.update(label="Estimation-procedure suggestion ready.", state="complete")
+                fresh_protocol = _read_json(run_dir / "protocol.json") or {}
+                fresh_suggestion = fresh_protocol.get("statistical_estimand_suggestion") or {}
+                if fresh_suggestion.get("estimation_procedure") in estimation_procedure_options:
+                    # Set before st.rerun(): a keyed st.selectbox's index=/value=
+                    # is only honored the first time that key appears in
+                    # session_state -- same idiom as the covariate-suggestion
+                    # pre-fill above.
+                    st.session_state[f"estimation_procedure_{run_id}"] = fresh_suggestion["estimation_procedure"]
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 - an optional, advisory step; never break the gate
+                status.update(label="Suggestion failed.", state="error")
+                st.error(f"Estimation-procedure suggestion failed: {exc}")
+
+        suggestion = protocol.get("statistical_estimand_suggestion")
+        if isinstance(suggestion, dict) and suggestion.get("rationale"):
+            st.caption(
+                f"LLM suggestion ({_humanize(suggestion.get('provenance', ''))}): "
+                f"**{_humanize(suggestion.get('estimation_procedure', ''))}** — {suggestion['rationale']}"
+            )
+
         with st.form(key=f"statistical_estimand_form_{run_id}"):
             missing_data_strategy = st.selectbox(
                 "Missing-data strategy",
@@ -581,6 +705,23 @@ def _render_statistical_estimand_review(manager: WorkflowManager, state: RunStat
                 format_func=lambda v: _CENSORING_STRATEGY_LABELS.get(v, v),
                 key=f"censoring_strategy_{run_id}",
             )
+            default_estimation_procedure = (
+                "causal_forest_dml" if population_summary == "CATE"
+                else saved.get("estimation_procedure", "plug_in_standardization")
+            )
+            estimation_procedure = st.selectbox(
+                "Estimation procedure",
+                estimation_procedure_options,
+                index=(
+                    estimation_procedure_options.index(default_estimation_procedure)
+                    if default_estimation_procedure in estimation_procedure_options else 0
+                ),
+                format_func=_humanize,
+                key=f"estimation_procedure_{run_id}",
+                help="causal_forest_dml (CATEAgent) is the only procedure that reports CATE; "
+                "plug_in_standardization (EstimationAgent) and targeted_minimum_loss_based_estimation "
+                "(TMLEAgent) both report the ATE.",
+            )
             rationale = st.text_area(
                 "Rationale (required)",
                 value=saved.get("censoring_rationale", ""),
@@ -597,6 +738,7 @@ def _render_statistical_estimand_review(manager: WorkflowManager, state: RunStat
                         censoring_strategy=censoring_strategy,
                         censoring_rationale=rationale,
                         reviewer=reviewer,
+                        estimation_procedure=estimation_procedure,
                     )
                     st.success("Statistical estimand strategy saved")
                     st.rerun()

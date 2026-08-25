@@ -310,6 +310,13 @@ def main() -> int:
     )
     workflow_estimand_strategy.add_argument("--reviewer", required=True)
     workflow_estimand_strategy.add_argument("--comment")
+    workflow_estimand_strategy_propose = workflow_sub.add_parser(
+        "estimand-strategy-propose",
+        help="LLM-assisted (deterministic for CATE) estimation-procedure suggestion "
+        "for the statistical_estimand gate (never auto-approved)",
+    )
+    workflow_estimand_strategy_propose.add_argument("run_id")
+    workflow_estimand_strategy_propose.add_argument("--model", default=None)
     workflow_materialize_dataset = workflow_sub.add_parser(
         "materialize-dataset",
         help="execute the governed cohort SQL through OMCP and write analytic_dataset.parquet",
@@ -597,6 +604,9 @@ def main() -> int:
                 estimation_procedure=args.estimation_procedure,
                 comment=args.comment,
             )
+        elif args.workflow_command == "estimand-strategy-propose":
+            resolved_llm = build_hypothesis_llm(model=args.model)
+            state = manager.propose_estimation_procedure(args.run_id, resolved_llm.call)
         elif args.workflow_command == "materialize-dataset":
             state = manager.materialize_analytic_dataset(args.run_id, OMCPClient(datasets))
         elif args.workflow_command == "estimate":
