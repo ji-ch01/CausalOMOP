@@ -69,3 +69,37 @@ jobs:
         run: |
           uv sync --extra dev
           uv run pytest tests/ -q
+
+  # Static security scan (bandit) over the two places that build and execute
+  # SQL against real OMOP patient data: `omcp/src` (the governed query
+  # server -- the SQL-validator stacked-statement bug this project already
+  # shipped once lived here) and `causal` (the SQL-generating query
+  # builders). Gated at high severity only: `-lll` reports zero issues on
+  # this codebase today, so the gate starts clean and catches a real
+  # regression (e.g. a new `eval`/`shell=True`/hardcoded-credential pattern)
+  # without blocking on the ~45 preexisting medium-severity, low-confidence
+  # findings (mostly f-string-built SQL against server-side config values,
+  # e.g. schema/project names -- not user input) that would need individual
+  # triage to either fix or annotate `# nosec`. Those are still surfaced,
+  # non-blocking, in the second step so they stay visible instead of
+  # silently uninvestigated.
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bandit
+        run: pip install bandit
+
+      - name: Bandit -- fail on high-severity findings
+        run: python -m bandit -r omcp/src causal -x "*/.venv/*,*/tests/*" -lll
+
+      - name: Bandit -- report medium+ severity findings (non-blocking)
+        if: always()
+        run: python -m bandit -r omcp/src causal -x "*/.venv/*,*/tests/*" -ll || true
