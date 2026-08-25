@@ -38,6 +38,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from causal.agents.covariate_suggestion import (
+    DEFAULT_COVARIATE_SUGGESTION_PROMPT_PATH,
+    build_covariate_suggestion_prompt,
+    parse_covariate_suggestion_response,
+)
 from causal.agents.dag_identification import (
     DEFAULT_MAX_ADJUSTMENT_CANDIDATES,
     RECOMMENDED_MAX_CONFOUNDERS,
@@ -1053,40 +1058,136 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         st.caption(
             "These first-pass covariates have no assigned causal role yet, so they are "
             "excluded from the DAG above pending review. Major confounders (marked) block "
-            "DAG approval until classified or explicitly rejected."
+            "DAG approval until classified or explicitly rejected. Rows left on \"Skip for "
+            "now\" are not submitted, so you can decide a subset now and the rest later -- "
+            "one submit reviews every row you did set, in a single page reload."
+        )
+        st.caption(
+            f"Already accepted: {identification.confounder_count} confounder(s). Recommended "
+            f"limit is {RECOMMENDED_MAX_CONFOUNDERS} — classifying more of the rows below as "
+            "\"confounder\" past that point will make identification checks noticeably slower "
+            "(see the warning above)."
         )
         major_set = set(artifact.major_confounders)
-        for label in artifact.unresolved_covariates:
-            is_major = label in major_set
-            with st.container(border=True), st.form(key=f"covariate_form_{run_id}_{label}"):
-                st.markdown(f"**{label}**" + (" 🔴 major confounder" if is_major else ""))
-                reviewer = st.text_input(
-                    "Reviewer", value=_reviewer_default(), key=f"covariate_reviewer_{run_id}_{label}"
-                )
-                decision_choice = st.selectbox(
-                    "Decision",
-                    ("reject",) + DAG_VARIABLE_ROLES,
-                    key=f"covariate_decision_{run_id}_{label}",
-                    format_func=lambda value: "Reject" if value == "reject" else value.replace("_", " "),
-                )
-                temporal_choice = st.selectbox(
-                    "Temporal classification (relative to treatment)",
-                    DAG_VARIABLE_TEMPORAL_CLASSES,
-                    key=f"covariate_temporal_{run_id}_{label}",
-                    format_func=_humanize,
-                )
-                domain_choice = st.selectbox(
-                    "OMOP domain (optional; enables a concept lookup later)",
-                    ("",) + DAG_VARIABLE_DOMAINS,
-                    key=f"covariate_domain_{run_id}_{label}",
-                    format_func=lambda value: "Not yet assessed" if value == "" else value,
-                )
-                comment = st.text_area(
-                    "Rationale" if decision_choice != "reject" else "Comment (optional)",
-                    key=f"covariate_comment_{run_id}_{label}",
-                )
-                submitted = st.form_submit_button("Submit decision")
-                if submitted:
+
+        def _decision_label(value: str) -> str:
+            if value == "skip":
+                return "Skip for now"
+            if value == "reject":
+                return "Reject"
+            return value.replace("_", " ")
+
+        suggestions_key = f"_covariate_suggestions_{run_id}"
+        if st.button(
+            "Suggest classifications",
+            icon=":material/auto_awesome:",
+            key=f"covariate_suggest_button_{run_id}",
+            help=(
+                "Asks the configured LLM for a starting role/timing/domain guess for every row "
+                "below, pre-filling the fields so reviewing is confirm-or-correct instead of "
+                "starting blank. Nothing is saved until you submit -- edit or leave any row on "
+                "\"Skip for now\" as usual."
+            ),
+        ):
+            reason_by_label = {
+                item.get("label"): item.get("reason")
+                for item in dag_unresolved
+                if isinstance(item, dict)
+            }
+            unresolved_payload = [
+                {
+                    "label": label,
+                    "reason": reason_by_label.get(label) or "No classification reason recorded.",
+                }
+                for label in artifact.unresolved_covariates
+            ]
+            try:
+                resolved_llm = build_hypothesis_llm()
+                with st.spinner(f"Asking `{resolved_llm.provider}:{resolved_llm.model}` for suggestions..."):
+                    prompt = build_covariate_suggestion_prompt(
+                        DEFAULT_COVARIATE_SUGGESTION_PROMPT_PATH, hypothesis, unresolved_payload,
+                    )
+                    suggestions = parse_covariate_suggestion_response(
+                        resolved_llm.call(prompt), set(artifact.unresolved_covariates),
+                    )
+                st.session_state[suggestions_key] = suggestions
+                # Set each row's widget state directly (not via `index=` on the
+                # selectbox below) so it takes effect on the very next render --
+                # once a keyed widget has rendered once, `index=`/`value=` is
+                # only consulted the *first* time that key appears in
+                # `st.session_state`, session_state wins on every render after.
+                for label, suggestion in suggestions.items():
+                    st.session_state[f"covariate_decision_{run_id}_{label}"] = suggestion.decision
+                    if suggestion.temporal_classification:
+                        st.session_state[f"covariate_temporal_{run_id}_{label}"] = (
+                            suggestion.temporal_classification
+                        )
+                    if suggestion.domain:
+                        st.session_state[f"covariate_domain_{run_id}_{label}"] = suggestion.domain
+                if not suggestions:
+                    st.warning("No suggestion was confident enough to propose for any row.")
+                st.rerun()
+            except (ValueError, RuntimeError, OSError) as exc:
+                st.error(str(exc))
+
+        cached_suggestions: dict[str, Any] = st.session_state.get(suggestions_key, {})
+
+        with st.form(key=f"covariate_batch_form_{run_id}"):
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"covariate_reviewer_{run_id}"
+            )
+            rows = []
+            for label in artifact.unresolved_covariates:
+                is_major = label in major_set
+                suggestion = cached_suggestions.get(label)
+                # Collapsed by default (16-25+ of these on a real DAG was the
+                # single biggest contributor to this tab's page length, even
+                # after compacting each row's fields into columns below) --
+                # major confounders stay expanded since they block DAG
+                # approval and need attention now; same
+                # expand-what's-actionable philosophy as
+                # `_render_covariate_card`'s `_covariate_needs_review`.
+                header = label + (" 🔴 major confounder" if is_major else "")
+                if suggestion is not None:
+                    header += f" — 🤖 suggested: {_decision_label(suggestion.decision)}"
+                with st.expander(header, expanded=is_major):
+                    if suggestion is not None:
+                        st.caption(f"🤖 Suggested: {_decision_label(suggestion.decision)} — {suggestion.rationale}")
+                    decision_col, temporal_col, domain_col = st.columns(3)
+                    decision_choice = decision_col.selectbox(
+                        "Decision",
+                        ("skip", "reject") + DAG_VARIABLE_ROLES,
+                        key=f"covariate_decision_{run_id}_{label}",
+                        format_func=_decision_label,
+                    )
+                    temporal_choice = temporal_col.selectbox(
+                        "Temporal classification",
+                        DAG_VARIABLE_TEMPORAL_CLASSES,
+                        key=f"covariate_temporal_{run_id}_{label}",
+                        format_func=_humanize,
+                        help="Relative to treatment.",
+                    )
+                    domain_choice = domain_col.selectbox(
+                        "OMOP domain (optional)",
+                        ("",) + DAG_VARIABLE_DOMAINS,
+                        key=f"covariate_domain_{run_id}_{label}",
+                        format_func=lambda value: "Not yet assessed" if value == "" else value,
+                        help="Enables a concept lookup later.",
+                    )
+                    comment = st.text_area(
+                        "Rationale" if decision_choice not in ("skip", "reject") else "Comment (optional)",
+                        key=f"covariate_comment_{run_id}_{label}",
+                    )
+                    rows.append((label, decision_choice, temporal_choice, domain_choice, comment))
+            submitted = st.form_submit_button("Submit reviewed decisions")
+
+        if submitted:
+            reviewed = [row for row in rows if row[1] != "skip"]
+            if not reviewed:
+                st.warning('No covariate decisions to submit -- every row is still on "Skip for now".')
+            else:
+                succeeded, errors = [], []
+                for label, decision_choice, temporal_choice, domain_choice, comment in reviewed:
                     try:
                         if decision_choice == "reject":
                             manager.review_covariate(run_id, label, "reject", reviewer, comment or None)
