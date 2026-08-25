@@ -318,7 +318,8 @@ parser and is not applied uniformly to those aggregate paths.
    every upstream warning/assumption, the full approval-gate history, and
    each artifact's own provenance metadata.
 
-Milestones 1, 2, and 6 remain open. Until they are complete, the g-computation
-estimate this pipeline can now produce is a transparent, prespecified baseline
-under stated (not yet fully validated) assumptions -- not a clinical
-causal-effect engine.
+Milestone 2 remains open, and milestone 5 is partial (joint/multivariate
+covariate balance remains future work). Until milestone 2 is complete, the
+g-computation, TMLE, and CATE estimates this pipeline can now produce are a
+transparent, prespecified baseline under stated (not yet fully validated)
+assumptions -- not a validated clinical causal-effect engine.
