@@ -189,7 +189,7 @@ class NormalizeNarrativeArtifactTests(unittest.TestCase):
             "claims": [_VALID_CLAIM],
             "verification": {"status": "passed", "checks": [], "checked_at_utc": "2026-08-11T00:00:00+00:00"},
             "review_status": "approved",
-            "reviewer": "Dr. Lee",
+            "reviewer": "Clinician",
             "reviewed_at": "2026-08-11T00:00:00+00:00",
             "review_note": "Looks good.",
         }

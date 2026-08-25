@@ -464,7 +464,7 @@ class HypothesisAgentVsUnexposedComparatorTests(unittest.TestCase):
         value = protocol()
         value["rejected_covariates"] = [
             {"label": "age", "reviewer": "Dr. Chen"},
-            {"label": "age", "reviewer": "Dr. Lee"},
+            {"label": "age", "reviewer": "Clinician"},
         ]
         with self.assertRaises(ValueError):
             HypothesisAgent().run(value)

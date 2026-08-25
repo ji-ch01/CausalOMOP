@@ -108,7 +108,7 @@ class VariableFromNegativeControlProposalTests(unittest.TestCase):
         proposal = {
             "control_id": "vitamin_d", "control_type": "negative_control_exposure",
             "label": "Vitamin D supplementation", "domain": "drug", "concept_ids": [999],
-            "mapping_status": "approved", "reviewer": "Dr. Lee", "provenance": "omcp_candidate",
+            "mapping_status": "approved", "reviewer": "Clinician", "provenance": "omcp_candidate",
         }
         variable = variable_from_negative_control_proposal(proposal)
         self.assertEqual(variable.mapping_status, MAPPING_STATUS_APPROVED)
