@@ -193,16 +193,10 @@ def _holm_stepdown_fwer_correction(
     order = sorted(names, key=lambda name: pvalues[name])
     adjusted_pvalue: dict[str, float] = {}
     running_max = 0.0
-    stopped = False
     for rank, name in enumerate(order, start=1):
-        if stopped:
-            adjusted_pvalue[name] = 1.0
-            continue
         holm_pvalue = min(1.0, (k - rank + 1) * pvalues[name])
         running_max = max(running_max, holm_pvalue)
         adjusted_pvalue[name] = running_max
-        if pvalues[name] > alpha / (k - rank + 1):
-            stopped = True
     simultaneous_ci_multiplier = float(norm.ppf(1 - alpha / (2 * k)))
     return adjusted_pvalue, simultaneous_ci_multiplier
 

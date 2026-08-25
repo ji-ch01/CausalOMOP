@@ -35,6 +35,26 @@ class HolmStepdownFWERTests(unittest.TestCase):
         self.assertAlmostEqual(adjusted["b"], 0.04)
         self.assertAlmostEqual(adjusted["c"], 0.04)
 
+    def test_running_max_continues_past_a_non_rejection_at_alpha(self):
+        """Regression test for a bug where the loop conflated Holm's
+        adjusted-p-value formula (an uninterrupted cumulative running max)
+        with the sequential-rejection decision rule at a fixed alpha
+        (which legitimately stops at the first non-rejection): the code
+        applied the stopping rule to the adjusted p-values themselves,
+        overwriting every rank after the first non-rejection with 1.0
+        instead of letting the running max continue. With alpha=0.05 the
+        decision rule stops after rank 2 (b's raw p=0.02 exceeds
+        0.05/3=0.0167), but the adjusted p-values must still be computed
+        for every rank -- this is the case traced by hand that would not
+        have been caught by the existing tests."""
+        adjusted, _ = _holm_stepdown_fwer_correction(
+            {"a": 0.01, "b": 0.02, "c": 0.03, "d": 0.5}, alpha=0.05,
+        )
+        self.assertAlmostEqual(adjusted["a"], 0.04)
+        self.assertAlmostEqual(adjusted["b"], 0.06)
+        self.assertAlmostEqual(adjusted["c"], 0.06)
+        self.assertAlmostEqual(adjusted["d"], 0.5)
+
     def test_a_clearly_null_hypothesis_is_not_spuriously_significant(self):
         """The exact bug this function replaced: a hypothesis with a
         clearly non-significant raw p-value must never come out of the
