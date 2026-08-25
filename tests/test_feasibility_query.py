@@ -172,5 +172,72 @@ class DuckDBFeasibilityQueryTests(unittest.TestCase):
         self.assertIn("DATETIME_ADD(e.index_datetime, INTERVAL 24 HOUR)", sql)
 
 
+COPD = ConceptSetSpec(domain="condition", concept_ids=(255573,))
+T2DM = ConceptSetSpec(domain="condition", concept_ids=(201826,))
+
+
+class AdditionalPopulationConceptSetTests(unittest.TestCase):
+    """A population defined by more than one independently-required
+    diagnosis (e.g. "type 2 diabetes AND COPD") ANDs each extra concept set
+    onto `population` via `additional_population` -- see `_cohort_ctes`."""
+
+    def test_defaults_to_unchanged_behavior(self):
+        with_default = analytic_cohort_sql(
+            BigQueryDatasets(), population=T2DM, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+        )
+        explicit_empty = analytic_cohort_sql(
+            BigQueryDatasets(), population=T2DM, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(),
+        )
+        self.assertEqual(with_default, explicit_empty)
+        self.assertNotIn("EXISTS", with_default)
+
+    def test_adds_one_exists_semi_join_per_additional_concept_set(self):
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=T2DM, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,),
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+        self.assertEqual(sql.count("EXISTS ("), 1)
+        # A semi-join, not a plain JOIN, so a person with multiple qualifying
+        # COPD rows is not counted more than once.
+        self.assertIn("WHERE ap.person_id = el.person_id", sql)
+        self.assertIn("ap.condition_start_datetime <= el.index_datetime", sql)
+
+    def test_two_additional_concept_sets_are_both_anded_in(self):
+        second = ConceptSetSpec(domain="measurement", concept_ids=(3004410,))
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=T2DM, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD, second),
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+        self.assertIn("population_additional_1_concepts", sql)
+        self.assertEqual(sql.count("EXISTS ("), 2)
+        self.assertIn(" AND EXISTS (", sql)
+
+    def test_combines_with_min_age_years_filter(self):
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=T2DM, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,), min_age_years=18,
+        )
+        self.assertIn("EXTRACT(YEAR FROM DATE(el.index_datetime)) - p.year_of_birth >= 18 AND EXISTS (", sql)
+
+    def test_rejects_unknown_domain(self):
+        bad = ConceptSetSpec(domain="not_a_domain", concept_ids=(1,))
+        with self.assertRaises(ValueError):
+            analytic_cohort_sql(
+                BigQueryDatasets(), population=T2DM, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                additional_population=(bad,),
+            )
+
+    def test_feasibility_sql_also_supports_additional_population(self):
+        sql = feasibility_sql(
+            BigQueryDatasets(), population=T2DM, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,),
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+        self.assertIn("EXISTS (", sql)
+
+
 if __name__ == "__main__":
     unittest.main()

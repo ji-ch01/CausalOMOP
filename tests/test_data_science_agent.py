@@ -38,7 +38,16 @@ class DataScienceAgentTests(unittest.TestCase):
         result = DataScienceAgent().run(hypothesis, protocol)
         albumin = next(item for item in result.phenotypes if item.name == "albumin")
         self.assertEqual(albumin.mode, "source_value_provisional")
-        self.assertFalse(result.exploratory_execution_allowed)
+        # A "candidate"/"unmapped"/"partial" status is exactly what
+        # exploratory mode tolerates -- source_value_rule fallbacks make
+        # every declared phenotype's mode "standard" or "source_value_
+        # provisional", and the two auto-scaffolded phenotypes below
+        # (all_cause_death, index_event) resolve via a standard OMOP table
+        # rather than blocking core_definitions_ready. This plan is
+        # "provisional" in the sense the test's name describes -- not
+        # execution-ready for a final study -- which final_execution_allowed
+        # (gated on zero unresolved_issues) below correctly still reflects.
+        self.assertTrue(result.exploratory_execution_allowed)
         self.assertFalse(result.final_execution_allowed)
         self.assertIn("death", result.required_tables)
         self.assertEqual(result.metadata["agent_name"], "data_science_agent")
@@ -586,6 +595,64 @@ class DataScienceAgentCovariateTests(unittest.TestCase):
         ])
         result = DataScienceAgent().run(hypothesis, self._protocol(), concept_lookup=lookup)
         self.assertNotIn("covariate:sofa_score:missing_domain", result.unresolved_issues)
+
+
+class DataScienceAgentAdditionalPopulationTests(unittest.TestCase):
+    """`additional_population_concept_sets` (see `WorkflowManager.
+    add_population_concept_set`) names a `concept_sets` entry that must ALSO
+    be resolved before `exploratory_execution_allowed` -- its role
+    (`population_secondary`) is not in `_REQUIRED_PHENOTYPE_ROLES`, since
+    it's only required while actively listed (an unlisted/removed entry must
+    not block)."""
+
+    def _protocol(self, *, listed: bool) -> dict:
+        protocol = {
+            "data_source": "project.dataset",
+            "concept_sets": {
+                "sepsis": {
+                    "role": "population", "domain": "condition",
+                    "status": "approved", "concept_ids": [132797],
+                },
+                "albumin": {
+                    "role": "treatment", "domain": "drug",
+                    "status": "approved", "concept_ids": [1],
+                },
+                "crystalloids": {
+                    "role": "comparator", "domain": "drug",
+                    "status": "approved", "concept_ids": [2],
+                },
+                "copd": {
+                    "role": "population_secondary", "domain": "condition",
+                    "status": "missing", "concept_ids": [],
+                },
+            },
+        }
+        if listed:
+            protocol["additional_population_concept_sets"] = ["copd"]
+        return protocol
+
+    def _hypothesis(self) -> dict:
+        return {
+            "schema_version": "1.0", "study_id": "study", "time_zero": "ICU admission",
+            "grace_period_hours": 24, "follow_up_days": 28, "primary_estimand": "ATE",
+        }
+
+    def test_unmapped_active_entry_blocks_exploratory_execution(self):
+        result = DataScienceAgent().run(self._hypothesis(), self._protocol(listed=True))
+        self.assertFalse(result.exploratory_execution_allowed)
+
+    def test_unmapped_unlisted_entry_does_not_block(self):
+        """Same phenotype, same unmapped status -- but `remove_population_
+        concept_set` already unlisted it, so it must not gate execution."""
+        result = DataScienceAgent().run(self._hypothesis(), self._protocol(listed=False))
+        self.assertTrue(result.exploratory_execution_allowed)
+
+    def test_mapped_active_entry_does_not_block(self):
+        protocol = self._protocol(listed=True)
+        protocol["concept_sets"]["copd"]["status"] = "approved"
+        protocol["concept_sets"]["copd"]["concept_ids"] = [255573]
+        result = DataScienceAgent().run(self._hypothesis(), protocol)
+        self.assertTrue(result.exploratory_execution_allowed)
 
 
 if __name__ == "__main__":

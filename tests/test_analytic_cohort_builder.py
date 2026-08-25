@@ -355,5 +355,55 @@ class CovariateMissingnessSqlTests(unittest.TestCase):
         self.assertIn("COUNT(*) AS cohort_persons", sql)
 
 
+COPD = ConceptSetSpec(domain="condition", concept_ids=(255573,))
+
+
+class AdditionalPopulationPassThroughTests(unittest.TestCase):
+    """`additional_population` is a thin pass-through on every method here
+    (no logic of its own -- see `causal.queries.feasibility` for the actual
+    AND-ing); these just confirm each method actually forwards it rather
+    than silently dropping it."""
+
+    def test_build_forwards_additional_population(self):
+        sql, _ = AnalyticCohortBuilder().build(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,), execution_allowed=False,
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+
+    def test_profile_sql_forwards_additional_population(self):
+        sql = AnalyticCohortBuilder().profile_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,),
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+
+    def test_followup_audit_sql_forwards_additional_population(self):
+        sql = AnalyticCohortBuilder().followup_audit_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,),
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+
+    def test_positivity_audit_sql_forwards_additional_population(self):
+        sql = AnalyticCohortBuilder().positivity_audit_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,),
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+
+    def test_covariate_missingness_sql_forwards_additional_population(self):
+        sql = AnalyticCohortBuilder().covariate_missingness_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            additional_population=(COPD,),
+        )
+        self.assertIn("population_additional_0_concepts", sql)
+
+
 if __name__ == "__main__":
     unittest.main()
