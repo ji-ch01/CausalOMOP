@@ -8,9 +8,17 @@ distributed with the repository.
 
 The current validation environment uses credentialed
 [MIMIC-IV 2.2](https://physionet.org/content/mimiciv/2.2/) converted to OMOP CDM
-5.3.1 using the [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) project. The
-conversion is queried either in BigQuery or from a controlled local DuckDB
-export.
+5.3.1 using the [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) project. **The
+ETL conversion itself runs entirely in BigQuery -- DuckDB is never an ETL
+target.** The result is then queried either directly in BigQuery or from a
+controlled local DuckDB export.
+
+The DuckDB export is a manually created, point-in-time copy someone runs by
+hand (see [BigQuery-to-DuckDB export](#bigquery-to-duckdb-export) below); no
+automated pipeline or CI job regenerates it. It is not a second, independent
+source of truth -- if the BigQuery ETL is rerun or its tables change, every
+existing local DuckDB export silently goes stale until someone re-runs the
+exporter.
 
 MIMIC-IV access remains subject to PhysioNet credentialing and the applicable
 data-use agreement. Conversion does not make the data public. Local exports,
@@ -29,6 +37,17 @@ resolving to a possibly-stale local file, and so BigQuery stays reachable with
 one flag -- no code change -- if the local export is ever unavailable. This
 mirrors `requirements-bigquery.txt` already being an optional install rather
 than a base dependency.
+
+**Backend support differs between the two projects in this repo.** `causal/`
+(CausalOMOP itself) supports both backends end to end -- the full test suite
+passes under each. `agno_fastomop` (FastOMOP, the natural-language
+descriptive-query agent reached for descriptive/retrieval questions via
+`causal/fastomop_bridge.py`) was built and has only run against the DuckDB
+backend; BigQuery support there is unverified and not expected to work as-is
+(BigQuery is an optional `--extra bigquery` uv dependency group in
+`agno_fastomop`'s own environment that the bridge does not arrange for). Keep
+`CAUSALOMOP_DB_BACKEND=duckdb` if you rely on the FastOMOP-routed descriptive
+path.
 
 ### DuckDB (recommended)
 

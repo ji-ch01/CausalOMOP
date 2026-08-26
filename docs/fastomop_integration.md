@@ -89,9 +89,49 @@ NL-to-SQL team
 ```
 
 The current CausalOMOP CLI and UI classify a question before drafting. A
-descriptive question is redirected to FastOMOP, but the applications are not
-yet connected by automatic process-level routing. A causal question must create
-a target-trial specification before SQL is generated.
+descriptive question is routed to FastOMOP automatically (see "CausalOMOP ->
+FastOMOP Bridge" below); a causal question must create a target-trial
+specification before SQL is generated.
+
+## CausalOMOP -> FastOMOP Bridge
+
+`causal.fastomop_bridge.ask_fastomop` is what the CLI's `workflow
+start-question` and the Streamlit "New causal study" form call when the
+causal-question gate classifies a question as `descriptive`. It does not
+import `agno_fastomop.workflows.omop_workflow` in-process: `agno_fastomop/` is
+a separate Python 3.13 + `uv`-managed project with its own dependency tree
+(agno, an Ollama/Anthropic/OpenAI client, langfuse...) that is not installed
+into CausalOMOP's own `.venv` -- the same out-of-process posture
+`causal.mcp_client.OMCPClient` already takes toward OMCP, extended here for
+the same reason. The bridge instead shells out to a small `agno_fastomop ask
+"<question>"` CLI command (`agno_fastomop/src/agno_fastomop/ask.py`, wired
+into `cli.py` alongside `run`/`web`/`bootstrap`) that runs one question
+through the existing semantic -> database workflow and prints a single
+`FASTOMOP_JSON:{...}` line that the bridge parses back out.
+
+Two things this wiring depends on:
+
+- **Read-only, single-writer DuckDB.** The bridge derives the OMCP
+  subprocess's `DB_*` environment with `causal.mcp_client._omcp_db_overrides`
+  -- the same helper `OMCPClient` uses -- which always sets
+  `DB_READ_ONLY=true`. This matters because DuckDB allows only one writer at a
+  time: FastOMOP's own OMCP subprocess and a causal-side `OMCPClient`
+  connection can both have the same DuckDB file open concurrently only
+  because neither ever opens it for writing.
+- **Milvus is configured but unused.** `agno_fastomop/config.toml`'s
+  `[milvus]` section and `.env.example`'s `MILVUS_*` variables are leftover
+  from an earlier embeddings-based concept-search design; nothing in
+  `agno_fastomop/src` imports `pymilvus` or connects to it today
+  (`semantic.py`'s own docstring: "direct SQL queries to concept table" via
+  `Lookup_Concept`/`Lookup_Drug`/`Lookup_Condition`). No Milvus instance needs
+  to be running for descriptive questions to work.
+
+The FastOMOP answer (its own natural-language response plus the SQL it ran)
+is for direct display to the human user only. It is never passed to
+`causal.llm`/CausalOMOP's own hypothesis-drafting LLM -- see
+[docs/datasets.md](datasets.md)'s "Never send patient-level data ... to an LLM
+provider" rule; a descriptive answer can carry patient-level content
+depending on the question asked.
 
 ## Shared MCP Contract
 
