@@ -29,8 +29,10 @@ that already made it in (pass --overwrite to force a full redo instead).
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -294,7 +296,39 @@ def _write_table(
     return con.execute(f"SELECT COUNT(*) FROM {qualified}").fetchone()[0]
 
 
-def _make_bqstorage_client() -> Any:
+def _make_file_refreshed_credentials(token_file: str | Path) -> Any:
+    """OAuth2 credentials whose token is re-read from a local file on each refresh.
+
+    For a host that must not hold a long-lived key (e.g. a rented, ephemeral
+    compute pod): `token_file` holds a short-lived impersonated access token
+    (`gcloud auth print-access-token --impersonate-service-account=...`) as
+    two lines, `<token>\\n<ISO-8601 UTC expiry>\\n`, rewritten periodically by
+    whoever controls the impersonating identity. This never mints or
+    refreshes a token itself -- it only re-reads whatever the file currently
+    holds, so the pod itself never needs impersonation rights. The base
+    `Credentials.before_request`/`valid`/`expired` already do the right thing
+    once `token`/`expiry` are populated; only `refresh` needs overriding.
+    """
+    import google.auth.credentials
+
+    token_path = Path(token_file)
+
+    class _FileRefreshedCredentials(google.auth.credentials.Credentials):
+        def refresh(self, request: Any) -> None:
+            token, _, expiry_iso = token_path.read_text(encoding="utf-8").strip().partition("\n")
+            self.token = token.strip()
+            expiry = datetime.datetime.fromisoformat(expiry_iso.strip())
+            if expiry.tzinfo is not None:
+                # google-auth's own expired-check compares against a naive UTC
+                # now() (true across current google-auth versions), so a
+                # timezone-aware expiry here would raise on comparison.
+                expiry = expiry.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            self.expiry = expiry
+
+    return _FileRefreshedCredentials()
+
+
+def _make_bqstorage_client(credentials: Any = None) -> Any:
     try:
         from google.cloud import bigquery_storage
     except ImportError:
@@ -304,17 +338,17 @@ def _make_bqstorage_client() -> Any:
             "(includes it) for faster export."
         )
         return None
-    return bigquery_storage.BigQueryReadClient()
+    return bigquery_storage.BigQueryReadClient(credentials=credentials)
 
 
-def make_bigquery_client(project: str) -> Any:
+def make_bigquery_client(project: str, credentials: Any = None) -> Any:
     try:
         from google.cloud import bigquery
     except ImportError as exc:
         raise RuntimeError(
             "BigQuery support is optional. Install with: pip install -r requirements-bigquery.txt"
         ) from exc
-    return bigquery.Client(project=project)
+    return bigquery.Client(project=project, credentials=credentials)
 
 
 def export_dataset_to_duckdb(
@@ -523,7 +557,23 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     datasets = BigQueryDatasets.from_env()
-    client = make_bigquery_client(datasets.project)
+    # CAUSALOMOP_BQ_TOKEN_FILE: opt-in path for a host that must not hold a
+    # long-lived key (e.g. a rented compute pod) -- authenticate from a
+    # short-lived impersonated access token that gets rewritten periodically
+    # by whoever holds impersonation rights, instead of from a downloadable
+    # service-account key file / ADC. Unset (the default) is unaffected: both
+    # clients fall back to normal ADC discovery exactly as before.
+    token_file = os.environ.get("CAUSALOMOP_BQ_TOKEN_FILE")
+    credentials = _make_file_refreshed_credentials(token_file) if token_file else None
+
+    client = make_bigquery_client(datasets.project, credentials=credentials)
+    bqstorage_client: Any
+    if args.no_bqstorage:
+        bqstorage_client = None
+    elif credentials is not None:
+        bqstorage_client = _make_bqstorage_client(credentials)
+    else:
+        bqstorage_client = "auto"
     summary = export_dataset_to_duckdb(
         client,
         datasets,
@@ -537,7 +587,7 @@ def main() -> int:
         max_retries=args.max_retries,
         duckdb_memory_limit=args.memory_limit,
         duckdb_temp_directory=args.temp_directory,
-        bqstorage_client=None if args.no_bqstorage else "auto",
+        bqstorage_client=bqstorage_client,
     )
     print(json.dumps(summary.to_dict(), indent=2))
     return 0 if summary.all_verified else 2
