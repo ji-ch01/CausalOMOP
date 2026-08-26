@@ -9,6 +9,11 @@ or production implementations.
 | `t2dm_analysis.ipynb` | type 2 diabetes treatment and outcome exploration |
 | `depressive_disorder_analysis.ipynb` | depressive-disorder exploration |
 
+Kept locally only, listed in `.gitignore`, and not visible on GitHub: their
+embedded outputs (matplotlib figures as base64 images) make them large
+binary-ish blobs, which this page already asks contributors not to commit.
+Anyone who needs a copy should get it directly rather than from the repo.
+
 Notebook findings are snapshots tied to their input data and execution state.
 They must not be treated as current MIMIC-IV validation results unless the
 notebook records that dataset, configuration, date, and reproducible run.

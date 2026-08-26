@@ -23,7 +23,7 @@ the tool's scope.
 | [Vocabulary mapping coverage](vocabulary_mapping_coverage.md) | source-data limitation note: OMOP concept mapping completeness, quantified over time |
 | [FastOMOP integration](fastomop_integration.md) | component ownership, OMCP contract, and submodules |
 | [LLM hypothesis integration](llm_hypothesis_integration.md) | question gate, evidence retrieval, critique, and provider policy |
-| [DAG audit](dag_generation_audit.md) | dated technical audit and metric history |
+| [DAG generation reference](dag_generation_audit.md) | pipeline design, evaluation methodology (SHD/SID, causal-learn), and known gaps |
 | [Repository map](repo_map.md) | folder ownership and Git policy |
 | [Responsible demo guide](responsible_demo_guide.md) | current demonstration script |
 | [Albumin/sepsis study](../studies/albumin_sepsis_28d/README.md) | first literature-comparison validation example |

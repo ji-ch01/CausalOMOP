@@ -123,7 +123,7 @@ reviewable graphs.
   instead.
 
 See [llm_hypothesis_integration.md](llm_hypothesis_integration.md) and the
-dated [DAG audit](dag_generation_audit.md).
+[DAG generation reference](dag_generation_audit.md).
 
 ## OMOP variable registry
 

@@ -23,7 +23,9 @@ Reference artifacts in this directory:
 
 The active blockers are a reproducible Sepsis-3 population, validated ICU time
 zero, approved albumin/crystalloid phenotypes, baseline covariate coverage,
-follow-up/censoring rules, and the absence of an implemented estimator.
+and follow-up/censoring rules for *this* study specifically -- the pipeline's
+estimators (g-computation, TMLE, CATE; see [causal/README.md](../../causal/README.md#current-capabilities))
+are implemented, but no run of this study has reached estimation yet.
 
 ## Concept audit
 

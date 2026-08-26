@@ -28,6 +28,12 @@ build/
 .ipynb_checkpoints/
 *.html
 
+# Kept locally for reference, not published: large embedded outputs (base64
+# images), see notebooks/README.md
+notebooks/omop_analysis.ipynb
+notebooks/t2dm_analysis.ipynb
+notebooks/depressive_disorder_analysis.ipynb
+
 # ── Environment / secrets ─────────────────────────────────────────────────────
 .env
 artifacts/runs/
