@@ -40,6 +40,14 @@ def _print_raw_llm_output(output: LLMRawOutput) -> None:
 
 
 def main() -> int:
+    # LLM-generated text (e.g. a FastOMOP answer, raw LLM output) can contain
+    # Unicode outside Windows' default cp1252 console codepage and crash a
+    # plain print() with UnicodeEncodeError -- reconfigure to UTF-8 with a
+    # replace fallback so the CLI never dies on the terminal encoding alone.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(prog="causalomop")
     sub = parser.add_subparsers(dest="command", required=True)
     config_cmd = sub.add_parser("config", help="print resolved dataset roles")
