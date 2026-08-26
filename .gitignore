@@ -32,6 +32,9 @@ build/
 .env
 artifacts/runs/
 # sample.env and omcp/sample.env are kept (they contain no secrets)
+*-key.json
+*-export-key.json
+*service-account*.json
 
 # ── OS / editor ───────────────────────────────────────────────────────────────
 .DS_Store
