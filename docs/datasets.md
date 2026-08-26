@@ -19,9 +19,40 @@ person-level datasets inherit the source restrictions.
 
 ## Runtime backends
 
-Set `CAUSALOMOP_DB_BACKEND` to `bigquery` or `duckdb`.
+Set `CAUSALOMOP_DB_BACKEND` to `duckdb` (recommended) or `bigquery`.
 
-For BigQuery:
+`sample.env` defaults new setups to `duckdb`. The hard-coded default inside
+`BigQueryDatasets` (`causal/config.py`) stays `bigquery` on purpose, so a
+missing/misplaced `.env` fails loudly against a placeholder project (see
+`FromEnvPlaceholderGuardTests` in `tests/test_config.py`) instead of silently
+resolving to a possibly-stale local file, and so BigQuery stays reachable with
+one flag -- no code change -- if the local export is ever unavailable. This
+mirrors `requirements-bigquery.txt` already being an optional install rather
+than a base dependency.
+
+### DuckDB (recommended)
+
+```text
+CAUSALOMOP_DB_BACKEND=duckdb
+CAUSALOMOP_DUCKDB_PATH=data/mimiciv_omop.duckdb
+CAUSALOMOP_DUCKDB_SCHEMA=main
+```
+
+Queries run against a local file created by
+[BigQuery-to-DuckDB export](#bigquery-to-duckdb-export) below. Preferred for
+day-to-day development and demos: access is controlled directly (filesystem
+permissions on a file you hold), there is no persistent copy of the export
+sitting in a third-party cloud project beyond the source BigQuery dataset
+itself, and query latency is much lower. The export must be refreshed
+whenever the source BigQuery dataset changes -- a stale local file silently
+diverges from BigQuery with no built-in warning, so treat its export date as
+part of any result you report.
+
+### BigQuery (secondary)
+
+```text
+CAUSALOMOP_DB_BACKEND=bigquery
+```
 
 | Role | Environment variable |
 |---|---|
@@ -32,15 +63,10 @@ For BigQuery:
 | tests, run logs, and metrics | `CAUSALOMOP_BQ_METRICS_DATASET` |
 
 Clinical analyses must read from the configured OMOP role, not silently from
-staging tables. The analysis-ready OMOP dataset is treated as read-only.
-
-For DuckDB:
-
-```text
-CAUSALOMOP_DB_BACKEND=duckdb
-CAUSALOMOP_DUCKDB_PATH=data/mimiciv_omop.duckdb
-CAUSALOMOP_DUCKDB_SCHEMA=main
-```
+staging tables. The analysis-ready OMOP dataset is treated as read-only. Use
+this backend when no local DuckDB export exists yet, or to query the live
+source directly (e.g. to confirm a result isn't an artifact of a stale
+export).
 
 The CausalOMOP configuration above is distinct from the environment passed to
 the OMCP subprocess (`DB_TYPE`, `DB_PATH`, `CDM_SCHEMA`, `VOCAB_SCHEMA`). The
