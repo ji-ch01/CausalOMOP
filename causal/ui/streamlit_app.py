@@ -68,6 +68,7 @@ from causal.agents.question_gate import DEFAULT_GATE_PROMPT_PATH, build_gate_pro
 from causal.agents.results_narrative import normalize_narrative_artifact
 from causal.agents.user_question import LLMRawOutput, UserQuestionHypothesisService
 from causal.config import BigQueryDatasets
+from causal.fastomop_bridge import FastOMOPError, ask_fastomop
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
 from causal.mcp_client import OMCPClient
@@ -3855,13 +3856,23 @@ def _render_new_question_section(manager: WorkflowManager, *, expanded: bool = F
                         resolved_llm.call(build_gate_prompt(DEFAULT_GATE_PROMPT_PATH, question))
                     )
                     if gate_result.category == "descriptive":
-                        status_log.update(label="Not a causal question", state="error")
                         st.session_state.pop("_pending_clarification", None)
-                        st.warning(
+                        st.info(
                             "This looks like a descriptive/retrieval question, not a causal one -- "
-                            "FastOMOP (agno_fastomop) handles this, not the causal target-trial pipeline.\n\n"
-                            f"Reasoning: {gate_result.reasoning}"
+                            "answering it via FastOMOP (agno_fastomop) instead of drafting a causal "
+                            f"study.\n\nReasoning: {gate_result.reasoning}"
                         )
+                        status_log.update(label="Asking FastOMOP...", state="running")
+                        try:
+                            result = ask_fastomop(question)
+                        except (FastOMOPError, FileNotFoundError) as exc:
+                            status_log.update(label="FastOMOP query failed", state="error")
+                            st.error(str(exc))
+                            return
+                        status_log.update(label="FastOMOP answered", state="complete")
+                        if result.sql_query:
+                            st.code(result.sql_query, language="sql")
+                        st.markdown(result.answer)
                         return
                     if gate_result.category == "needs_clarification":
                         status_log.update(label="Needs clarification", state="error")

@@ -32,7 +32,7 @@ are:
 
 | Area | Current status |
 |---|---|
-| Natural-language question intake | LLM-based causal/descriptive/clarification gate in the CLI and Streamlit UI; descriptive questions are redirected to FastOMOP, but automatic cross-application routing is not implemented |
+| Natural-language question intake | LLM-based causal/descriptive/clarification gate in the CLI and Streamlit UI; descriptive questions are routed to FastOMOP automatically (`causal.fastomop_bridge`) and answered inline |
 | Target-trial draft | Strictly parsed LLM or manually supplied protocol; human approval remains mandatory |
 | Evidence grounding | PubMed and OpenAlex retrieval, optional OptimusKG relations, deterministic citation allow-list |
 | DAG review | Role/timing validation, cycle checks, bounded critique/revision, optional multi-candidate tournament, backdoor identification, minimum adjustment sets, SHD/SID audit metrics |
@@ -288,8 +288,9 @@ From a natural-language causal question:
 python -m causal.cli workflow start-question "Among adult ICU patients with sepsis, what is the effect of albumin plus crystalloids versus crystalloids alone on 28-day mortality?"
 ```
 
-This path first classifies the question. A descriptive question is refused with
-a pointer to FastOMOP; an ambiguous question returns a clarification request.
+This path first classifies the question. A descriptive question is answered
+inline through FastOMOP instead of drafting a causal study; an ambiguous
+question returns a clarification request.
 `--skip-question-gate` exists for controlled testing, not as a scientific
 approval mechanism.
 

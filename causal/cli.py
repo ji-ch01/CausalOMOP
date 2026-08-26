@@ -20,6 +20,7 @@ from causal.agents.hypothesis import (
 )
 from causal.agents.question_gate import DEFAULT_GATE_PROMPT_PATH, build_gate_prompt, parse_gate_response
 from causal.agents.user_question import LLMRawOutput
+from causal.fastomop_bridge import FastOMOPError, ask_fastomop
 from causal.knowledge_graph import OptimusKGClient
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
@@ -433,11 +434,21 @@ def main() -> int:
                 if gate_result.category == "descriptive":
                     print(
                         "This looks like a descriptive/retrieval question, not a causal one -- "
-                        "FastOMOP (agno_fastomop) handles this, not the causal target-trial pipeline.\n"
-                        f"Reasoning: {gate_result.reasoning}",
+                        "routing it to FastOMOP (agno_fastomop) instead of the causal target-trial "
+                        f"pipeline.\nReasoning: {gate_result.reasoning}",
                         file=sys.stderr,
                     )
-                    return 2
+                    try:
+                        result = ask_fastomop(args.question, datasets=datasets)
+                    except (FastOMOPError, FileNotFoundError) as exc:
+                        print(f"FastOMOP query failed: {exc}", file=sys.stderr)
+                        return 1
+                    if result.sql_query:
+                        print("--- SQL ---")
+                        print(result.sql_query)
+                        print("--- ANSWER ---")
+                    print(result.answer)
+                    return 0
                 if gate_result.category == "needs_clarification":
                     print(
                         "This question needs to be sharpened before drafting a causal study.\n"

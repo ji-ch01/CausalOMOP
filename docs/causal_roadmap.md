@@ -52,7 +52,7 @@ the full literature grounding, including a second candidate comparison case.
 
 | Roadmap stage | Implementation |
 |---|---|
-| 1. Question classification | Implemented as an LLM-based `causal`, `descriptive`, or `needs_clarification` gate in CLI and Streamlit. It can be skipped explicitly and does not automatically invoke FastOMOP. |
+| 1. Question classification | Implemented as an LLM-based `causal`, `descriptive`, or `needs_clarification` gate in CLI and Streamlit. It can be skipped explicitly; a `descriptive` result automatically invokes FastOMOP (`causal.fastomop_bridge`) and returns its answer instead of drafting a causal study. |
 | 2. Target-trial draft | Implemented for manual protocols and strictly parsed LLM drafts; human protocol approval is required. |
 | 3. Counterfactual estimand | Implemented: `causal.agents.dag_identification.build_study_specification` constructs and validates the full `CausalQuestion`/`TargetTrialProtocol`/`CausalEstimand` contract from `protocol.json` + `hypothesis.json`, persisted as `study_specification.json` when the `identification_estimand` gate is approved. `protocol["target_trial"]` carries the complete field set (eligibility criteria; assignment, censoring, and analysis strategy; effect measure; treatment/comparator contrast values), required by both the LLM drafting prompt (`causal/prompts/hypothesis.md`) and the `target_trial` gate. |
 | 4. Causal DAG | Implemented: literature/KG drafting, typed roles and timing, bounded critique/revision, optional tournament, human covariate review. |
