@@ -11,6 +11,7 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,14 @@ from causal.agents.results_narrative import (
     parse_narrative_response,
 )
 from causal.agents.user_question import GeneratedHypothesis
+from causal.companion.companion import (
+    DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
+    CompanionMessage,
+    CompanionTurn,
+    EstimandDialogueContext,
+    build_estimand_dialogue_prompt,
+    parse_companion_turn,
+)
 from causal.llm.base import LLMCallable
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
@@ -4325,6 +4334,60 @@ class WorkflowManager:
             )
             self.save(state)
         return state
+
+    def run_companion_turn(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        history: Sequence[CompanionMessage],
+        *,
+        prompt_path: Path = DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
+    ) -> CompanionTurn:
+        """One turn of the conversational assist at the `statistical_estimand`
+        gate (`causal.companion.companion`). Owns the `llm(prompt)` call and
+        the JSON-artifact reads; the pure prompt-build/parse lives in the
+        companion module, matching `propose_estimation_procedure` above.
+
+        Read-only with respect to run state: it takes no `_RunLock`, records
+        nothing in `state.history`, and writes no file. The conversation
+        transcript is the caller's to persist (`causal.companion.conversation`),
+        and the one write this dialogue can lead to --
+        `set_statistical_estimand_strategy` -- is a separate, explicitly
+        confirmed call. The returned `CompanionTurn.proposed_action` has
+        already been through `causal.companion.actions.validate_proposed_action`
+        (inside `parse_companion_turn`), so it can only ever name that one
+        allow-listed write with in-range arguments.
+
+        `analytic_dataset.parquet` is never read here; the companion is fed
+        the same class of on-disk JSON artifacts as
+        `causal.agents.results_narrative`.
+        """
+        state = self.load(run_id)
+        if state.phase != "estimand_review":
+            raise RuntimeError("The estimand dialogue requires the estimand_review phase")
+        run_dir = self.runs_dir / run_id
+        study_spec_path = run_dir / "study_specification.json"
+        if not study_spec_path.is_file():
+            raise RuntimeError(
+                "Cannot run the estimand dialogue: study_specification.json is missing "
+                "-- approve the identification_estimand gate first"
+            )
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        query_settings = protocol.get("query_settings")
+        context = EstimandDialogueContext(
+            study_specification=json.loads(study_spec_path.read_text(encoding="utf-8")),
+            current_settings=protocol.get("statistical_estimand_settings") or {},
+            cohort_manifest=self._read_optional_json(run_dir / "cohort_manifest.json"),
+            feasibility=self._read_optional_json(run_dir / "feasibility.json"),
+            followup_audit=self._read_optional_json(run_dir / "followup_audit.json"),
+            positivity_audit=self._read_optional_json(run_dir / "positivity_audit.json"),
+            covariate_missingness=self._read_optional_json(run_dir / "covariate_missingness.json"),
+            censoring_definition_approved=bool(
+                (query_settings or {}).get("censoring_definition_approved", False)
+            ),
+        )
+        prompt = build_estimand_dialogue_prompt(prompt_path, history=history, context=context)
+        return parse_companion_turn(llm(prompt))
 
     def set_cate_cutpoint(self, run_id: str, covariate_name: str, cutpoint: float, reviewer: str) -> RunState:
         """Record a reviewer-entered cutpoint for splitting a continuous

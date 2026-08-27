@@ -12,6 +12,7 @@ import pandas as pd
 
 from causal.config import BigQueryDatasets
 from causal.mcp_client import MCPToolResponse
+from causal.companion.companion import CompanionMessage
 from causal.orchestrator import WorkflowManager
 from causal.provenance import artifact_metadata
 from causal.orchestrator.workflow import (
@@ -2624,85 +2625,93 @@ def _never_call_estimation_procedure_llm(prompt: str) -> str:
     raise AssertionError("llm() must not be called when population_summary == 'CATE'")
 
 
-class WorkflowProposeEstimationProcedureTests(unittest.TestCase):
-    """`propose_estimation_procedure` sits at the same `estimand_review`
-    gate as `set_statistical_estimand_strategy` (`WorkflowMaterializeAnalyticDatasetTests.
-    setUp` above), but this fixture stops right after `build_cohort_plan`
-    -- before the human strategy/gate/advance calls -- since proposing a
-    suggestion is meant to happen *before* the reviewer has decided
-    anything, not after.
+def _bring_run_to_estimand_review(root: Path, datasets) -> tuple[WorkflowManager, str, Path]:
+    """Advance a fresh single-covariate (SOFA) run through every gate to the
+    `estimand_review` phase, with `study_specification.json` and
+    `cohort_manifest.json` on disk. Stops right after `build_cohort_plan` --
+    before the human strategy/gate/advance calls -- since both the
+    estimation-procedure suggestion and the companion dialogue are meant to
+    run *before* the reviewer has decided anything.
     """
+    protocol = root / "protocol.json"
+    protocol.write_text(json.dumps({
+        "study_id": "test_study",
+        "source_question": "Does treatment affect outcome?",
+        "target_trial": {
+            "population": "population", "treatment": "treatment",
+            "comparator": "comparator", "time_zero": "index",
+            "grace_period_hours": 24, "outcome": "outcome",
+            "follow_up_days": 28, "primary_estimand": "ATE",
+            **_FULL_TARGET_TRIAL_FIELDS,
+        },
+        "data_source": "project.dataset",
+        "first_pass_covariates": ["SOFA score"],
+        "concept_sets": {
+            "population": {
+                "role": "population", "status": "approved",
+                "domain": "condition", "concept_ids": [132797],
+            },
+            "treatment": {
+                "role": "treatment", "status": "approved",
+                "domain": "drug", "concept_ids": [1],
+            },
+            "comparator": {
+                "role": "comparator", "status": "approved",
+                "domain": "drug", "concept_ids": [2],
+            },
+            "outcome": {
+                "role": "outcome", "status": "approved",
+                "domain": "condition", "concept_ids": [316866],
+            },
+        },
+    }), encoding="utf-8")
+    manager = WorkflowManager(root / "runs")
+    state = manager.start(protocol)
+    state = manager.run_hypothesis_agent(state.run_id)
+    run_id = state.run_id
+    run_dir = root / "runs" / run_id
+
+    manager.review_covariate(
+        run_id, "SOFA score", "accept", "Dr. Chen",
+        "Higher SOFA is associated with treatment choice and outcome.",
+        role="confounder", temporal_classification="pre_treatment",
+        domain="measurement",
+    )
+    manager.map_covariate_concepts(run_id, "SOFA score", [4301868], "Dr. Lee")
+    manager.review_covariate_aggregation(
+        run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
+    )
+    _approve_pre_mapping_gates(manager, run_id)
+    for _ in range(3):
+        manager.advance(run_id)
+    manager.decide_gate(run_id, "clinical_mapping", "approved", "Dr. Lee")
+    manager.advance(run_id)
+    manager.run_data_science_agent(run_id)
+    manager.advance(run_id)
+    plan_path = run_dir / "analysis_plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["exploratory_execution_allowed"] = True
+    plan["unresolved_issues"] = []
+    for phenotype in plan["phenotypes"]:
+        phenotype["status"] = "approved"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    manager.decide_gate(run_id, "analysis_plan", "approved", "Dr. Lee")
+    state = manager.advance(run_id)
+    assert state.phase == "estimand_review", state.phase
+    manager.build_cohort_plan(run_id, datasets)
+    return manager, run_id, run_dir
+
+
+class WorkflowProposeEstimationProcedureTests(unittest.TestCase):
+    """`propose_estimation_procedure` sits at the `estimand_review` gate; see
+    `_bring_run_to_estimand_review` for the shared fixture."""
 
     def setUp(self):
         self.datasets = BigQueryDatasets()
         self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
-        self.protocol = root / "protocol.json"
-        self.protocol.write_text(json.dumps({
-            "study_id": "test_study",
-            "source_question": "Does treatment affect outcome?",
-            "target_trial": {
-                "population": "population", "treatment": "treatment",
-                "comparator": "comparator", "time_zero": "index",
-                "grace_period_hours": 24, "outcome": "outcome",
-                "follow_up_days": 28, "primary_estimand": "ATE",
-                **_FULL_TARGET_TRIAL_FIELDS,
-            },
-            "data_source": "project.dataset",
-            "first_pass_covariates": ["SOFA score"],
-            "concept_sets": {
-                "population": {
-                    "role": "population", "status": "approved",
-                    "domain": "condition", "concept_ids": [132797],
-                },
-                "treatment": {
-                    "role": "treatment", "status": "approved",
-                    "domain": "drug", "concept_ids": [1],
-                },
-                "comparator": {
-                    "role": "comparator", "status": "approved",
-                    "domain": "drug", "concept_ids": [2],
-                },
-                "outcome": {
-                    "role": "outcome", "status": "approved",
-                    "domain": "condition", "concept_ids": [316866],
-                },
-            },
-        }), encoding="utf-8")
-        self.manager = WorkflowManager(root / "runs")
-        state = self.manager.start(self.protocol)
-        state = self.manager.run_hypothesis_agent(state.run_id)
-        self.run_id = state.run_id
-        self.run_dir = root / "runs" / self.run_id
-
-        self.manager.review_covariate(
-            self.run_id, "SOFA score", "accept", "Dr. Chen",
-            "Higher SOFA is associated with treatment choice and outcome.",
-            role="confounder", temporal_classification="pre_treatment",
-            domain="measurement",
+        self.manager, self.run_id, self.run_dir = _bring_run_to_estimand_review(
+            Path(self.temp.name), self.datasets
         )
-        self.manager.map_covariate_concepts(self.run_id, "SOFA score", [4301868], "Dr. Lee")
-        self.manager.review_covariate_aggregation(
-            self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
-        )
-        _approve_pre_mapping_gates(self.manager, self.run_id)
-        for _ in range(3):
-            state = self.manager.advance(self.run_id)
-        self.manager.decide_gate(self.run_id, "clinical_mapping", "approved", "Dr. Lee")
-        self.manager.advance(self.run_id)
-        self.manager.run_data_science_agent(self.run_id)
-        self.manager.advance(self.run_id)
-        plan_path = self.run_dir / "analysis_plan.json"
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        plan["exploratory_execution_allowed"] = True
-        plan["unresolved_issues"] = []
-        for phenotype in plan["phenotypes"]:
-            phenotype["status"] = "approved"
-        plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "Dr. Lee")
-        state = self.manager.advance(self.run_id)
-        self.assertEqual(state.phase, "estimand_review")
-        self.manager.build_cohort_plan(self.run_id, self.datasets)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -2763,6 +2772,117 @@ class WorkflowProposeEstimationProcedureTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.manager.propose_estimation_procedure(self.run_id, _fake_llm)
+
+
+class _CapturingLLM:
+    def __init__(self, response: str):
+        self.response = response
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.response
+
+
+_COMPANION_REPLY_ONLY = json.dumps({"reply": "Let's start with the censoring strategy."})
+_COMPANION_WITH_ACTION = json.dumps({
+    "reply": "Recording IPCW plus TMLE, as we discussed.",
+    "proposed_action": {
+        "action": "set_statistical_estimand_strategy",
+        "args": {
+            "missing_data_strategy": "complete_case_analysis",
+            "censoring_strategy": "ipcw_administrative_censoring",
+            "estimation_procedure": "targeted_minimum_loss_based_estimation",
+            "censoring_rationale": "Follow-up audit shows non-trivial administrative censoring; reweight rather than drop.",
+        },
+    },
+})
+
+
+class WorkflowRunCompanionTurnTests(unittest.TestCase):
+    """`run_companion_turn` is the LLM-owning half of the estimand dialogue;
+    the pure prompt-build/parse is covered by `test_companion_agent.py`."""
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        self.manager, self.run_id, self.run_dir = _bring_run_to_estimand_review(
+            Path(self.temp.name), self.datasets
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_returns_a_parsed_reply_only_turn(self):
+        turn = self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_REPLY_ONLY), [])
+        self.assertEqual(turn.reply, "Let's start with the censoring strategy.")
+        self.assertIsNone(turn.proposed_action)
+
+    def test_returns_a_validated_proposed_action(self):
+        turn = self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_WITH_ACTION), [])
+        self.assertIsNotNone(turn.proposed_action)
+        self.assertEqual(turn.proposed_action.action, "set_statistical_estimand_strategy")
+        self.assertEqual(
+            turn.proposed_action.args["censoring_strategy"], "ipcw_administrative_censoring"
+        )
+
+    def test_prompt_is_grounded_in_the_run_artifacts_and_history(self):
+        manifest = json.loads((self.run_dir / "cohort_manifest.json").read_text(encoding="utf-8"))
+        covariate = next(
+            column["name"] for column in manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        )
+        llm = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(
+            self.run_id, llm, [CompanionMessage("user", "what does IPCW change?")]
+        )
+        prompt = llm.prompts[0]
+        self.assertIn(covariate, prompt)
+        self.assertIn("Reviewer: what does IPCW change?", prompt)
+
+    def test_does_not_mutate_run_state(self):
+        before = self.manager.load(self.run_id)
+        self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_WITH_ACTION), [])
+        after = self.manager.load(self.run_id)
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertEqual(after.updated_at, before.updated_at)
+        self.assertNotIn(
+            "statistical_estimand_settings",
+            json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8")),
+        )
+
+    def test_rejects_the_wrong_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "execution"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_REPLY_ONLY), [])
+
+    def test_requires_study_specification(self):
+        (self.run_dir / "study_specification.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_REPLY_ONLY), [])
+
+    def test_malformed_llm_response_raises(self):
+        with self.assertRaises(ValueError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM("not json"), [])
+
+    def test_smuggled_reviewer_in_action_fails_the_turn(self):
+        smuggled = json.dumps({
+            "reply": "recording",
+            "proposed_action": {
+                "action": "set_statistical_estimand_strategy",
+                "args": {
+                    "missing_data_strategy": "complete_case_analysis",
+                    "censoring_strategy": "ignore_censoring_administrative_waiver",
+                    "estimation_procedure": "plug_in_standardization",
+                    "censoring_rationale": "waiver",
+                    "reviewer": "not_a_real_person",
+                },
+            },
+        })
+        with self.assertRaises(ValueError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM(smuggled), [])
 
 
 def _synthetic_cohort_csv(n: int = 300, seed: int = 11) -> str:
