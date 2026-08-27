@@ -136,6 +136,11 @@ action. The transcript (`conversation.jsonl`) records every turn, including
 which card was confirmed or dismissed. If the companion LLM is unavailable
 the panel degrades to a warning and the "Fill the form directly" fallback.
 
+To exercise this panel without a working OMCP/BigQuery stack,
+`python scripts/stage_demo_run.py --to estimand_review` stages a fully
+synthetic run (auto-approved gates, fabricated cohort) straight into the
+phase and prints its run id for the Streamlit sidebar.
+
 ## Results narrative (post-estimation interpretation)
 
 After `causal.agents.estimation`/`causal.agents.diagnostics` compute the
@@ -185,6 +190,9 @@ one-step `run_results_narrative` path stays as the no-conversation fallback;
 both write the identical artifact and both go through the same faithfulness
 verification and human approval. The `source` field on
 `results_narrative.json` records which path produced it.
+`python scripts/stage_demo_run.py --to results_review` stages a synthetic
+run (fabricated cohort, `estimation.json` / `diagnostics.json` written) for
+testing this panel offline.
 
 Every claim in `claims` is typed (`effect_direction`, `effect_magnitude`,
 `uncertainty`, `sample_size`, `diagnostic_warning`,

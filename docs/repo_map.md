@@ -13,6 +13,7 @@ data.
 | `studies/` | versioned study specifications and reference audits | tracked, no patient data |
 | `scripts/bigquery_etl/` | project-owned BigQuery-to-DuckDB exporter | tracked |
 | `scripts/snuh_etl/` | project-owned SYN-SNUH ETL and validation | tracked |
+| `scripts/stage_demo_run.py` | dev-only: stage a fully synthetic run to `estimand_review` / `results_review` for offline UI-dialogue testing (no OMCP/BigQuery) | tracked |
 | `notebooks/` | exploratory analysis | tracked selectively; strip large outputs |
 | `tests/` | deterministic project test suite | tracked |
 | `artifacts/runs/` | generated workflow artifacts | generated; review before any commit or sharing |
