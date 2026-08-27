@@ -42,18 +42,24 @@ from causal.agents.results_narrative import (
     DEFAULT_NARRATIVE_PROMPT_PATH,
     NARRATIVE_BOUNDARY_STATEMENT,
     NarrativeInput,
+    NarrativeResult,
     build_narrative_prompt,
+    narrative_result_from_payload,
     normalize_narrative_artifact,
     parse_narrative_response,
 )
 from causal.agents.user_question import GeneratedHypothesis
 from causal.companion.companion import (
     DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
+    DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
     CompanionMessage,
     CompanionTurn,
     EstimandDialogueContext,
+    ResultsCompanionTurn,
     build_estimand_dialogue_prompt,
+    build_results_dialogue_prompt,
     parse_companion_turn,
+    parse_results_companion_turn,
 )
 from causal.llm.base import LLMCallable
 from causal.bigquery import BigQueryOMOPGateway
@@ -3072,9 +3078,27 @@ class WorkflowManager:
         (see its own docstring), it never calls an LLM itself.
         """
         state = self.load(run_id)
+        narrative_input = self._results_narrative_input(state)
+        prompt = build_narrative_prompt(prompt_path, narrative_input)
+        result = parse_narrative_response(llm(prompt))
+        return self._write_results_narrative(
+            run_id, narrative_input, result,
+            prompt=prompt, model=model, provider=provider, source="one_shot",
+        )
+
+    def _results_narrative_input(self, state: RunState) -> NarrativeInput:
+        """Build the JSON-safe `NarrativeInput` for a run from its on-disk
+        artifacts. Shared by `run_results_narrative` (one-shot),
+        `run_results_companion_turn` (a dialogue turn), and
+        `save_results_narrative_draft` (persisting a dialogue draft) so all
+        three interpret -- and `verify_narrative` checks -- against the
+        identical bundle. Raises if the phase is not `results_review` /
+        `report` or `estimation.json` is missing.
+        `analytic_dataset.parquet` is never read here.
+        """
         if state.phase not in {"results_review", "report"}:
             raise RuntimeError("Results narrative requires the results_review or report phase")
-        run_dir = self.runs_dir / run_id
+        run_dir = self.runs_dir / state.run_id
         estimation_path = run_dir / "estimation.json"
         if not estimation_path.is_file():
             raise RuntimeError("Run run_estimation first")
@@ -3089,7 +3113,7 @@ class WorkflowManager:
             study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics,
             estimation.get("estimand", {}), cate,
         )
-        narrative_input = NarrativeInput(
+        return NarrativeInput(
             study_id=state.study_id,
             question=study_spec.get("question", {}),
             estimand=study_spec.get("estimand", {}),
@@ -3108,9 +3132,27 @@ class WorkflowManager:
             ),
             assumptions_and_limitations=tuple(assumptions),
         )
-        prompt = build_narrative_prompt(prompt_path, narrative_input)
-        result = parse_narrative_response(llm(prompt))
+
+    def _write_results_narrative(
+        self,
+        run_id: str,
+        narrative_input: NarrativeInput,
+        result: NarrativeResult,
+        *,
+        prompt: str,
+        model: str,
+        provider: str,
+        source: str,
+    ) -> RunState:
+        """Run the deterministic `verify_narrative` and persist a parsed
+        narrative as `results_narrative.json` (`review_status: pending`).
+        `source` is `one_shot` (`run_results_narrative`) or `dialogue`
+        (`save_results_narrative_draft`) -- the artifacts are identical in
+        shape and both still require `review_results_narrative` before the
+        report.
+        """
         verification = verify_narrative(result, narrative_input)
+        run_dir = self.runs_dir / run_id
         artifact = {
             "schema_version": "2.0",
             "narrative": result.narrative_text,
@@ -3123,10 +3165,11 @@ class WorkflowManager:
             "boundary_statement": NARRATIVE_BOUNDARY_STATEMENT,
             "model": model,
             "provider": provider,
+            "source": source,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "metadata": artifact_metadata(
                 "results_narrative_agent", "0.2.0",
-                {"study_id": state.study_id, "model": model, "provider": provider},
+                {"study_id": narrative_input.study_id, "model": model, "provider": provider},
             ),
         }
         with _RunLock(run_dir):
@@ -3138,11 +3181,74 @@ class WorkflowManager:
                 state.artifacts.append("results_narrative.json")
             state.record(
                 "results_narrative_generated",
-                f"results_narrative.json; model={provider}:{model}; "
+                f"results_narrative.json; source={source}; model={provider}:{model}; "
                 f"verification={verification.status}; claims={len(result.claims)}",
             )
             self.save(state)
         return state
+
+    def run_results_companion_turn(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        history: Sequence[CompanionMessage],
+        *,
+        prompt_path: Path = DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
+    ) -> ResultsCompanionTurn:
+        """One turn of the conversational assist for interpreting the
+        finished estimate (`causal.companion.companion`) -- the
+        results-review counterpart of `run_companion_turn`. Owns the
+        `llm(prompt)` call and the JSON-artifact reads; the pure
+        prompt-build/parse lives in the companion module.
+
+        Read-only with respect to run state: no `_RunLock`, nothing recorded
+        in `state.history`, no file written. A turn may end with a
+        `drafted_narrative`; the caller persists it with
+        `save_results_narrative_draft` on an explicit reviewer confirm, and
+        `review_results_narrative` is still the only way a narrative reaches
+        `build_causal_report`.
+
+        Same grounding as `run_results_narrative`: `NarrativeInput` from
+        on-disk JSON only, so `analytic_dataset.parquet` never reaches `llm`.
+        """
+        state = self.load(run_id)
+        narrative_input = self._results_narrative_input(state)
+        prompt = build_results_dialogue_prompt(
+            prompt_path, history=history, narrative_input=narrative_input
+        )
+        return parse_results_companion_turn(llm(prompt))
+
+    def save_results_narrative_draft(
+        self,
+        run_id: str,
+        drafted_narrative: dict[str, Any],
+        history: Sequence[CompanionMessage],
+        *,
+        model: str = "unknown",
+        provider: str = "unknown",
+        prompt_path: Path = DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
+    ) -> RunState:
+        """Persist a results-dialogue-drafted narrative as
+        `results_narrative.json` (`review_status: pending`).
+
+        `drafted_narrative` is the `{narrative, claims}` object a
+        `run_results_companion_turn` turn carried; it is re-validated here
+        (`narrative_result_from_payload`) and run through the same
+        deterministic `verify_narrative` as a one-shot narrative. The
+        reviewer still has to approve it with `review_results_narrative`
+        before it enters the report. `prompt_sha256` records the dialogue
+        prompt the draft was produced against, rebuilt from `history`.
+        """
+        state = self.load(run_id)
+        narrative_input = self._results_narrative_input(state)
+        result = narrative_result_from_payload(drafted_narrative, context="drafted_narrative")
+        prompt = build_results_dialogue_prompt(
+            prompt_path, history=history, narrative_input=narrative_input
+        )
+        return self._write_results_narrative(
+            run_id, narrative_input, result,
+            prompt=prompt, model=model, provider=provider, source="dialogue",
+        )
 
     def review_results_narrative(
         self,

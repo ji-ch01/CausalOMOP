@@ -227,9 +227,14 @@ class NormalizeNarrativeArtifactTests(unittest.TestCase):
             "reviewer": "Clinician",
             "reviewed_at": "2026-08-11T00:00:00+00:00",
             "review_note": "Looks good.",
+            "source": "one_shot",
         }
         normalized = normalize_narrative_artifact(current)
         self.assertEqual(normalized, current)
+
+    def test_legacy_artifact_defaults_source_to_one_shot(self):
+        normalized = normalize_narrative_artifact({"narrative": "An old narrative."})
+        self.assertEqual(normalized["source"], "one_shot")
 
 
 if __name__ == "__main__":

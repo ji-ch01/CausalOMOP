@@ -3807,6 +3807,95 @@ class WorkflowResultsNarrativeReviewTests(_ResultsNarrativeFixture, unittest.Tes
             self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee")
 
 
+class WorkflowResultsCompanionTurnTests(_ResultsNarrativeFixture, unittest.TestCase):
+    """`run_results_companion_turn` is the LLM-owning half of the
+    results-interpretation dialogue; the pure prompt-build/parse is covered
+    by `test_companion_agent.py`. `save_results_narrative_draft` persists a
+    drafted narrative through the same path as the one-shot step."""
+
+    def _draft_payload(self) -> dict:
+        """A structurally valid, faithful draft built from the run's own
+        estimation.json -- reuses `_faithful_llm`'s response body."""
+        return json.loads(self._faithful_llm()(""))
+
+    def test_returns_a_parsed_reply_only_turn(self):
+        llm = _CapturingLLM(json.dumps({"reply": "Let's start with the direction of the effect."}))
+        turn = self.manager.run_results_companion_turn(self.run_id, llm, [])
+        self.assertEqual(turn.reply, "Let's start with the direction of the effect.")
+        self.assertIsNone(turn.drafted_narrative)
+
+    def test_prompt_is_grounded_in_the_estimate_and_history(self):
+        estimation = json.loads((self.run_dir / "estimation.json").read_text(encoding="utf-8"))
+        n_total = str(estimation["estimand"]["n_total"])
+        llm = _CapturingLLM(json.dumps({"reply": "ok"}))
+        self.manager.run_results_companion_turn(
+            self.run_id, llm, [CompanionMessage("user", "which way does it point?")]
+        )
+        prompt = llm.prompts[0]
+        self.assertIn(n_total, prompt)
+        self.assertIn("Reviewer: which way does it point?", prompt)
+        self.assertNotIn("analytic_dataset.parquet", prompt)
+
+    def test_turn_can_carry_a_validated_draft(self):
+        llm = _CapturingLLM(json.dumps({"reply": "Drafted it.", "drafted_narrative": self._draft_payload()}))
+        turn = self.manager.run_results_companion_turn(self.run_id, llm, [])
+        self.assertIsNotNone(turn.drafted_narrative)
+        self.assertGreaterEqual(len(turn.drafted_narrative.claims), 3)
+
+    def test_a_turn_does_not_mutate_run_state_or_write_an_artifact(self):
+        before = self.manager.load(self.run_id)
+        llm = _CapturingLLM(json.dumps({"reply": "Drafted it.", "drafted_narrative": self._draft_payload()}))
+        self.manager.run_results_companion_turn(self.run_id, llm, [])
+        after = self.manager.load(self.run_id)
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertFalse((self.run_dir / "results_narrative.json").is_file())
+
+    def test_rejects_the_wrong_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_results_companion_turn(self.run_id, _CapturingLLM("{}"), [])
+
+    def test_rejects_a_missing_estimation_artifact(self):
+        (self.run_dir / "estimation.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_results_companion_turn(self.run_id, _CapturingLLM("{}"), [])
+
+    def test_save_draft_writes_a_pending_artifact_tagged_dialogue(self):
+        state = self.manager.save_results_narrative_draft(
+            self.run_id, self._draft_payload(), [CompanionMessage("user", "go ahead")],
+            model="test-model", provider="test-provider",
+        )
+        artifact = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["source"], "dialogue")
+        self.assertEqual(artifact["review_status"], "pending")
+        self.assertEqual(artifact["model"], "test-model")
+        self.assertIn(artifact["verification"]["status"], {"passed", "warning", "failed"})
+        self.assertIn("results_narrative.json", state.artifacts)
+        self.assertTrue(any(
+            e["event"] == "results_narrative_generated" and "source=dialogue" in e["detail"]
+            for e in state.history
+        ))
+
+    def test_a_saved_draft_goes_through_the_normal_human_review(self):
+        self.manager.save_results_narrative_draft(
+            self.run_id, self._draft_payload(), [], model="m", provider="p"
+        )
+        self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee", "Faithful to the estimate.")
+        artifact = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["review_status"], "approved")
+        report = self.manager.build_causal_report(self.run_id).read_text(encoding="utf-8")
+        self.assertIn("Approved by Dr. Lee", report)
+
+    def test_save_draft_rejects_a_malformed_payload(self):
+        with self.assertRaises(ValueError):
+            self.manager.save_results_narrative_draft(
+                self.run_id, {"narrative": "text", "claims": []}, [], model="m", provider="p"
+            )
+        self.assertFalse((self.run_dir / "results_narrative.json").is_file())
+
+
 class WorkflowVariableRegistryTests(unittest.TestCase):
     """`build_variable_registry` only needs `protocol.json` -- it must not
     depend on the Data Science Agent or on any OMOP data being reachable

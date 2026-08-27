@@ -217,4 +217,7 @@ def normalize_narrative_artifact(payload: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("reviewer", None)
     normalized.setdefault("reviewed_at", None)
     normalized.setdefault("review_note", None)
+    # "dialogue" (results-interpretation dialogue draft) vs "one_shot"; a
+    # legacy artifact predates the distinction and was always one-shot.
+    normalized.setdefault("source", "one_shot")
     return normalized
