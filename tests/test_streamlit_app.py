@@ -534,5 +534,42 @@ class EstimandReviewFormSmokeTests(unittest.TestCase):
         self.assertTrue(any("conversation on the left" in block.value for block in harness.info))
 
 
+def _results_narrative_section_script(run_dir: str) -> None:
+    """AppTest script: render `_render_results_narrative_section` for a run
+    that has an estimate but no interpretation yet, to guard that arriving at
+    the section no longer fires a one-shot LLM call (the dialogue does that
+    now) and offers the one-step fallback instead."""
+    import json
+    from pathlib import Path
+
+    from causal.orchestrator.state import RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_results_narrative_section
+
+    path = Path(run_dir)
+    (path / "estimation.json").write_text(
+        json.dumps({"estimand": {"point_estimate": 0.01, "ci_lower": -0.1, "ci_upper": 0.1, "n_total": 200}}),
+        encoding="utf-8",
+    )
+    state = RunState(
+        run_id="run1", study_id="s", protocol_path=str(path / "protocol.json"), phase="results_review"
+    )
+    _render_results_narrative_section(WorkflowManager(path.parent), state, path)
+
+
+class ResultsNarrativeSectionSmokeTests(unittest.TestCase):
+    def test_no_autogen_on_arrival_offers_the_one_step_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run1"
+            run_dir.mkdir()
+            harness = AppTest.from_function(
+                _results_narrative_section_script, kwargs={"run_dir": str(run_dir)}, default_timeout=30
+            )
+            harness.run()
+            self.assertEqual(list(harness.exception), [])
+            self.assertFalse((run_dir / "results_narrative.json").is_file())
+        self.assertTrue(any("Draft in one step" in button.label for button in harness.button))
+
+
 if __name__ == "__main__":
     unittest.main()

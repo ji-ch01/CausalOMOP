@@ -3411,34 +3411,35 @@ def _generate_results_narrative(manager: WorkflowManager, run_id: str, *, status
 
 
 def _render_results_narrative_section(manager: WorkflowManager, state: RunState, run_dir: Path) -> dict[str, Any] | None:
-    """Steps 2-4 of the estimation/report flow: automatically produce a
-    plain-language interpretation of the finished estimate the moment it's
-    ready, show it front and center, and let a human approve or exclude it
-    (deterministic faithfulness verification and the underlying claims stay
-    available but tucked into a secondary "Review & audit" expander so they
-    don't compete with the readable summary). Returns the normalized
-    artifact (or `None` if none exists yet) so the caller can gate "Build
-    causal report" on it via `_narrative_blocks_report`."""
+    """Steps 2-4 of the estimation/report flow: show the plain-language
+    interpretation of the finished estimate front and center, and let a human
+    approve or exclude it (deterministic faithfulness verification and the
+    underlying claims stay available but tucked into a secondary "Review &
+    audit" expander so they don't compete with the readable summary). Returns
+    the normalized artifact (or `None` if none exists yet) so the caller can
+    gate "Build causal report" on it via `_narrative_blocks_report`.
+
+    The interpretation is normally drafted through the results dialogue in the
+    conversation panel (`causal.ui.conversation._render_results_dialogue`);
+    the "Draft in one step" button here is the no-conversation fallback. Both
+    paths write the same `results_narrative.json` and go through the same
+    approval below."""
     run_id = state.run_id
     narrative_raw = _read_json(run_dir / "results_narrative.json")
     narrative = normalize_narrative_artifact(narrative_raw) if narrative_raw else None
     narrative_ready = state.phase in {"results_review", "report"} and (run_dir / "estimation.json").is_file()
 
-    autogen_key = f"_narrative_autogen_attempted_{run_id}"
-    if narrative_ready and narrative is None and not st.session_state.get(autogen_key):
-        st.session_state[autogen_key] = True
-        if _generate_results_narrative(manager, run_id, status_label="Interpreting the estimate automatically..."):
-            st.rerun()
-
     st.subheader("What this result means", anchor=False)
     st.caption(
-        "Generated automatically from the finished estimate, diagnostics, and gate history -- never the "
-        "patient-level dataset. Advisory only: it cannot approve the results gate or change the estimate."
+        "Built from the finished estimate, diagnostics, and gate history -- never the patient-level "
+        "dataset. Advisory only: it cannot approve the results gate or change the estimate. Draft it "
+        "by talking the estimate through in the conversation panel, or in one step here."
     )
 
     if narrative:
         review_status = narrative.get("review_status", "pending")
         status_color = {"approved": "green", "excluded": "orange"}.get(review_status, "gray")
+        source_label = {"dialogue": "from the interpretation dialogue"}.get(narrative.get("source"), "drafted in one step")
         with st.container(border=True):
             header_col, badge_col = st.columns([5, 2], vertical_alignment="center")
             with header_col:
@@ -3447,28 +3448,35 @@ def _render_results_narrative_section(manager: WorkflowManager, state: RunState,
                 st.badge(review_status.replace("_", " ").capitalize(), color=status_color)
             st.markdown(narrative.get("narrative", ""))
             st.caption(narrative.get("boundary_statement", ""))
-        st.caption(f"Model: {narrative.get('provider', 'unknown')}:{narrative.get('model', 'unknown')}")
+        st.caption(
+            f"Model: {narrative.get('provider', 'unknown')}:{narrative.get('model', 'unknown')} · {source_label}"
+        )
         if st.button(
-            "Regenerate interpretation",
+            "Redraft in one step",
             icon=":material/refresh:",
             disabled=not narrative_ready,
             key=f"generate_narrative_{run_id}",
+            help="Replaces the current draft with a fresh one-shot interpretation (no conversation).",
         ):
-            if _generate_results_narrative(manager, run_id, status_label="Regenerating the interpretation..."):
+            if _generate_results_narrative(manager, run_id, status_label="Redrafting the interpretation..."):
                 st.rerun()
         if not narrative_ready:
             st.caption("Requires the results-review or report phase and an existing estimate.")
     elif narrative_ready:
-        st.info("No LLM interpretation could be generated for this run yet.")
+        st.info(
+            "No interpretation drafted yet. Talk the estimate through in the conversation panel, "
+            "or draft one here without the conversation."
+        )
         if st.button(
-            "Retry",
+            "Draft in one step",
             icon=":material/smart_toy:",
             key=f"generate_narrative_{run_id}",
         ):
             if _generate_results_narrative(manager, run_id, status_label="Interpreting the estimate..."):
                 st.rerun()
+        return None
     else:
-        st.caption("An interpretation will be generated automatically once an estimate is available.")
+        st.caption("An interpretation can be drafted once an estimate is available.")
         return None
 
     if not narrative:

@@ -32,6 +32,16 @@ def _estimand_dialogue_script(runs_dir: str, run_id: str) -> None:
     _render_estimand_dialogue(WorkflowManager(runs_dir), run_id)
 
 
+def _results_dialogue_script(runs_dir: str, run_id: str) -> None:
+    """AppTest script: render the results-interpretation dialogue for one run."""
+    from pathlib import Path as _Path
+
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.conversation import _render_results_dialogue
+
+    _render_results_dialogue(WorkflowManager(runs_dir), run_id, _Path(runs_dir) / run_id)
+
+
 def _conversation_panel_script(runs_dir: str, run_id: str) -> None:
     """AppTest script: render the whole panel for an open run so the study
     progress header (the moved "Study summary" content) is exercised."""
@@ -201,6 +211,114 @@ class LatestPendingActionTests(unittest.TestCase):
                 [_entry("proposed_action", phase="results_review", text="not this one")]
             )
         )
+
+
+class ResultsDialogueHistoryTests(unittest.TestCase):
+    def test_keeps_only_results_phase_user_and_assistant_turns(self):
+        entries = [
+            _entry("message", role="user", phase="estimand_review", text="from another dialogue"),
+            _entry("message", role="user", phase="results_review", text="which way does it point?"),
+            _entry("message", role="assistant", phase="results_review", text="the point estimate is positive"),
+            _entry("narrative_saved", role="event", phase="results_review", text="saved"),
+            _entry("drafted_narrative", role="assistant", phase="results_review", text="drafted it for review"),
+        ]
+        history = panel.results_dialogue_history(entries)
+        self.assertEqual(
+            [(m.role, m.text) for m in history],
+            [
+                ("user", "which way does it point?"),
+                ("assistant", "the point estimate is positive"),
+                ("assistant", "drafted it for review"),
+            ],
+        )
+
+    def test_blank_turns_are_dropped(self):
+        self.assertEqual(
+            panel.results_dialogue_history([_entry("message", role="user", phase="results_review", text="  ")]),
+            [],
+        )
+
+
+class LatestDraftedNarrativeTests(unittest.TestCase):
+    def _draft(self, text="draft A"):
+        return _entry("drafted_narrative", phase="results_review", text=text)
+
+    def test_none_when_no_draft(self):
+        self.assertIsNone(
+            panel.latest_drafted_narrative([_entry("message", role="user", phase="results_review", text="hi")])
+        )
+
+    def test_returns_the_unresolved_draft(self):
+        draft = self._draft()
+        self.assertIs(panel.latest_drafted_narrative([draft]), draft)
+
+    def test_saved_or_dismissed_clears_it(self):
+        draft = self._draft()
+        for resolver in ("narrative_saved", "narrative_dismissed"):
+            self.assertIsNone(
+                panel.latest_drafted_narrative(
+                    [draft, _entry(resolver, role="event", phase="results_review", text="done")]
+                )
+            )
+
+    def test_a_newer_draft_supersedes_an_older_one(self):
+        first, second = self._draft("A"), self._draft("B")
+        self.assertIs(panel.latest_drafted_narrative([first, second]), second)
+
+    def test_ignores_drafts_from_other_phases(self):
+        self.assertIsNone(
+            panel.latest_drafted_narrative([_entry("drafted_narrative", phase="estimand_review", text="x")])
+        )
+
+
+class ResultsDialogueRenderTests(unittest.TestCase):
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.runs_dir = Path(self._temp.name)
+
+    def _app(self, run_id: str) -> AppTest:
+        harness = AppTest.from_function(
+            _results_dialogue_script,
+            kwargs={"runs_dir": str(self.runs_dir), "run_id": run_id},
+            default_timeout=30,
+        )
+        harness.run()
+        return harness
+
+    def test_points_to_estimation_when_no_estimate_exists_yet(self):
+        (self.runs_dir / "run0").mkdir(parents=True)
+        harness = self._app("run0")
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("estimator has run" in info.value for info in harness.info))
+        self.assertEqual(len(harness.chat_input), 0)
+
+    def test_renders_the_thread_and_a_drafted_narrative_card(self):
+        run_dir = self.runs_dir / "run1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "estimation.json").write_text("{}", encoding="utf-8")
+        ConversationStore(run_dir).extend(
+            [
+                _entry("message", role="assistant", phase="results_review", text="Let's start with direction."),
+                _entry("message", role="user", phase="results_review", text="ready, draft it"),
+                _entry(
+                    "drafted_narrative",
+                    role="assistant",
+                    phase="results_review",
+                    text="Drafted the interpretation.",
+                    narrative="The estimated effect is small and imprecise.",
+                    claims=[{"text": "small", "claim_type": "effect_magnitude", "source_fields": ["estimation"]}],
+                    provider="test",
+                    model="test-model",
+                ),
+            ]
+        )
+        harness = self._app("run1")
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Save for review" in button.label for button in harness.button))
+        self.assertEqual(len(harness.chat_input), 1)
+        prose = " ".join(block.value for block in harness.markdown)
+        self.assertIn("small and imprecise", prose)
 
 
 class EstimandDialogueRenderTests(unittest.TestCase):

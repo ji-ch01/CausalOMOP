@@ -58,6 +58,11 @@ _THREAD_HEIGHT = 460
 # container for one or two messages just leaves a large empty box.
 _THREAD_SCROLL_AFTER = 5
 _ESTIMAND_PHASE = "estimand_review"
+# The results-interpretation dialogue runs across two phases; its transcript
+# turns are all tagged with this one value so history filtering stays stable
+# even after the run advances from `results_review` to `report`.
+_RESULTS_PHASES = frozenset({"results_review", "report"})
+_RESULTS_DIALOGUE_PHASE = "results_review"
 
 _CATEGORY_LABELS = {
     "causal": "Causal question",
@@ -152,6 +157,36 @@ def latest_pending_action(entries: Sequence[ConversationEntry]) -> ConversationE
     return pending
 
 
+def results_dialogue_history(entries: Sequence[ConversationEntry]) -> list[CompanionMessage]:
+    """The results-dialogue turns, as the companion sees them: reviewer
+    (`user`) and companion (`assistant`) messages in order. Workflow `event`
+    lines (a draft saved / dismissed) and turns from other phases are
+    dropped; a `drafted_narrative` turn's `reply` text is kept (it is the
+    companion speaking)."""
+    history: list[CompanionMessage] = []
+    for entry in entries:
+        if entry.phase != _RESULTS_DIALOGUE_PHASE or entry.role not in ("user", "assistant"):
+            continue
+        if entry.text.strip():
+            history.append(CompanionMessage(role=entry.role, text=entry.text))
+    return history
+
+
+def latest_drafted_narrative(entries: Sequence[ConversationEntry]) -> ConversationEntry | None:
+    """The most recent `drafted_narrative` turn not yet saved or dismissed. A
+    later draft supersedes an earlier one; a `narrative_saved` /
+    `narrative_dismissed` after it clears it."""
+    pending: ConversationEntry | None = None
+    for entry in entries:
+        if entry.phase != _RESULTS_DIALOGUE_PHASE:
+            continue
+        if entry.kind == "drafted_narrative":
+            pending = entry
+        elif entry.kind in ("narrative_saved", "narrative_dismissed"):
+            pending = None
+    return pending
+
+
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
@@ -183,6 +218,14 @@ def _render_entry(entry: ConversationEntry) -> None:
             st.caption(f":material/description: {entry.data.get('summary', 'Proposed action')}")
         elif entry.kind in ("action_taken", "action_dismissed"):
             icon = ":material/check_circle:" if entry.kind == "action_taken" else ":material/cancel:"
+            st.markdown(f"{icon} {entry.text}")
+        elif entry.kind == "drafted_narrative":
+            if entry.text:
+                st.markdown(entry.text)
+            claim_count = len(entry.data.get("claims") or ())
+            st.caption(f":material/description: Drafted interpretation · {claim_count} checkable claim(s)")
+        elif entry.kind in ("narrative_saved", "narrative_dismissed"):
+            icon = ":material/check_circle:" if entry.kind == "narrative_saved" else ":material/cancel:"
             st.markdown(f"{icon} {entry.text}")
         else:  # "message" and any kind a later build introduced
             st.markdown(entry.text or "_(empty)_")
@@ -557,6 +600,187 @@ def _render_estimand_dialogue(manager: WorkflowManager, run_id: str) -> None:
         st.rerun()
 
 
+# --------------------------------------------------------------------------- #
+# Results-interpretation dialogue (phase results_review / report)
+# --------------------------------------------------------------------------- #
+_RESULTS_EMPTY_MESSAGE = (
+    "The estimate, diagnostics, and robustness analyses are ready. Talk them "
+    "through here and the companion will draft a plain-language interpretation "
+    "for you to approve -- or draft it in one step under **Estimation & report**."
+)
+
+
+def _run_results_companion_reply(
+    manager: WorkflowManager, run_id: str, store: ConversationStore
+) -> bool:
+    """Read the results dialogue so far, take one companion turn, append its
+    reply (and any drafted narrative) to the transcript. Returns True on
+    success; on any provider/parse failure it records the message for the
+    panel to show and returns False without writing anything."""
+    history = results_dialogue_history(store.read())
+    status = st.status("Companion is thinking...", expanded=False)
+    try:
+        resolved_llm = build_hypothesis_llm()
+        turn = manager.run_results_companion_turn(run_id, resolved_llm.call, history)
+    except Exception as exc:  # noqa: BLE001 - surfaced in the panel, not swallowed
+        status.update(label="Companion unavailable", state="error")
+        st.session_state[_companion_error_key(run_id)] = str(exc)
+        return False
+    status.update(label="Companion replied", state="complete")
+    st.session_state.pop(_companion_error_key(run_id), None)
+    if turn.drafted_narrative is not None:
+        store.append(
+            ConversationEntry(
+                role="assistant",
+                kind="drafted_narrative",
+                phase=_RESULTS_DIALOGUE_PHASE,
+                text=turn.reply,
+                data={
+                    "narrative": turn.drafted_narrative.narrative_text,
+                    "claims": [claim.to_dict() for claim in turn.drafted_narrative.claims],
+                    "provider": resolved_llm.provider,
+                    "model": resolved_llm.model,
+                },
+            )
+        )
+    else:
+        store.append(
+            ConversationEntry(
+                role="assistant", kind="message", phase=_RESULTS_DIALOGUE_PHASE, text=turn.reply
+            )
+        )
+    return True
+
+
+def _render_drafted_narrative_card(
+    manager: WorkflowManager, run_id: str, entry: ConversationEntry
+) -> None:
+    data = entry.data or {}
+    narrative_text = data.get("narrative", "")
+    claims = list(data.get("claims") or ())
+    with st.container(border=True):
+        st.markdown(":material/description: **Drafted interpretation — not yet saved**")
+        st.markdown(narrative_text or "_(empty draft)_")
+        if claims:
+            with st.expander(f"{len(claims)} checkable claim(s)"):
+                st.dataframe(
+                    [
+                        {
+                            "Claim": claim.get("text", ""),
+                            "Type": claim.get("claim_type", ""),
+                            "Source fields": ", ".join(claim.get("source_fields", [])),
+                        }
+                        for claim in claims
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+        st.caption(
+            "Saving runs the deterministic faithfulness check and records this as the run's "
+            "interpretation. It still needs your approval under **Estimation & report** before "
+            "it enters the causal report."
+        )
+        save_col, dismiss_col = st.columns(2)
+        save = save_col.button(
+            "Save for review", type="primary", key=f"draft_save_{entry.id}", width="stretch"
+        )
+        dismiss = dismiss_col.button("Dismiss", key=f"draft_dismiss_{entry.id}", width="stretch")
+        store = ConversationStore(manager.runs_dir / run_id)
+        if save:
+            try:
+                manager.save_results_narrative_draft(
+                    run_id,
+                    {"narrative": narrative_text, "claims": claims},
+                    results_dialogue_history(store.read()),
+                    model=data.get("model", "unknown"),
+                    provider=data.get("provider", "unknown"),
+                )
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+                return
+            store.append(
+                ConversationEntry(
+                    role="event",
+                    kind="narrative_saved",
+                    phase=_RESULTS_DIALOGUE_PHASE,
+                    text="Interpretation saved — approve or exclude it under Estimation & report.",
+                    data={"draft_id": entry.id},
+                )
+            )
+            st.rerun()
+        if dismiss:
+            store.append(
+                ConversationEntry(
+                    role="event",
+                    kind="narrative_dismissed",
+                    phase=_RESULTS_DIALOGUE_PHASE,
+                    text="Drafted interpretation dismissed.",
+                    data={"draft_id": entry.id},
+                )
+            )
+            st.rerun()
+
+
+def _render_results_dialogue(manager: WorkflowManager, run_id: str, run_dir: Any) -> None:
+    if not (run_dir / "estimation.json").is_file():
+        _render_thread(ConversationStore(run_dir).read())
+        st.info(
+            "The interpretation dialogue opens once the estimator has run. Start it from "
+            "**Estimation & report**.",
+            icon=":material/query_stats:",
+        )
+        return
+
+    store = ConversationStore(run_dir)
+
+    def _load() -> tuple[list[ConversationEntry], list[ConversationEntry]]:
+        entries = store.read()
+        return entries, [e for e in entries if e.phase == _RESULTS_DIALOGUE_PHASE]
+
+    entries, dialogue_entries = _load()
+
+    # Open the dialogue automatically on first arrival (once per session). On
+    # success rerun for a clean render; on failure fall through to the warning
+    # + one-step fallback below.
+    opened_key = f"_results_opened_{run_id}"
+    if not dialogue_entries and not st.session_state.get(opened_key):
+        st.session_state[opened_key] = True
+        if _run_results_companion_reply(manager, run_id, store):
+            st.rerun()
+        entries, dialogue_entries = _load()
+
+    st.caption(
+        "Interpret the finished estimate with the study companion. Nothing enters the report "
+        "until you save a draft and approve it."
+    )
+    _render_thread(dialogue_entries, empty_message=_RESULTS_EMPTY_MESSAGE)
+
+    error = st.session_state.get(_companion_error_key(run_id))
+    if error:
+        st.warning(
+            f"The companion is unavailable ({error}). Use **Estimation & report** to draft "
+            "the interpretation in one step instead."
+        )
+        if st.button("Retry the companion", icon=":material/refresh:", key=f"results_retry_{run_id}"):
+            st.session_state.pop(_companion_error_key(run_id), None)
+            _run_results_companion_reply(manager, run_id, store)
+            st.rerun()
+
+    pending = latest_drafted_narrative(entries)
+    if pending is not None:
+        _render_drafted_narrative_card(manager, run_id, pending)
+
+    submitted = st.chat_input("Ask about the estimate, or say you're ready…", key=f"results_chat_{run_id}")
+    if submitted and submitted.strip():
+        store.append(
+            ConversationEntry(
+                role="user", kind="message", phase=_RESULTS_DIALOGUE_PHASE, text=submitted.strip()
+            )
+        )
+        _run_results_companion_reply(manager, run_id, store)
+        st.rerun()
+
+
 def _render_study_progress(state: RunState, run_dir: Any) -> None:
     """Compact "where is this study" view at the top of the conversation
     panel: phase progress, next action, the reviewed question and P/T/C/O,
@@ -644,6 +868,8 @@ def render_conversation_panel(manager: WorkflowManager, run_id: str | None) -> N
         st.divider()
         if state.phase == _ESTIMAND_PHASE:
             _render_estimand_dialogue(manager, run_id)
+        elif state.phase in _RESULTS_PHASES:
+            _render_results_dialogue(manager, run_id, run_dir)
         else:
             _render_thread(ConversationStore(run_dir).read())
             st.caption(

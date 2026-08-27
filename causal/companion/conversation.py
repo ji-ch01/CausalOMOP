@@ -45,10 +45,14 @@ ENTRY_KINDS = frozenset(
         "clarification_request",
         "fastomop_answer",
         "run_created",
-        # estimand dialogue (phase 2)
+        # estimand dialogue (phase 2a)
         "proposed_action",
         "action_taken",
         "action_dismissed",
+        # results-interpretation dialogue (phase 2b)
+        "drafted_narrative",
+        "narrative_saved",
+        "narrative_dismissed",
     }
 )
 
