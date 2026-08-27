@@ -10,6 +10,7 @@ from pathlib import Path
 
 from causal.companion.actions import ProposedAction
 from causal.companion.companion import (
+    DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
     CompanionMessage,
     CompanionTurn,
     EstimandDialogueContext,
@@ -126,6 +127,17 @@ class BuildEstimandDialoguePromptTests(unittest.TestCase):
             self.template, history=[], context=self._context(censoring_definition_approved=False)
         )
         self.assertIn("CENSOR_OK: no", no)
+
+    def test_shipped_prompt_template_has_every_placeholder(self):
+        # The default template is loaded in production; a missing placeholder
+        # would raise only at call time otherwise.
+        prompt = build_estimand_dialogue_prompt(
+            DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH, history=[], context=self._context()
+        )
+        for placeholder in _PLACEHOLDERS:
+            self.assertNotIn(placeholder, prompt)
+        for procedure in ("plug_in_standardization", "targeted_minimum_loss_based_estimation"):
+            self.assertIn(procedure, prompt)
 
 
 class ParseCompanionTurnTests(unittest.TestCase):
