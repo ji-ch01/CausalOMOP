@@ -1,21 +1,32 @@
 """Prompt-build and strict-parse for one study-companion turn.
 
-The companion is the conversational assist at the `statistical_estimand`
-gate: it reads the run's JSON artifacts, talks the reviewer through the
-missing-data / censoring / estimator choices one at a time, and can end a
-turn by proposing the `set_statistical_estimand_strategy` write as a card the
-reviewer confirms.
+Two conversational assists live here, both pure (no LLM call, no I/O beyond
+reading the prompt template) -- like `causal.agents.question_gate` and
+`causal.agents.estimation_procedure_suggestion`. The matching
+`causal.orchestrator.workflow.WorkflowManager` method owns the `llm(prompt)`
+call, gathers the artifacts, and persists the turn.
 
-Like `causal.agents.question_gate` and
-`causal.agents.estimation_procedure_suggestion`, this module is pure: no LLM
-call and no I/O beyond reading the prompt template.
-`causal.orchestrator.workflow.WorkflowManager.run_companion_turn` owns the
-`llm(prompt)` call, gathers the artifacts, and persists the turn.
+1. The **estimand dialogue** (`build_estimand_dialogue_prompt` /
+   `parse_companion_turn`, driver `run_companion_turn`): at the
+   `statistical_estimand` gate, talks the reviewer through the
+   missing-data / censoring / estimator choices one at a time, and can end a
+   turn by proposing the `set_statistical_estimand_strategy` write as a card
+   the reviewer confirms. `proposed_action` is run through
+   `causal.companion.actions.validate_proposed_action` here, so a turn that
+   reaches the caller can only ever carry an allow-listed write with in-range
+   arguments -- and the reviewer still has to click Confirm for it to happen.
 
-A companion turn never approves anything. `proposed_action` is run through
-`causal.companion.actions.validate_proposed_action` here, so a turn that
-reaches the caller can only ever carry an allow-listed write with in-range
-arguments -- and the reviewer still has to click Confirm for it to happen.
+2. The **results dialogue** (`build_results_dialogue_prompt` /
+   `parse_results_companion_turn`, driver `run_results_companion_turn`): at
+   `results_review` / `report`, talks the reviewer through interpreting the
+   already-computed estimate, and can end a turn by carrying a
+   `drafted_narrative` in exactly the `{narrative, claims}` shape the
+   one-shot `causal.agents.results_narrative` step produces. Persisting that
+   draft still runs the deterministic `causal.agents.results_faithfulness.
+   verify_narrative` and still needs the separate human
+   `review_results_narrative` approval before it can reach `causal_report.md`.
+
+Neither turn ever approves a gate or advances a phase.
 """
 
 from __future__ import annotations
@@ -26,9 +37,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from causal.agents.results_narrative import (
+    NarrativeInput,
+    NarrativeResult,
+    narrative_result_from_payload,
+)
 from causal.companion.actions import ProposedAction, validate_proposed_action
 
 DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH = Path("causal/prompts/estimand_dialogue.md")
+DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH = Path("causal/prompts/results_dialogue.md")
 
 _MESSAGE_ROLES = frozenset({"user", "assistant"})
 
@@ -170,3 +187,85 @@ def parse_companion_turn(raw: str) -> CompanionTurn:
         reply=reply.strip(),
         proposed_action=validate_proposed_action(payload.get("proposed_action")),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Results-interpretation dialogue (phase results_review / report)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ResultsCompanionTurn:
+    """The parsed result of one results-dialogue turn.
+
+    `drafted_narrative` is `None` while the reviewer is still talking through
+    the estimate; once they signal they are done the companion fills it with
+    the same `{narrative, claims}` structure the one-shot
+    `causal.agents.results_narrative` step produces, already validated by
+    `causal.agents.results_narrative.narrative_result_from_payload`. It is a
+    draft only -- persisting it runs `verify_narrative` and it still needs
+    `WorkflowManager.review_results_narrative` approval to reach the report.
+    """
+
+    reply: str
+    drafted_narrative: NarrativeResult | None
+
+
+def build_results_dialogue_prompt(
+    template_path: Path,
+    *,
+    history: Sequence[CompanionMessage],
+    narrative_input: NarrativeInput,
+) -> str:
+    """Render `causal/prompts/results_dialogue.md`.
+
+    The grounding is exactly `NarrativeInput` -- the same JSON-safe,
+    patient-level-free bundle the one-shot narrative step is fed and that
+    `verify_narrative` later checks the draft against -- serialized the same
+    way `build_narrative_prompt` serializes it, so a claim the companion
+    drafts can be verified against precisely what it was shown.
+
+    Same required-placeholder rule as `build_estimand_dialogue_prompt`: a
+    missing placeholder in the template raises rather than passing silently.
+    """
+    template = template_path.read_text(encoding="utf-8")
+    required = {
+        "{{CONVERSATION}}": _format_history(history),
+        "{{RESULTS_JSON}}": json.dumps(narrative_input.to_dict(), indent=2, sort_keys=True),
+    }
+    for placeholder, value in required.items():
+        if placeholder not in template:
+            raise ValueError(f"Results dialogue prompt is missing {placeholder}")
+        template = template.replace(placeholder, value)
+    return template
+
+
+def parse_results_companion_turn(raw: str) -> ResultsCompanionTurn:
+    """Structurally validate one results-dialogue turn.
+
+    Empty, non-JSON, non-object, or a missing/empty `reply` all raise
+    `ValueError`. `drafted_narrative` (if present and non-empty) must be a
+    `{narrative, claims}` object; it is passed through
+    `causal.agents.results_narrative.narrative_result_from_payload`, whose
+    `ValueError` propagates -- so a turn that reaches the caller with a
+    non-null `drafted_narrative` always carries a structurally valid,
+    deterministically checkable narrative.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("LLM returned an empty results-companion response")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Results-companion response must be one valid JSON object") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Results-companion response must be a JSON object")
+    reply = payload.get("reply")
+    if not isinstance(reply, str) or not reply.strip():
+        raise ValueError("Results-companion response requires a non-empty reply")
+
+    raw_draft = payload.get("drafted_narrative")
+    drafted: NarrativeResult | None = None
+    if raw_draft not in (None, {}):
+        if not isinstance(raw_draft, dict):
+            raise ValueError("drafted_narrative must be a JSON object")
+        drafted = narrative_result_from_payload(raw_draft, context="drafted_narrative")
+
+    return ResultsCompanionTurn(reply=reply.strip(), drafted_narrative=drafted)
