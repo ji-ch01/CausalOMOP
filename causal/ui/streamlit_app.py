@@ -64,11 +64,9 @@ from causal.agents.hypothesis import (
     HypothesisArtifact,
     RejectedCovariate,
 )
-from causal.agents.question_gate import DEFAULT_GATE_PROMPT_PATH, build_gate_prompt, parse_gate_response
 from causal.agents.results_narrative import normalize_narrative_artifact
-from causal.agents.user_question import LLMRawOutput, UserQuestionHypothesisService
+from causal.agents.user_question import UserQuestionHypothesisService
 from causal.config import BigQueryDatasets
-from causal.fastomop_bridge import FastOMOPError, ask_fastomop
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
 from causal.mcp_client import OMCPClient
@@ -76,6 +74,7 @@ from causal.orchestrator.state import NEXT_PHASE, PHASES, RunState
 from causal.orchestrator.workflow import WorkflowManager
 from causal.queries import COVARIATE_AGGREGATIONS_BY_DOMAIN, EXPOSURE_CONTRASTS, OUTCOME_DOMAINS
 from causal.roadmap import CENSORING_STRATEGIES, ESTIMATION_PROCEDURES, MISSING_DATA_STRATEGIES, CausalDAG
+from causal.ui.conversation import render_conversation_panel, reset_intake
 
 
 RUNS_DIR = _PROJECT_ROOT / "artifacts" / "runs"
@@ -3824,208 +3823,6 @@ def _render_estimation_report_tab(manager: WorkflowManager, state: RunState, run
         st.caption("No causal report generated yet.")
 
 
-def _render_new_question_section(manager: WorkflowManager, *, expanded: bool = False) -> None:
-    with st.expander("New causal study", icon=":material/add_circle:", expanded=expanded):
-        st.caption(
-            "Calls the configured LLM provider (and PubMed/OpenAlex unless skipped) "
-            "and may incur API costs. Can take up to a couple of minutes — longer with "
-            "more review rounds or more than one candidate DAG."
-        )
-
-        def _run_generation(
-            question: str,
-            *,
-            mode: str,
-            model_override: str,
-            skip_question_gate: bool,
-            skip_literature: bool,
-            skip_critique: bool,
-            max_critique_rounds: int,
-            tournament_size: int,
-        ) -> None:
-            status_log = st.status("Generating hypothesis draft...", expanded=True)
-
-            def _on_llm_output(output: LLMRawOutput) -> None:
-                status_log.write(f"Received `{output.stage}` from the LLM.")
-
-            try:
-                resolved_llm = build_hypothesis_llm(model=model_override.strip() or None)
-                status_log.write(f"Using provider `{resolved_llm.provider}:{resolved_llm.model}`.")
-                if not skip_question_gate:
-                    gate_result = parse_gate_response(
-                        resolved_llm.call(build_gate_prompt(DEFAULT_GATE_PROMPT_PATH, question))
-                    )
-                    if gate_result.category == "descriptive":
-                        st.session_state.pop("_pending_clarification", None)
-                        st.info(
-                            "This looks like a descriptive/retrieval question, not a causal one -- "
-                            "answering it via FastOMOP (agno_fastomop) instead of drafting a causal "
-                            f"study.\n\nReasoning: {gate_result.reasoning}"
-                        )
-                        status_log.update(label="Asking FastOMOP...", state="running")
-                        try:
-                            result = ask_fastomop(question)
-                        except (FastOMOPError, FileNotFoundError) as exc:
-                            status_log.update(label="FastOMOP query failed", state="error")
-                            st.error(str(exc))
-                            return
-                        status_log.update(label="FastOMOP answered", state="complete")
-                        if result.sql_query:
-                            st.code(result.sql_query, language="sql")
-                        st.markdown(result.answer)
-                        return
-                    if gate_result.category == "needs_clarification":
-                        status_log.update(label="Needs clarification", state="error")
-                        # Keep the question and the LLM's own follow-up alive across
-                        # the rerun so the user can answer it instead of retyping the
-                        # whole question from scratch -- previously this was a dead
-                        # end (the warning was shown and everything below discarded).
-                        st.session_state["_pending_clarification"] = {
-                            "question": question,
-                            "clarifying_question": gate_result.clarifying_question,
-                            "reasoning": gate_result.reasoning,
-                            "mode": mode,
-                            "model_override": model_override,
-                            "skip_literature": skip_literature,
-                            "skip_critique": skip_critique,
-                            "max_critique_rounds": max_critique_rounds,
-                            "tournament_size": tournament_size,
-                        }
-                        st.warning(
-                            "This question needs to be sharpened before drafting a causal study.\n\n"
-                            f"Reasoning: {gate_result.reasoning}\n\n"
-                            f"Clarifying question: {gate_result.clarifying_question}"
-                        )
-                        st.rerun()
-                        return
-                    status_log.write(f"Causal-question gate: {gate_result.category} -- {gate_result.reasoning}")
-                st.session_state.pop("_pending_clarification", None)
-                literature = (
-                    None
-                    if skip_literature
-                    else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
-                )
-                generated = UserQuestionHypothesisService().generate(
-                    question,
-                    resolved_llm.call,
-                    data_source=BigQueryDatasets.from_env().describe(),
-                    literature=literature,
-                    on_llm_output=_on_llm_output,
-                    enable_critique=not skip_critique,
-                    max_critique_rounds=int(max_critique_rounds),
-                    tournament_size=int(tournament_size),
-                )
-                state = manager.start_generated(
-                    generated, mode, f"{resolved_llm.provider}:{resolved_llm.model}"
-                )
-            except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
-                status_log.update(label="Failed", state="error")
-                st.error(str(exc))
-                return
-
-            status_log.update(label=f"Created run {state.run_id}", state="complete")
-            # The `run_selector` widget is already instantiated earlier in this same
-            # script run, so it can't be reassigned directly here (Streamlit raises
-            # StreamlitAPIException). Stash the target run id and apply it at the
-            # top of the next run, before the widget is (re-)created.
-            st.session_state["_pending_run_selection"] = state.run_id
-            st.rerun()
-
-        pending = st.session_state.get("_pending_clarification")
-        if pending:
-            st.warning(
-                "This question needs to be sharpened before drafting a causal study.\n\n"
-                f"Reasoning: {pending['reasoning']}\n\n"
-                f"Clarifying question: {pending['clarifying_question']}"
-            )
-            with st.form(key="clarification_form"):
-                answer = st.text_area("Your answer", key="clarification_answer")
-                answer_col, restart_col = st.columns(2)
-                answer_submitted = answer_col.form_submit_button(
-                    "Submit clarification", type="primary"
-                )
-                start_over = restart_col.form_submit_button("Start over with a new question")
-            if start_over:
-                st.session_state.pop("_pending_clarification", None)
-                st.rerun()
-            if answer_submitted:
-                if not answer.strip():
-                    st.error("An answer is required")
-                else:
-                    combined_question = (
-                        f"{pending['question']}\n\nClarification: {answer.strip()}"
-                    )
-                    _run_generation(
-                        combined_question,
-                        mode=pending["mode"],
-                        model_override=pending["model_override"],
-                        skip_question_gate=False,
-                        skip_literature=pending["skip_literature"],
-                        skip_critique=pending["skip_critique"],
-                        max_critique_rounds=pending["max_critique_rounds"],
-                        tournament_size=pending["tournament_size"],
-                    )
-            return
-
-        with st.form(key="new_question_form"):
-            question = st.text_area("Clinical question", key="new_question_text")
-            mode = st.selectbox("Mode", ("exploratory", "final"), key="new_question_mode")
-            model_override = st.text_input(
-                "Model override (optional)", key="new_question_model"
-            )
-            skip_question_gate = st.checkbox(
-                "Skip causal-question gate (assume the question is already causal)",
-                key="new_question_skip_gate",
-            )
-            skip_literature = st.checkbox(
-                "Skip literature grounding (PubMed/OpenAlex)", key="new_question_skip_lit"
-            )
-            skip_critique = st.checkbox(
-                "Skip automated DAG review", key="new_question_skip_critique"
-            )
-            critique_col, tournament_col = st.columns(2)
-            max_critique_rounds = critique_col.number_input(
-                "Review rounds",
-                min_value=1,
-                max_value=5,
-                value=2,
-                disabled=skip_critique,
-                key="new_question_max_critique_rounds",
-                help="How many rounds of automated review and revision the draft DAG goes through.",
-            )
-            tournament_size = tournament_col.number_input(
-                "Candidate DAGs to draft",
-                min_value=1,
-                max_value=MAX_TOURNAMENT_SIZE,
-                value=2,
-                key="new_question_tournament_size",
-                help=(
-                    "Draft this many DAGs independently, then automatically combine them into "
-                    "one. 2+ also unlocks the SHD/SID draft-agreement comparison below the DAG "
-                    "on the Study design tab; 1 skips that comparison entirely (no independent "
-                    "draft to compare against)."
-                ),
-            )
-            submitted = st.form_submit_button("Generate hypothesis draft")
-
-        if not submitted:
-            return
-        if not question.strip():
-            st.error("Clinical question is required")
-            return
-
-        _run_generation(
-            question,
-            mode=mode,
-            model_override=model_override,
-            skip_question_gate=skip_question_gate,
-            skip_literature=skip_literature,
-            skip_critique=skip_critique,
-            max_critique_rounds=int(max_critique_rounds),
-            tournament_size=int(tournament_size),
-        )
-
-
 def main() -> None:
     st.set_page_config(
         page_title="CausalOMOP",
@@ -4049,78 +3846,84 @@ def main() -> None:
             help="Pre-fills the reviewer field on every gate and covariate decision below.",
         )
         st.header("Study runs")
+        if st.button("New study", icon=":material/add:", width="stretch"):
+            # Drop any run selection so the conversation panel returns to a
+            # blank intake thread; the widget below then resolves to None.
+            reset_intake()
+            st.session_state.pop("run_selector", None)
+            st.rerun()
         run_ids = _list_runs()
         run_id = (
             st.selectbox(
                 "Open a study",
                 run_ids,
                 key="run_selector",
+                index=None,
+                placeholder="Open a study…",
                 format_func=_run_option_label,
             )
             if run_ids
             else None
         )
 
-    title_col, action_col = st.columns([4, 1], vertical_alignment="center")
-    with title_col:
-        st.title("Causal workflow review")
-        st.caption("Draft, review, and audit a causal study. Each important decision remains human-reviewed.")
-    with action_col:
-        with st.popover("New causal study", type="primary", icon=":material/add:", width="stretch"):
-            _render_new_question_section(manager, expanded=True)
+    st.title("Causal workflow review")
+    st.caption("Draft, review, and audit a causal study. Each important decision remains human-reviewed.")
 
-    if run_id is None:
-        with st.container(border=True):
-            st.subheader("Start your first causal study")
-            st.write(
-                "Create a study from a clinical question, then review the target trial, causal DAG, "
-                "and OMOP concept mappings step by step."
+    conversation_col, workspace_col = st.columns([5, 7], gap="large")
+    with conversation_col:
+        render_conversation_panel(manager, run_id)
+
+    with workspace_col:
+        if run_id is None:
+            st.info(
+                "Ask a clinical question in the conversation to start a study, or open an "
+                "existing one from the sidebar.",
+                icon=":material/arrow_back:",
             )
-            st.info("Use **New causal study** in the top-right corner to begin.", icon=":material/arrow_upward:")
-        return
+            return
 
-    state = manager.load(run_id)
-    run_dir = RUNS_DIR / run_id
+        state = manager.load(run_id)
+        run_dir = RUNS_DIR / run_id
 
-    st.caption(f"Study `{state.run_id}` · {state.mode} mode · updated {state.updated_at}")
-    source_question = _source_question(run_dir)
-    if source_question:
-        with st.container(border=True):
-            st.caption("Clinical question")
-            st.write(source_question)
-    _render_phase_tracker(state)
-    workspace = st.segmented_control(
-        "Study workspace",
-        (
-            "Study summary",
-            "Current task",
-            "Study design",
-            "Mapping & plan",
-            "Feasibility & cohort",
-            "Estimation & report",
-            "Report & audit",
-        ),
-        default="Study summary",
-        required=True,
-        key=f"workspace_{run_id}",
-        label_visibility="collapsed",
-        width="stretch",
-    )
+        st.caption(f"Study `{state.run_id}` · {state.mode} mode · updated {state.updated_at}")
+        source_question = _source_question(run_dir)
+        if source_question:
+            with st.container(border=True):
+                st.caption("Clinical question")
+                st.write(source_question)
+        _render_phase_tracker(state)
+        workspace = st.segmented_control(
+            "Study workspace",
+            (
+                "Study summary",
+                "Current task",
+                "Study design",
+                "Mapping & plan",
+                "Feasibility & cohort",
+                "Estimation & report",
+                "Report & audit",
+            ),
+            default="Study summary",
+            required=True,
+            key=f"workspace_{run_id}",
+            label_visibility="collapsed",
+            width="stretch",
+        )
 
-    if workspace == "Study summary":
-        _render_study_summary(state, run_dir)
-    elif workspace == "Current task":
-        _render_gates_tab(manager, state, run_dir)
-    elif workspace == "Study design":
-        _render_hypothesis_tab(manager, run_id, run_dir)
-    elif workspace == "Mapping & plan":
-        _render_analysis_plan_tab(manager, run_id, run_dir)
-    elif workspace == "Feasibility & cohort":
-        _render_feasibility_tab(manager, state, run_dir)
-    elif workspace == "Estimation & report":
-        _render_estimation_report_tab(manager, state, run_dir)
-    else:
-        _render_report_tab(manager, state, run_dir)
+        if workspace == "Study summary":
+            _render_study_summary(state, run_dir)
+        elif workspace == "Current task":
+            _render_gates_tab(manager, state, run_dir)
+        elif workspace == "Study design":
+            _render_hypothesis_tab(manager, run_id, run_dir)
+        elif workspace == "Mapping & plan":
+            _render_analysis_plan_tab(manager, run_id, run_dir)
+        elif workspace == "Feasibility & cohort":
+            _render_feasibility_tab(manager, state, run_dir)
+        elif workspace == "Estimation & report":
+            _render_estimation_report_tab(manager, state, run_dir)
+        else:
+            _render_report_tab(manager, state, run_dir)
 
 
 if __name__ == "__main__":

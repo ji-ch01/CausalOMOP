@@ -1,7 +1,7 @@
 """Coverage for `causal.ui.streamlit_app`'s pure helper functions.
 
 The module is a Streamlit script (`st.*` calls throughout its `_render_*`
-functions), so most of it needs a real app run to exercise. This file only
+functions), so most of it needs a real app run to exercise. This file mostly
 targets the helpers that don't touch `st.*` -- JSON/CSV parsing, dataclass
 construction from a dict, DOT generation, sorting/labeling -- which is where
 plain data bugs (a missing `.get()` default, a wrong sort key) would actually
@@ -9,6 +9,10 @@ show up. Importing the module itself is also useful signal: it fails fast if
 a rename in `causal.agents.hypothesis`/`causal.roadmap`/etc. breaks the app's
 imports, something `python -c "import ..."` isn't otherwise checked for by
 this test suite.
+
+`MainLayoutSmokeTests` is the one exception -- it drives `main()` through
+`streamlit.testing.v1.AppTest` to guard the two-column conversation/workspace
+layout against a load-time crash.
 """
 
 import inspect
@@ -20,9 +24,12 @@ from pathlib import Path
 from unittest import mock
 
 import streamlit as st
+from streamlit.testing.v1 import AppTest
 
 from causal.roadmap import CausalDAG, CausalEdge, CausalNode
 from causal.ui import streamlit_app as app
+
+_APP_PATH = Path(app.__file__)
 
 
 class ReadJsonTests(unittest.TestCase):
@@ -450,6 +457,41 @@ class ReviewerFieldSyncTests(unittest.TestCase):
         finally:
             for key in ("reviewer_name", "some_other_widget"):
                 st.session_state.pop(key, None)
+
+
+class MainLayoutSmokeTests(unittest.TestCase):
+    """Drives `main()` end to end via AppTest. Scoped to an empty runs dir so
+    it exercises the "no run selected" branch -- the new code path (two-column
+    split, conversation panel, sidebar "New study" button) -- without needing
+    a materialized run on disk."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self._patch = mock.patch.object(app, "RUNS_DIR", Path(self._temp.name))
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _run(self) -> AppTest:
+        harness = AppTest.from_file(str(_APP_PATH), default_timeout=30)
+        harness.run()
+        return harness
+
+    def test_main_renders_without_exception_when_no_run_is_selected(self):
+        harness = self._run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertIn("Conversation", [block.value for block in harness.subheader])
+        self.assertEqual(len(harness.chat_input), 1)
+
+    def test_sidebar_exposes_a_new_study_button(self):
+        harness = self._run()
+        self.assertIn("New study", [button.label for button in harness.button])
+
+    def test_new_study_button_click_reruns_cleanly(self):
+        harness = self._run()
+        new_study = next(button for button in harness.button if button.label == "New study")
+        new_study.click().run()
+        self.assertEqual(list(harness.exception), [])
 
 
 if __name__ == "__main__":
