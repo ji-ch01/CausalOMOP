@@ -9,7 +9,7 @@ data.
 | Path | Owner and purpose | Git policy |
 |---|---|---|
 | `README.md`, `docs/` | CausalOMOP documentation | tracked |
-| `causal/` | CausalOMOP workflow, agents, contracts, mapping, queries, and UI | tracked |
+| `causal/` | CausalOMOP workflow, agents, contracts, mapping, queries, the conversation layer (`causal/companion/`), and UI | tracked |
 | `studies/` | versioned study specifications and reference audits | tracked, no patient data |
 | `scripts/bigquery_etl/` | project-owned BigQuery-to-DuckDB exporter | tracked |
 | `scripts/snuh_etl/` | project-owned SYN-SNUH ETL and validation | tracked |

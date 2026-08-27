@@ -32,7 +32,7 @@ are:
 
 | Area | Current status |
 |---|---|
-| Natural-language question intake | LLM-based causal/descriptive/clarification gate in the CLI and Streamlit UI; descriptive questions are routed to FastOMOP automatically (`causal.fastomop_bridge`) and answered inline |
+| Natural-language question intake | LLM-based causal/descriptive/clarification gate in the CLI and in the Streamlit UI's conversation panel (multi-round clarification, persisted per run as `conversation.jsonl`); descriptive questions are routed to FastOMOP automatically (`causal.fastomop_bridge`) and answered inline |
 | Target-trial draft | Strictly parsed LLM or manually supplied protocol; human approval remains mandatory |
 | Evidence grounding | PubMed and OpenAlex retrieval, optional OptimusKG relations, deterministic citation allow-list |
 | DAG review | Role/timing validation, cycle checks, bounded critique/revision, optional multi-candidate tournament, backdoor identification, minimum adjustment sets, SHD/SID audit metrics |

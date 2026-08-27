@@ -25,6 +25,13 @@ The initial question gate is itself LLM-based. It classifies a question as
 before drafting for the latter two categories. `--skip-question-gate` exists
 for controlled tests and already-reviewed inputs.
 
+The Streamlit UI runs this intake as a conversation panel
+(`causal.ui.conversation` over `causal.companion.intake`): a
+`needs_clarification` verdict is answerable in-thread over multiple rounds
+(each round re-runs the gate on the accumulated question, capped at
+`MAX_CLARIFICATION_ROUNDS`), and the whole exchange is persisted to the run's
+`conversation.jsonl` -- a record, not an approval path.
+
 ## Evidence retrieval and citation checks
 
 The first draft supplies short clinical search terms. Deterministic code builds

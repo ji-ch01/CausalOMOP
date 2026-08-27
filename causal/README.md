@@ -191,7 +191,10 @@ The natural-language entry point includes a causal-question classifier before
 target-trial drafting. It refuses descriptive questions with a FastOMOP
 redirect and requests clarification when the intervention or outcome is too
 ambiguous. The gate is LLM-based and may be skipped explicitly for controlled
-testing; it is not a replacement for human protocol review.
+testing; it is not a replacement for human protocol review. In the Streamlit
+UI this intake is a conversation panel (`causal/companion/`): clarification
+is answerable over multiple rounds and the exchange is persisted per run as
+`conversation.jsonl`, an advisory record with no gate authority.
 
 ## Important implementation boundary
 

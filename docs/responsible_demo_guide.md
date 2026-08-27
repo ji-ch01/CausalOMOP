@@ -62,6 +62,14 @@ are redirected to FastOMOP; ambiguous requests return a clarification question.
 The causal path can retrieve PubMed/OpenAlex evidence, use OptimusKG when
 available, and run a bounded DAG critique/revision loop.
 
+In the Streamlit UI the same intake runs as a conversation panel: the
+clinical question, the gate verdict, any clarification rounds, the FastOMOP
+answer for a descriptive question, and the "study created" event are shown
+as a thread and written to `artifacts/runs/<run_id>/conversation.jsonl` once
+the run exists. That transcript is an advisory record only -- it carries no
+decision authority and never reaches a gate; every approval still goes
+through `WorkflowManager` explicitly.
+
 ## Show the audit trail
 
 Under `artifacts/runs/<run_id>/`, show:
