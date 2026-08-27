@@ -106,6 +106,36 @@ Useful controls:
 - `--max-critique-rounds` to bound critique rounds;
 - `--tournament-size` to draft multiple candidates.
 
+## Estimand dialogue (statistical_estimand gate)
+
+While a run is in the `estimand_review` phase, the Streamlit left panel runs
+the study companion (`causal.companion.companion` via
+`WorkflowManager.run_companion_turn`). It is the same advisory-LLM posture as
+the question gate and the results narrative:
+
+```text
+conversation so far + JSON-safe run artifacts (study_specification.json,
+  cohort_manifest.json adjustment set, feasibility / follow-up / positivity /
+  covariate-missingness counts, whether the per-row censored column is
+  approved) -- never analytic_dataset.parquet
+  -> estimand_dialogue prompt
+  -> strict-JSON response: { reply, proposed_action | null }
+  -> causal.companion.actions.validate_proposed_action
+     (allow-list: set_statistical_estimand_strategy only; every arg checked
+      against MISSING_DATA_STRATEGIES / CENSORING_STRATEGIES /
+      ESTIMATION_PROCEDURES; reviewer / run_id can never appear)
+  -> the reviewer clicks Confirm on the card
+     -> WorkflowManager.set_statistical_estimand_strategy(reviewer=<sidebar>)
+```
+
+`run_companion_turn` is read-only with respect to run state: it takes no
+lock, records nothing, writes no file. The one write the dialogue can lead
+to is the explicitly confirmed `set_statistical_estimand_strategy`;
+approving the `statistical_estimand` gate itself is a separate manual
+action. The transcript (`conversation.jsonl`) records every turn, including
+which card was confirmed or dismissed. If the companion LLM is unavailable
+the panel degrades to a warning and the "Fill the form directly" fallback.
+
 ## Results narrative (post-estimation interpretation)
 
 After `causal.agents.estimation`/`causal.agents.diagnostics` compute the

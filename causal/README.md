@@ -57,7 +57,12 @@ call it.
   `statistical_estimand` review before any patient-level row is
   materialized -- the analytic cohort's per-row `censored` column, unused by
   anything before this gate existed, is now excluded from the estimation
-  sample when the reviewed strategy says so;
+  sample when the reviewed strategy says so. In the Streamlit UI those three
+  choices are settled through the estimand-dialogue companion
+  (`causal/companion/companion.py`), which proposes
+  `set_statistical_estimand_strategy` as a human-confirmed card behind a
+  code-level allow-list (`causal/companion/actions.py`); approving the gate
+  itself stays manual;
 - aggregate-only feasibility counts, mapping-audit diagnostics, univariate
   positivity screening, and per-covariate missingness audits;
 - person-level analytic cohort SQL generation (`A`, `Y`, `index_datetime`,

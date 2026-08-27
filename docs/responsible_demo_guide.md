@@ -156,6 +156,20 @@ Choosing `exclude_censored_before_analysis` instead requires the per-row
 `censored` column to already be approved
 (`WorkflowManager.approve_censoring_definition`) -- the gate blocks otherwise.
 
+In the Streamlit UI this is a conversation: while the run is in
+`estimand_review` the left panel becomes the estimand dialogue
+(`causal.companion.companion` via `WorkflowManager.run_companion_turn`). The
+study companion walks the reviewer through the three choices one at a time,
+grounded in the same pre-gate diagnostic artifacts, and can end a turn by
+proposing `set_statistical_estimand_strategy` as a card. The card shows an
+editable rationale and applies nothing until the reviewer clicks Confirm; a
+strict allow-list (`causal.companion.actions`) means the companion can only
+ever propose that one write, with arguments in range, and never the reviewer
+identity. Approving the `statistical_estimand` gate itself stays a separate
+manual action, and the "Fill the form directly" expander is the same call
+without the dialogue. The companion is fed only JSON artifacts, never
+`analytic_dataset.parquet`.
+
 ## Estimation and the causal report
 
 Only once `clinical_mapping`, `analysis_plan`, and `statistical_estimand` are
