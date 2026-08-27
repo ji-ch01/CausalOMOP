@@ -53,6 +53,9 @@ from causal.orchestrator.workflow import WorkflowManager
 _INTAKE_THREAD_KEY = "_intake_thread"
 _CLARIFICATION_KEY = "_clarification"
 _THREAD_HEIGHT = 460
+# Below this many turns the thread renders inline; a fixed-height scroll
+# container for one or two messages just leaves a large empty box.
+_THREAD_SCROLL_AFTER = 5
 _ESTIMAND_PHASE = "estimand_review"
 
 _CATEGORY_LABELS = {
@@ -192,10 +195,14 @@ _INTAKE_EMPTY_MESSAGE = (
 
 
 def _render_thread(entries: Sequence[ConversationEntry], *, empty_message: str = _INTAKE_EMPTY_MESSAGE) -> None:
+    if not entries:
+        st.chat_message("assistant", avatar=_ROLE_AVATARS["assistant"]).markdown(empty_message)
+        return
+    if len(entries) <= _THREAD_SCROLL_AFTER:
+        for entry in entries:
+            _render_entry(entry)
+        return
     with st.container(height=_THREAD_HEIGHT, border=False):
-        if not entries:
-            st.chat_message("assistant", avatar=_ROLE_AVATARS["assistant"]).markdown(empty_message)
-            return
         for entry in entries:
             _render_entry(entry)
 
