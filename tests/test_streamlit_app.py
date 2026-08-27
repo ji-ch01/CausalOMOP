@@ -494,5 +494,45 @@ class MainLayoutSmokeTests(unittest.TestCase):
         self.assertEqual(list(harness.exception), [])
 
 
+def _estimand_review_form_script(run_dir: str) -> None:
+    """AppTest script: render `_render_statistical_estimand_review` for a
+    minimal seeded run so the flattened layout + the nested "Fill the form
+    directly" expander are exercised for a nesting error."""
+    import json
+    from pathlib import Path
+
+    from causal.orchestrator.state import RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_statistical_estimand_review
+
+    path = Path(run_dir)
+    (path / "protocol.json").write_text(json.dumps({"study_id": "s", "query_settings": {}}), encoding="utf-8")
+    (path / "study_specification.json").write_text(
+        json.dumps({"estimand": {"population_summary": "ATE", "effect_measure": "risk_difference"}}),
+        encoding="utf-8",
+    )
+    (path / "cohort_manifest.json").write_text(
+        json.dumps({"columns": [{"name": "age", "role": "baseline_covariate"}]}), encoding="utf-8"
+    )
+    state = RunState(
+        run_id="run1", study_id="s", protocol_path=str(path / "protocol.json"), phase="estimand_review"
+    )
+    _render_statistical_estimand_review(WorkflowManager(path.parent), state, path)
+
+
+class EstimandReviewFormSmokeTests(unittest.TestCase):
+    def test_render_has_the_dialogue_pointer_and_a_non_nested_form_expander(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run1"
+            run_dir.mkdir()
+            harness = AppTest.from_function(
+                _estimand_review_form_script, kwargs={"run_dir": str(run_dir)}, default_timeout=30
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Fill the form directly" in block.label for block in harness.expander))
+        self.assertTrue(any("conversation on the left" in block.value for block in harness.info))
+
+
 if __name__ == "__main__":
     unittest.main()

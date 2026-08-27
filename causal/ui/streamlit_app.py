@@ -692,12 +692,15 @@ _CENSORING_STRATEGY_LABELS = {
 
 
 def _render_statistical_estimand_review(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
-    """Lets a reviewer record the missing-data/censoring strategy
-    (`WorkflowManager.set_statistical_estimand_strategy`) that
-    `_write_statistical_estimand` needs before the `statistical_estimand`
-    gate can be approved. Unlike `target_trial`'s read-only summary, this
-    gate's content has no other tab that already owns setting it, so the
-    form to actually choose it lives here.
+    """Read-only summary of what the `statistical_estimand` gate approves,
+    plus a fallback form for recording the missing-data/censoring/estimator
+    strategy (`WorkflowManager.set_statistical_estimand_strategy`).
+
+    The primary way to settle those choices is the estimand dialogue in the
+    left conversation panel (`causal.ui.conversation`), active while the run
+    is in the `estimand_review` phase; the "Fill the form directly" expander
+    here is the same `set_statistical_estimand_strategy` call for when the
+    companion is unavailable or the reviewer prefers it.
     """
     run_id = state.run_id
     protocol = _read_json(run_dir / "protocol.json") or {}
@@ -709,51 +712,60 @@ def _render_statistical_estimand_review(manager: WorkflowManager, state: RunStat
     saved = protocol.get("statistical_estimand_settings")
     saved = saved if isinstance(saved, dict) else {}
 
-    with st.expander("Statistical estimand (statistical_estimand gate content)", expanded=True):
-        if cohort_manifest is None:
-            st.warning(
-                "No cohort_manifest.json yet -- build the cohort plan first (Feasibility & cohort "
-                "tab) so the adjustment set actually built into cohort.sql is known."
-            )
-        else:
-            adjustment_set = [
-                column["name"] for column in cohort_manifest["columns"]
-                if column["role"] == "baseline_covariate"
-            ]
-            st.markdown(
-                f"**Adjustment set (from cohort_manifest.json)**  \n{', '.join(adjustment_set) or '—'}"
-            )
-        st.markdown(
-            "**Per-row `censored` column approved?**  \n"
-            + ("Yes" if censoring_definition_approved else "No")
+    st.markdown("**Statistical estimand** (statistical_estimand gate content)")
+    if cohort_manifest is None:
+        st.warning(
+            "No cohort_manifest.json yet -- build the cohort plan first (Feasibility & cohort "
+            "tab) so the adjustment set actually built into cohort.sql is known."
         )
-        if not censoring_definition_approved:
-            st.caption(
-                "Choosing 'Exclude censored rows' or 'IPCW' below requires approving the per-row "
-                "censoring definition first (Feasibility & cohort tab)."
-            )
-        if saved:
-            st.caption(
-                f"Currently saved: missing_data_strategy={saved.get('missing_data_strategy')}, "
-                f"censoring_strategy={saved.get('censoring_strategy')}, "
-                f"estimation_procedure={saved.get('estimation_procedure', 'plug_in_standardization')}, "
-                f"rationale=\"{saved.get('censoring_rationale')}\""
-            )
-        if population_summary:
-            st.markdown(f"**Primary estimand (from study_specification.json)**  \n{population_summary}")
-        if population_summary == "CATE":
-            st.caption(
-                "This study's primary estimand is CATE, which only `causal_forest_dml` computes -- "
-                "`plug_in_standardization`/`targeted_minimum_loss_based_estimation` report the ATE "
-                "and will be rejected below."
-            )
+    else:
+        adjustment_set = [
+            column["name"] for column in cohort_manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        ]
+        st.markdown(
+            f"**Adjustment set (from cohort_manifest.json)**  \n{', '.join(adjustment_set) or '—'}"
+        )
+    st.markdown(
+        "**Per-row `censored` column approved?**  \n"
+        + ("Yes" if censoring_definition_approved else "No")
+    )
+    if not censoring_definition_approved:
+        st.caption(
+            "Choosing 'Exclude censored rows' or 'IPCW' requires approving the per-row "
+            "censoring definition first (Feasibility & cohort tab)."
+        )
+    if saved:
+        st.caption(
+            f"Currently saved: missing_data_strategy={saved.get('missing_data_strategy')}, "
+            f"censoring_strategy={saved.get('censoring_strategy')}, "
+            f"estimation_procedure={saved.get('estimation_procedure', 'plug_in_standardization')}, "
+            f"rationale=\"{saved.get('censoring_rationale')}\""
+        )
+    if population_summary:
+        st.markdown(f"**Primary estimand (from study_specification.json)**  \n{population_summary}")
+    if population_summary == "CATE":
+        st.caption(
+            "This study's primary estimand is CATE, which only `causal_forest_dml` computes -- "
+            "`plug_in_standardization`/`targeted_minimum_loss_based_estimation` report the ATE "
+            "and will be rejected."
+        )
 
-        _render_estimation_procedure_diagnostics(run_dir)
+    _render_estimation_procedure_diagnostics(run_dir)
 
-        missing_data_options = sorted(MISSING_DATA_STRATEGIES)
-        censoring_options = sorted(CENSORING_STRATEGIES)
-        estimation_procedure_options = sorted(ESTIMATION_PROCEDURES)
+    st.info(
+        "Work through these three choices in the conversation on the left — it walks "
+        "you through them one at a time, grounded in the diagnostics above, and proposes "
+        "the strategy as a card you confirm. The form below sets them directly if you "
+        "prefer, or if the companion is unavailable.",
+        icon=":material/forum:",
+    )
 
+    missing_data_options = sorted(MISSING_DATA_STRATEGIES)
+    censoring_options = sorted(CENSORING_STRATEGIES)
+    estimation_procedure_options = sorted(ESTIMATION_PROCEDURES)
+
+    with st.expander("Fill the form directly", expanded=False):
         if st.button(
             "Suggest estimation procedure (LLM)",
             icon=":material/auto_awesome:",
