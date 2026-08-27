@@ -1,15 +1,35 @@
-"""Coverage for the pure helpers in `causal.ui.conversation`.
+"""Coverage for `causal.ui.conversation`.
 
-Same scope rule as `tests/test_streamlit_app.py`: only the functions that
-don't touch `st.*` (entry -> chat shape, form values -> DraftOptions,
-clarification bookkeeping). Importing the module is itself signal -- it
-fails fast if a rename in `causal.companion` breaks the panel's imports."""
+Mostly the pure helpers (entry -> chat shape, form values -> DraftOptions,
+clarification bookkeeping, dialogue history, pending-card lookup). The
+`EstimandDialogueRenderTests` class is the exception -- it drives the panel's
+Streamlit code through `AppTest` to guard the render path against a crash."""
 
+import tempfile
 import unittest
+from pathlib import Path
 
-from causal.companion.conversation import ConversationEntry
+from streamlit.testing.v1 import AppTest
+
+from causal.companion.companion import CompanionMessage
+from causal.companion.conversation import ConversationEntry, ConversationStore
 from causal.companion.intake import MAX_CLARIFICATION_ROUNDS, DraftOptions
 from causal.ui import conversation as panel
+
+
+def _entry(kind: str, *, role: str = "assistant", phase: str = "estimand_review", text: str = "x", **data):
+    return ConversationEntry(role=role, kind=kind, phase=phase, text=text, data=data)
+
+
+def _estimand_dialogue_script(runs_dir: str, run_id: str) -> None:
+    """Run as an AppTest script: render the estimand dialogue for one run."""
+    import streamlit as st
+
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.conversation import _render_estimand_dialogue
+
+    st.session_state["reviewer_name"] = "Dr. Test"
+    _render_estimand_dialogue(WorkflowManager(runs_dir), run_id)
 
 
 class EntryChatShapeTests(unittest.TestCase):
@@ -88,6 +108,110 @@ class ClarificationBookkeepingTests(unittest.TestCase):
         at_cap = [("q", "a")] * MAX_CLARIFICATION_ROUNDS
         self.assertFalse(panel.clarification_exhausted(at_cap))
         self.assertTrue(panel.clarification_exhausted([*at_cap, ("q", "a")]))
+
+
+class EstimandDialogueHistoryTests(unittest.TestCase):
+    def test_keeps_only_estimand_phase_user_and_assistant_turns(self):
+        entries = [
+            _entry("message", role="user", phase="target_trial_review", text="the original question"),
+            _entry("message", role="user", text="what does IPCW do?"),
+            _entry("message", role="assistant", text="IPCW reweights rather than drops."),
+            _entry("action_taken", role="event", text="strategy saved"),
+            _entry("proposed_action", role="assistant", text="here is what I'd record"),
+        ]
+        history = panel.estimand_dialogue_history(entries)
+        self.assertEqual(
+            [(m.role, m.text) for m in history],
+            [
+                ("user", "what does IPCW do?"),
+                ("assistant", "IPCW reweights rather than drops."),
+                ("assistant", "here is what I'd record"),
+            ],
+        )
+        self.assertTrue(all(isinstance(m, CompanionMessage) for m in history))
+
+    def test_blank_turns_are_dropped(self):
+        entries = [_entry("message", role="user", text="   ")]
+        self.assertEqual(panel.estimand_dialogue_history(entries), [])
+
+
+class LatestPendingActionTests(unittest.TestCase):
+    def test_none_when_no_proposal(self):
+        self.assertIsNone(panel.latest_pending_action([_entry("message", role="user", text="hi")]))
+
+    def test_returns_the_unresolved_proposal(self):
+        proposal = _entry("proposed_action", text="proposal A")
+        self.assertIs(panel.latest_pending_action([proposal]), proposal)
+
+    def test_confirmed_or_dismissed_clears_it(self):
+        proposal = _entry("proposed_action", text="proposal A")
+        for resolver in ("action_taken", "action_dismissed"):
+            self.assertIsNone(
+                panel.latest_pending_action([proposal, _entry(resolver, role="event", text="done")])
+            )
+
+    def test_a_newer_proposal_supersedes_an_older_one(self):
+        first = _entry("proposed_action", text="proposal A")
+        second = _entry("proposed_action", text="proposal B")
+        self.assertIs(panel.latest_pending_action([first, second]), second)
+
+    def test_ignores_proposals_from_other_phases(self):
+        self.assertIsNone(
+            panel.latest_pending_action(
+                [_entry("proposed_action", phase="results_review", text="not this one")]
+            )
+        )
+
+
+class EstimandDialogueRenderTests(unittest.TestCase):
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.runs_dir = Path(self._temp.name)
+
+    def _app(self, run_id: str) -> AppTest:
+        harness = AppTest.from_function(
+            _estimand_dialogue_script,
+            kwargs={"runs_dir": str(self.runs_dir), "run_id": run_id},
+            default_timeout=30,
+        )
+        harness.run()
+        return harness
+
+    def test_renders_the_thread_and_a_pending_action_card(self):
+        run_dir = self.runs_dir / "run1"
+        run_dir.mkdir(parents=True)
+        ConversationStore(run_dir).extend(
+            [
+                _entry("message", role="assistant", text="Let's start with the censoring strategy."),
+                _entry("message", role="user", text="use IPCW"),
+                _entry(
+                    "proposed_action",
+                    role="assistant",
+                    text="Recording IPCW plus TMLE.",
+                    action="set_statistical_estimand_strategy",
+                    args={
+                        "missing_data_strategy": "complete_case_analysis",
+                        "censoring_strategy": "ipcw_administrative_censoring",
+                        "estimation_procedure": "targeted_minimum_loss_based_estimation",
+                        "censoring_rationale": "Reweight rather than drop.",
+                    },
+                    summary="Save statistical-estimand strategy",
+                ),
+            ]
+        )
+        harness = self._app("run1")
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Confirm" in button.label for button in harness.button))
+        self.assertEqual(len(harness.chat_input), 1)
+
+    def test_degrades_without_a_crash_when_the_companion_cannot_run(self):
+        # An empty run dir: run_companion_turn's own load() raises, the panel
+        # catches it and shows the fallback rather than blowing up.
+        (self.runs_dir / "run2").mkdir(parents=True)
+        harness = self._app("run2")
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("unavailable" in warning.value.lower() for warning in harness.warning))
 
 
 if __name__ == "__main__":
