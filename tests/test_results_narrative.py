@@ -10,6 +10,7 @@ from causal.agents.results_narrative import (
     Claim,
     NarrativeInput,
     build_narrative_prompt,
+    narrative_result_from_payload,
     normalize_narrative_artifact,
     parse_narrative_response,
 )
@@ -161,6 +162,40 @@ class ParseNarrativeResponseTests(unittest.TestCase):
         )
         result = parse_narrative_response(_response(claims=claims))
         self.assertEqual([c.claim_type for c in result.claims], ["effect_direction", "uncertainty"])
+
+
+class NarrativeResultFromPayloadTests(unittest.TestCase):
+    """`narrative_result_from_payload` is the shared validator behind both
+    `parse_narrative_response` and the results-dialogue's drafted narrative
+    (`causal.companion.companion.parse_results_companion_turn`)."""
+
+    def test_validates_an_already_parsed_object(self):
+        result = narrative_result_from_payload({"narrative": "A summary.", "claims": [_VALID_CLAIM]})
+        self.assertEqual(result.narrative_text, "A summary.")
+        self.assertEqual(result.claims[0].claim_type, "effect_direction")
+
+    def test_missing_narrative_raises_with_the_given_context(self):
+        with self.assertRaisesRegex(ValueError, "drafted_narrative"):
+            narrative_result_from_payload({"claims": [_VALID_CLAIM]}, context="drafted_narrative")
+
+    def test_bad_claim_type_raises_with_the_given_context(self):
+        bad_claim = dict(_VALID_CLAIM, claim_type="clinical_recommendation")
+        with self.assertRaisesRegex(ValueError, "drafted_narrative"):
+            narrative_result_from_payload(
+                {"narrative": "text", "claims": [bad_claim]}, context="drafted_narrative"
+            )
+
+    def test_empty_claims_list_raises(self):
+        with self.assertRaises(ValueError):
+            narrative_result_from_payload({"narrative": "text", "claims": []})
+
+    def test_round_trips_a_serialized_claim(self):
+        payload = {
+            "narrative": "text",
+            "claims": [Claim("t", "sample_size", ("estimation.estimand.n_total",)).to_dict()],
+        }
+        result = narrative_result_from_payload(payload)
+        self.assertEqual(result.claims[0].source_fields, ("estimation.estimand.n_total",))
 
 
 class NormalizeNarrativeArtifactTests(unittest.TestCase):

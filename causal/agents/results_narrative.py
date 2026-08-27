@@ -142,31 +142,56 @@ def parse_narrative_response(raw: str) -> NarrativeResult:
         raise ValueError("Results-narrative response must be one valid JSON object") from exc
     if not isinstance(payload, dict):
         raise ValueError("Results-narrative response must be a JSON object")
+    return narrative_result_from_payload(payload)
+
+
+def narrative_result_from_payload(
+    payload: dict[str, Any], *, context: str = "Results-narrative response"
+) -> NarrativeResult:
+    """Validate an already-parsed `{narrative, claims}` object into a
+    `NarrativeResult`.
+
+    Shared by `parse_narrative_response` (the one-shot results-narrative
+    step, which owns the JSON decode) and `causal.companion.companion.
+    parse_results_companion_turn` (the drafted narrative a results-dialogue
+    turn can carry as a nested field). `context` is only used to make the
+    `ValueError` messages point at the right caller.
+
+    Requires a non-empty free-text `narrative` and a non-empty `claims`
+    array -- each claim needs `text`, a `claim_type` from `CLAIM_TYPES`, and
+    a non-empty `source_fields` list of non-empty strings -- so a narrative
+    that `causal.agents.results_faithfulness` could not deterministically
+    fact-check is rejected here rather than silently accepted.
+    """
     narrative = payload.get("narrative")
     if not isinstance(narrative, str) or not narrative.strip():
-        raise ValueError("Results-narrative response must include a non-empty 'narrative' field")
+        raise ValueError(f"{context} must include a non-empty 'narrative' field")
 
     raw_claims = payload.get("claims")
     if not isinstance(raw_claims, list) or not raw_claims:
-        raise ValueError("Results-narrative response must include a non-empty 'claims' list")
+        raise ValueError(f"{context} must include a non-empty 'claims' list")
 
     claims: list[Claim] = []
     for index, item in enumerate(raw_claims):
         if not isinstance(item, dict):
-            raise ValueError(f"claims[{index}] must be a JSON object")
+            raise ValueError(f"{context}: claims[{index}] must be a JSON object")
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
-            raise ValueError(f"claims[{index}] must include a non-empty 'text' field")
+            raise ValueError(f"{context}: claims[{index}] must include a non-empty 'text' field")
         claim_type = item.get("claim_type")
         if claim_type not in CLAIM_TYPES:
-            raise ValueError(f"claims[{index}].claim_type must be one of {CLAIM_TYPES}, got {claim_type!r}")
+            raise ValueError(
+                f"{context}: claims[{index}].claim_type must be one of {CLAIM_TYPES}, got {claim_type!r}"
+            )
         source_fields = item.get("source_fields")
         if (
             not isinstance(source_fields, list)
             or not source_fields
             or not all(isinstance(field, str) and field.strip() for field in source_fields)
         ):
-            raise ValueError(f"claims[{index}].source_fields must be a non-empty list of non-empty strings")
+            raise ValueError(
+                f"{context}: claims[{index}].source_fields must be a non-empty list of non-empty strings"
+            )
         claims.append(Claim(text=text.strip(), claim_type=claim_type, source_fields=tuple(source_fields)))
 
     return NarrativeResult(narrative_text=narrative.strip(), claims=tuple(claims))
