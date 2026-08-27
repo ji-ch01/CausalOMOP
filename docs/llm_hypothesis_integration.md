@@ -155,6 +155,37 @@ estimation.json + diagnostics.json
      review_status == "approved" and verification has no `failed` check
 ```
 
+### Results dialogue (drafting the narrative conversationally)
+
+While a run is in `results_review` / `report` the Streamlit left panel runs
+the results-interpretation dialogue -- the results-review counterpart of the
+estimand dialogue, `causal.companion.companion.build_results_dialogue_prompt`
+/ `parse_results_companion_turn` via `WorkflowManager.
+run_results_companion_turn`. The companion walks the reviewer through the
+direction, magnitude, uncertainty, diagnostics, robustness, and limitations
+one topic at a time, then ends a turn with a `drafted_narrative` in exactly
+the `{ narrative, claims[] }` shape above:
+
+```text
+conversation so far + the same NarrativeInput the one-shot step is fed
+  -> results_dialogue prompt (JSON-safe artifacts only)
+  -> strict-JSON response: { reply, drafted_narrative | null }
+     (drafted_narrative validated by
+      causal.agents.results_narrative.narrative_result_from_payload)
+  -> the reviewer clicks "Save for review" on the card
+     -> WorkflowManager.save_results_narrative_draft
+        -> verify_narrative + results_narrative.json (source="dialogue",
+           review_status="pending")
+  -> WorkflowManager.review_results_narrative (unchanged human approve/exclude)
+```
+
+`run_results_companion_turn` is read-only with respect to run state (no
+lock, no history entry, no file write), matching `run_companion_turn`. The
+one-step `run_results_narrative` path stays as the no-conversation fallback;
+both write the identical artifact and both go through the same faithfulness
+verification and human approval. The `source` field on
+`results_narrative.json` records which path produced it.
+
 Every claim in `claims` is typed (`effect_direction`, `effect_magnitude`,
 `uncertainty`, `sample_size`, `diagnostic_warning`,
 `assumption_or_limitation`) and cites the dotted JSON path(s) it is based

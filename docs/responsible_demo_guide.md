@@ -196,6 +196,21 @@ directory and is never sent to an LLM. `narrative <run_id>` is optional and
 calls the configured LLM provider to interpret the already-computed estimate
 only; skipping it never blocks `causal-report`.
 
+In the Streamlit UI this interpretation is a conversation too: while the run
+is in `results_review` / `report` the left panel becomes the
+results-interpretation dialogue (`causal.companion.companion` via
+`WorkflowManager.run_results_companion_turn`). The companion talks the
+reviewer through direction, magnitude, uncertainty, diagnostics, robustness,
+and limitations one topic at a time -- grounded in the same JSON-safe
+`NarrativeInput` the one-shot step uses, never `analytic_dataset.parquet` --
+then ends a turn with a drafted `{ narrative, claims[] }`. "Save for review"
+(`save_results_narrative_draft`) runs the same deterministic
+`verify_narrative` and writes `results_narrative.json`; the reviewer still
+approves or excludes it under **Estimation & report**
+(`review_results_narrative`), and only an approved, clean narrative reaches
+`causal_report.md`. The "Draft in one step" button is the same outcome
+without the conversation.
+
 ## Safe claims
 
 - The system creates versioned, reviewable protocol and DAG drafts.

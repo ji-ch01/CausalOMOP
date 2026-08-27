@@ -91,13 +91,19 @@ reviewable graphs.
 
 ## Evidence and LLM boundary
 
-- The question gate, the drafting agents, and the estimand-dialogue
-  companion (`causal.companion.companion`, at the `statistical_estimand`
-  gate) are advisory LLM steps. They cannot approve a protocol, a DAG, an
-  OMOP mapping, a statistical estimand, or execution. The companion's one
-  possible write, `set_statistical_estimand_strategy`, is an explicitly
-  human-confirmed card gated by a code-level allow-list
-  (`causal.companion.actions`); approving the gate itself stays manual.
+- The question gate, the drafting agents, the estimand-dialogue companion
+  (`causal.companion.companion`, at the `statistical_estimand` gate), and the
+  results-interpretation dialogue companion (same module, at
+  `results_review` / `report`) are advisory LLM steps. They cannot approve a
+  protocol, a DAG, an OMOP mapping, a statistical estimand, execution, or the
+  `results` gate. The estimand companion's one possible write,
+  `set_statistical_estimand_strategy`, is an explicitly human-confirmed card
+  gated by a code-level allow-list (`causal.companion.actions`); approving
+  the gate itself stays manual. The results companion's only outcome is a
+  drafted narrative the reviewer explicitly saves
+  (`save_results_narrative_draft`), which then goes through the same
+  deterministic `verify_narrative` and the same human
+  `review_results_narrative` approval as a one-shot narrative.
 - PubMed and OpenAlex provide literature records; OptimusKG is an optional
   relation source. Retrieved identifiers form a deterministic allow-list for
   citations emitted by the model.
@@ -125,7 +131,12 @@ reviewable graphs.
   otherwise influence. `causal_report.md` includes the narrative's text
   only once it is `approved` with a clean verification -- an unrequested,
   still-`pending`, or `excluded` narrative renders as a plain status line
-  instead.
+  instead. In the Streamlit UI this narrative is normally drafted through
+  the results-interpretation dialogue (the companion walks the reviewer
+  through the estimate one topic at a time, then drafts the
+  `{ narrative, claims }`); the one-shot `run_results_narrative` remains the
+  no-conversation fallback and `results_narrative.json` records which path
+  produced it (`source`).
 
 See [llm_hypothesis_integration.md](llm_hypothesis_integration.md) and the
 [DAG generation reference](dag_generation_audit.md).

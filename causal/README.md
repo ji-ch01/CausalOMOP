@@ -128,7 +128,12 @@ call it.
   results_faithfulness` (no second LLM), and is included in the report only
   once a human reviewer approves it with no failed check
   (`WorkflowManager.review_results_narrative`) -- a decision entirely
-  separate from the mandatory `results` gate;
+  separate from the mandatory `results` gate. In the Streamlit UI that
+  narrative is normally drafted through the results-interpretation dialogue
+  companion (`WorkflowManager.run_results_companion_turn`), the
+  results-review counterpart of the estimand dialogue; "Draft in one step"
+  is the no-conversation fallback and both paths write the same verified,
+  human-approved artifact;
 - CATE (conditional average treatment effect) for a prespecified family of
   effect-modifier subgroups, cited to Athey & Imbens 2016 and Wager & Athey
   2018 (`causal.agents.cate.CATEAgent`, a causal forest via `econml.dml.
@@ -199,7 +204,11 @@ ambiguous. The gate is LLM-based and may be skipped explicitly for controlled
 testing; it is not a replacement for human protocol review. In the Streamlit
 UI this intake is a conversation panel (`causal/companion/`): clarification
 is answerable over multiple rounds and the exchange is persisted per run as
-`conversation.jsonl`, an advisory record with no gate authority.
+`conversation.jsonl`, an advisory record with no gate authority. That same
+left panel becomes an active dialogue at the two points a run most needs
+one -- the `statistical_estimand` gate (estimand dialogue) and results
+review (results-interpretation dialogue) -- each a read-only companion turn
+whose only outcome is a human-confirmed card.
 
 ## Important implementation boundary
 
