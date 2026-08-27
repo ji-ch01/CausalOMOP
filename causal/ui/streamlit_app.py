@@ -38,6 +38,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from causal.agents.concept_lookup_terms import (
+    DEFAULT_CONCEPT_LOOKUP_TERMS_PROMPT_PATH,
+    build_concept_lookup_terms_prompt,
+    parse_concept_lookup_terms_response,
+)
 from causal.agents.covariate_suggestion import (
     DEFAULT_COVARIATE_SUGGESTION_PROMPT_PATH,
     build_covariate_suggestion_prompt,
@@ -1944,8 +1949,62 @@ def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_d
         hide_index=True,
         width="stretch",
     )
+    _render_concept_lookup_term_suggester(manager, run_id, protocol or {}, concept_sets)
     _render_concept_set_mapping_forms(manager, run_id, concept_sets, exposure_contrast)
     _render_population_concept_set_manager(manager, run_id, protocol or {})
+
+
+def _render_concept_lookup_term_suggester(
+    manager: WorkflowManager, run_id: str, protocol: dict[str, Any], concept_sets: dict[str, Any]
+) -> None:
+    """One shared "Suggest search terms" button: a single LLM call proposes a
+    short OMOP-vocabulary search string for every concept set at once
+    (`causal.agents.concept_lookup_terms`), persisted to each entry's
+    `lookup_term` so the per-role "Search term" boxes below pre-fill with it.
+    A search hint only -- it never chooses or approves a concept."""
+    target = protocol.get("target_trial") or {}
+    rows = [
+        {"name": name, "role": str(definition.get("role", "")), "label": definition.get("label") or name}
+        for name, definition in concept_sets.items()
+        if isinstance(definition, dict)
+    ]
+    if not rows:
+        return
+    known_names = {row["name"] for row in rows}
+
+    if st.button(
+        "Suggest search terms for all concept sets (LLM)",
+        icon=":material/auto_awesome:",
+        key=f"suggest_concept_lookup_terms_{run_id}",
+        help="Pre-fills every 'Search term' box below from the clinical labels. You still run "
+        "each search and approve each concept.",
+    ):
+        status = st.status("Requesting OMOP search-term suggestions...", expanded=True)
+        try:
+            resolved_llm = build_hypothesis_llm()
+            status.write(f"Calling `{resolved_llm.provider}:{resolved_llm.model}`...")
+            prompt = build_concept_lookup_terms_prompt(
+                DEFAULT_CONCEPT_LOOKUP_TERMS_PROMPT_PATH, target, rows
+            )
+            terms = parse_concept_lookup_terms_response(resolved_llm.call(prompt), known_names)
+            if not terms:
+                status.update(label="No usable suggestions returned.", state="error")
+                return
+            manager.set_concept_set_lookup_terms(run_id, terms)
+            # Overwrite any already-rendered "Search term" box for these names
+            # (whatever OMOP domain it is on) -- a keyed st.text_input ignores
+            # its `value=` once the key exists in session_state, same idiom as
+            # the covariate-suggestion pre-fill above.
+            for name, term in terms.items():
+                prefix = f"concept_set_candidates_{run_id}_{name}_"
+                for key in list(st.session_state.keys()):
+                    if key.startswith(prefix) and key.endswith("_term"):
+                        st.session_state[key] = term
+            status.update(label=f"Search terms updated for {len(terms)} concept set(s).", state="complete")
+            st.rerun()
+        except (ValueError, RuntimeError, OSError) as exc:
+            status.update(label="Search-term suggestion failed.", state="error")
+            st.error(str(exc))
 
 
 def _render_population_concept_set_manager(manager: WorkflowManager, run_id: str, protocol: dict[str, Any]) -> None:

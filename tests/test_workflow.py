@@ -998,6 +998,70 @@ class WorkflowMapConceptSetTests(unittest.TestCase):
             )
 
 
+class WorkflowSetConceptSetLookupTermsTests(unittest.TestCase):
+    """`set_concept_set_lookup_terms` only seeds the UI concept-search box; it
+    writes `protocol.json` but touches no mapping decision and no gate."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        protocol = root / "protocol.json"
+        protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+            },
+            "concept_sets": {
+                "population": {"role": "population", "status": "pending_omop_mapping", "concept_ids": [], "domain": ""},
+                "outcome": {"role": "outcome", "status": "pending_omop_mapping", "concept_ids": [], "domain": ""},
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        self.state = self.manager.run_hypothesis_agent(self.manager.start(protocol).run_id)
+        self.run_dir = root / "runs" / self.state.run_id
+
+    def _protocol(self) -> dict:
+        return json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+
+    def test_updates_lookup_term_without_touching_other_fields(self):
+        self.manager.map_concept_set(self.state.run_id, "population", "condition", [132797], "Dr. Chen")
+        self.manager.set_concept_set_lookup_terms(
+            self.state.run_id, {"population": "  sepsis ", "outcome": "in-hospital death"}
+        )
+        concept_sets = self._protocol()["concept_sets"]
+        self.assertEqual(concept_sets["population"]["lookup_term"], "sepsis")
+        self.assertEqual(concept_sets["outcome"]["lookup_term"], "in-hospital death")
+        # The mapping approved above is untouched.
+        self.assertEqual(concept_sets["population"]["concept_ids"], [132797])
+        self.assertEqual(concept_sets["population"]["status"], "approved")
+
+    def test_records_an_event_and_no_gate_is_invalidated(self):
+        self.manager.decide_gate(self.state.run_id, "clinical_mapping", "approved", "Dr. Lee")
+        state = self.manager.set_concept_set_lookup_terms(self.state.run_id, {"population": "sepsis"})
+        self.assertEqual(state.gates["clinical_mapping"].status, "approved")
+        self.assertTrue(any(e["event"] == "concept_set_lookup_terms_set" for e in state.history))
+
+    def test_unknown_names_are_ignored_when_at_least_one_matches(self):
+        self.manager.set_concept_set_lookup_terms(
+            self.state.run_id, {"population": "sepsis", "not_a_set": "x"}
+        )
+        self.assertEqual(self._protocol()["concept_sets"]["population"]["lookup_term"], "sepsis")
+
+    def test_raises_when_no_name_matches(self):
+        with self.assertRaises(RuntimeError):
+            self.manager.set_concept_set_lookup_terms(self.state.run_id, {"not_a_set": "x"})
+
+    def test_rejects_empty_or_non_string_input(self):
+        for bad in ({}, {"population": "   "}, {"population": 5}, "not a dict"):
+            with self.assertRaises(ValueError):
+                self.manager.set_concept_set_lookup_terms(self.state.run_id, bad)
+
+
 class WorkflowGateInvalidationTests(unittest.TestCase):
     """An `approved`/`provisional` gate must not silently keep authorizing
     execution once the content it approved changes underneath it --

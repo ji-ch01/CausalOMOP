@@ -557,6 +557,40 @@ def _results_narrative_section_script(run_dir: str) -> None:
     _render_results_narrative_section(WorkflowManager(path.parent), state, path)
 
 
+def _concept_lookup_term_suggester_script(runs_dir: str) -> None:
+    """AppTest script: render the shared "Suggest search terms" button for a
+    minimal run so the section renders without a crash (the button itself is
+    not clicked -- that path needs a live LLM)."""
+    from pathlib import Path
+
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_concept_lookup_term_suggester
+
+    protocol = {
+        "target_trial": {"population": "sepsis", "treatment": "albumin", "comparator": "crystalloid", "outcome": "death"},
+        "concept_sets": {
+            "population": {"role": "population", "label": "sepsis", "status": "pending_omop_mapping"},
+            "treatment": {"role": "treatment", "label": "albumin", "status": "pending_omop_mapping"},
+        },
+    }
+    _render_concept_lookup_term_suggester(
+        WorkflowManager(runs_dir), "run1", protocol, protocol["concept_sets"]
+    )
+
+
+class ConceptLookupTermSuggesterSmokeTests(unittest.TestCase):
+    def test_renders_the_shared_button(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _concept_lookup_term_suggester_script,
+                kwargs={"runs_dir": str(Path(temp) / "runs")},
+                default_timeout=30,
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Suggest search terms" in button.label for button in harness.button))
+
+
 class ResultsNarrativeSectionSmokeTests(unittest.TestCase):
     def test_no_autogen_on_arrival_offers_the_one_step_fallback(self):
         with tempfile.TemporaryDirectory() as temp:

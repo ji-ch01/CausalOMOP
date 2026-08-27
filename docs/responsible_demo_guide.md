@@ -108,6 +108,14 @@ OMCP lookup results are candidates only. Review mappings through
 streamlit run causal/ui/streamlit_app.py
 ```
 
+In the Streamlit concept-mapping section a shared "Suggest search terms"
+button makes one LLM call (`causal.agents.concept_lookup_terms`) that
+pre-fills the OMOP-search box for every concept set from its clinical label,
+persisted as `concept_sets[name].lookup_term`
+(`WorkflowManager.set_concept_set_lookup_terms`). It is a search convenience
+only -- it invalidates no gate and chooses no concept; the reviewer still
+runs each search and approves each mapping.
+
 Never approve a mapping or gate merely to make a live demo proceed.
 
 ## Registry and aggregate diagnostics

@@ -1248,6 +1248,56 @@ class WorkflowManager:
         self.save(state)
         return state
 
+    def set_concept_set_lookup_terms(self, run_id: str, terms: dict[str, str]) -> RunState:
+        """Update `concept_sets[name].lookup_term` for one or more entries.
+
+        `lookup_term` is only a search hint: it seeds the default value of the
+        OMOP concept-search box in the UI (and the term
+        `causal.agents.data_science.DataScienceAgent` uses to pre-fetch
+        candidate concepts). It is not part of any mapping decision -- it does
+        not feed `_load_concept_specs`, cohort/feasibility SQL, or any gate --
+        so this writes `protocol.json` under the lock and records the change,
+        but invalidates no gate and does not regenerate `hypothesis.json`.
+
+        Backs the "Suggest search terms" button in the Streamlit
+        concept-mapping section (`causal.agents.concept_lookup_terms`); a name
+        not present in `concept_sets` is ignored rather than raising, since
+        the set can change between the suggestion and the save.
+        """
+        if not isinstance(terms, dict) or not all(
+            isinstance(name, str) and isinstance(value, str) for name, value in terms.items()
+        ):
+            raise ValueError("terms must be a {concept_set_name: search_term} mapping of strings")
+        cleaned = {name: value.strip() for name, value in terms.items() if value.strip()}
+        if not cleaned:
+            raise ValueError("terms contains no non-empty search term")
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            concept_sets = protocol.get("concept_sets", {})
+            applied = {
+                name: value for name, value in cleaned.items()
+                if isinstance(concept_sets.get(name), dict)
+            }
+            if not applied:
+                raise RuntimeError("none of the given names match a concept set on this run")
+            protocol["concept_sets"] = {
+                name: ({**entry, "lookup_term": applied[name]} if name in applied else entry)
+                for name, entry in concept_sets.items()
+            }
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+        state.record(
+            "concept_set_lookup_terms_set",
+            "; ".join(f"{name}={value!r}" for name, value in sorted(applied.items())),
+        )
+        self.save(state)
+        return state
+
     def add_population_concept_set(
         self,
         run_id: str,
