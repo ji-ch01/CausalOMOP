@@ -37,6 +37,35 @@ def _sign_causal_context(causal_context: dict[str, Any], secret: str) -> str:
     return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
+def _leaf_exceptions(group: BaseException) -> list[BaseException]:
+    """Flatten a (possibly nested) ExceptionGroup to its leaf exceptions."""
+    nested = getattr(group, "exceptions", None)
+    if not nested:
+        return [group]
+    leaves: list[BaseException] = []
+    for exc in nested:
+        leaves.extend(_leaf_exceptions(exc))
+    return leaves
+
+
+def _run_omcp(coro: Any) -> "MCPToolResponse":
+    """`asyncio.run` the coroutine, but flatten the `ExceptionGroup` that
+    anyio's task group raises when the OMCP subprocess cannot be launched or
+    dies during a call (`uv` missing from PATH, a bad `--directory`, the
+    server crashing on startup) into a plain `RuntimeError`.
+
+    Without this the failure reaches callers as an unhandled `ExceptionGroup`,
+    which none of their `except (ValueError, RuntimeError, OSError)` clauses
+    catch -- so an optional concept search or feasibility probe takes down the
+    whole Streamlit page instead of showing an error.
+    """
+    try:
+        return asyncio.run(coro)
+    except ExceptionGroup as group:  # noqa: UP041 - builtin on the 3.12 this project targets
+        detail = "; ".join(str(exc) for exc in _leaf_exceptions(group)) or str(group)
+        raise RuntimeError(f"OMCP call failed: {detail}") from group
+
+
 @dataclass(frozen=True)
 class MCPToolResponse:
     text: str
@@ -116,15 +145,15 @@ class OMCPClient:
         operation: str,
         causal_context: dict[str, Any],
     ) -> MCPToolResponse:
-        return asyncio.run(self._causal_select(query, operation, causal_context))
+        return _run_omcp(self._causal_select(query, operation, causal_context))
 
     def lookup_drug(self, term: str, *, limit: int = 10, offset: int = 0) -> MCPToolResponse:
-        return asyncio.run(
+        return _run_omcp(
             self._call_tool("Lookup_Drug", {"term": term, "limit": limit, "offset": offset})
         )
 
     def lookup_condition(self, term: str, *, limit: int = 10, offset: int = 0) -> MCPToolResponse:
-        return asyncio.run(
+        return _run_omcp(
             self._call_tool("Lookup_Condition", {"term": term, "limit": limit, "offset": offset})
         )
 
@@ -134,10 +163,10 @@ class OMCPClient:
         arguments: dict[str, Any] = {"term": term, "domain": domain, "limit": limit, "offset": offset}
         if vocabulary_id is not None:
             arguments["vocabulary_id"] = vocabulary_id
-        return asyncio.run(self._call_tool("Lookup_Concept", arguments))
+        return _run_omcp(self._call_tool("Lookup_Concept", arguments))
 
     def get_concepts_by_id(self, concept_ids: list[int]) -> MCPToolResponse:
-        return asyncio.run(self._call_tool("Get_Concepts_By_Id", {"concept_ids": concept_ids}))
+        return _run_omcp(self._call_tool("Get_Concepts_By_Id", {"concept_ids": concept_ids}))
 
     async def _causal_select(
         self,

@@ -7,14 +7,54 @@ from causal.config import BigQueryDatasets
 from causal.mcp_client import (
     MCPToolResponse,
     OMCPClient,
+    _leaf_exceptions,
     _normalize_tool_response,
     _omcp_db_overrides,
+    _run_omcp,
     _sign_causal_context,
     _subprocess_environment,
 )
 
 BIGQUERY_DATASETS = BigQueryDatasets(project="project", omop="dataset")
 DUCKDB_DATASETS = BigQueryDatasets(backend="duckdb", duckdb_path="data/mimiciv_omop.duckdb", duckdb_schema="main")
+
+
+class RunOmcpTests(unittest.TestCase):
+    """`_run_omcp` must flatten the ExceptionGroup anyio raises when the OMCP
+    subprocess cannot start into a plain RuntimeError, so a caller's
+    `except (ValueError, RuntimeError, OSError)` catches it instead of the
+    whole app crashing on an unhandled ExceptionGroup."""
+
+    async def _ok(self):
+        return MCPToolResponse(text="fine", metadata={})
+
+    async def _raises_group(self):
+        raise ExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [FileNotFoundError("[Errno 2] No such file or directory: 'uv'")],
+        )
+
+    async def _raises_runtime(self):
+        raise RuntimeError("OMCP tool failed: Lookup_Condition")
+
+    def test_passes_through_a_normal_result(self):
+        self.assertEqual(_run_omcp(self._ok()).text, "fine")
+
+    def test_flattens_an_exception_group_into_a_runtime_error(self):
+        with self.assertRaises(RuntimeError) as caught:
+            _run_omcp(self._raises_group())
+        self.assertIn("uv", str(caught.exception))
+        self.assertNotIsInstance(caught.exception, ExceptionGroup)
+
+    def test_leaves_a_plain_runtime_error_alone(self):
+        with self.assertRaisesRegex(RuntimeError, "Lookup_Condition"):
+            _run_omcp(self._raises_runtime())
+
+    def test_leaf_exceptions_flattens_nested_groups(self):
+        inner = ExceptionGroup("inner", [ValueError("a"), KeyError("b")])
+        outer = ExceptionGroup("outer", [inner, OSError("c")])
+        messages = {type(exc).__name__ for exc in _leaf_exceptions(outer)}
+        self.assertEqual(messages, {"ValueError", "KeyError", "OSError"})
 
 
 class OMCPClientTests(unittest.TestCase):
