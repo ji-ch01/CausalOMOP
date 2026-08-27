@@ -514,136 +514,6 @@ def _next_action_text(state: RunState) -> str:
     return f"decide the {title} gate (Current task)."
 
 
-def _render_phase_tracker(state: RunState) -> None:
-    current_phase = state.phase
-    current_index = PHASES.index(current_phase)
-    current_gate = _PHASE_TO_GATE.get(current_phase)
-    gate_status = state.gates[current_gate].status if current_gate else "action required"
-
-    phase_col, progress_col, gate_col = st.columns(3)
-    phase_col.metric("Current phase", _PHASE_LABELS.get(current_phase, current_phase), border=True)
-    progress_col.metric("Workflow progress", f"{current_index + 1} of {len(PHASES)}", border=True)
-    gate_col.metric(
-        "Current checkpoint",
-        gate_status.replace("_", " "),
-        border=True,
-    )
-    st.info(f"Next action: {_next_action_text(state)}", icon=":material/arrow_forward:")
-
-    with st.expander("View the complete workflow", icon=":material/account_tree:"):
-        for start in range(0, len(PHASES), 3):
-            columns = st.columns(3)
-            for index, phase in enumerate(PHASES[start : start + 3], start=start):
-                phase_label = _PHASE_LABELS.get(phase, phase)
-                if index < current_index:
-                    status, color, icon = "Completed", "green", ":material/check_circle:"
-                elif index == current_index:
-                    status, color, icon = "Current", "blue", ":material/play_circle:"
-                else:
-                    status, color, icon = "Upcoming", "gray", ":material/lock:"
-                with columns[index - start]:
-                    st.markdown(f"**{phase_label}**")
-                    st.badge(status, color=color, icon=icon)
-        st.caption("A locked step may require an approval decision before the workflow can continue.")
-
-
-def _render_study_summary(state: RunState, run_dir: Path) -> None:
-    """Research-facing overview of the study's question, evidence, and review state.
-
-    This is intentionally read-only: it orients a reviewer before they enter
-    the detailed workspaces that own each workflow decision.
-    """
-    protocol = _read_json(run_dir / "protocol.json") or {}
-    target_trial = protocol.get("target_trial") or {}
-    estimation = _read_json(run_dir / "estimation.json") or {}
-    diagnostics = _read_json(run_dir / "diagnostics.json") or {}
-    sensitivity = _read_json(run_dir / "sensitivity_analysis.json") or {}
-    cate = _read_json(run_dir / "cate.json") or {}
-    narrative_raw = _read_json(run_dir / "results_narrative.json")
-    narrative = normalize_narrative_artifact(narrative_raw) if narrative_raw else None
-    report_ready = (run_dir / "causal_report.md").is_file()
-    rejected_gates = [name for name, gate in state.gates.items() if gate.status == "rejected"]
-    flagged_balance = sum(1 for entry in diagnostics.get("balance", ()) if entry.get("flagged"))
-
-    st.subheader("Study summary")
-    st.caption(
-        "A read-only overview of the scientific question, reviewed design, available evidence, and next decision."
-    )
-
-    if report_ready:
-        st.success("Report ready for audit.", icon=":material/verified:")
-    elif rejected_gates:
-        rejected_titles = ", ".join(_GATE_INFO.get(name, {}).get("title", name) for name in rejected_gates)
-        st.warning(f"Review blocked: {rejected_titles} require resolution.", icon=":material/warning:")
-    elif not estimation:
-        st.info("Evidence incomplete: a primary causal estimate is not available yet.", icon=":material/pending:")
-    elif flagged_balance:
-        st.warning(
-            f"Results require diagnostic review: {flagged_balance} covariate(s) exceed the SMD review threshold.",
-            icon=":material/warning:",
-        )
-    else:
-        st.info("Ready for results review. Confirm the interpretation and complete the final review gate.", icon=":material/rate_review:")
-
-    with st.container(border=True):
-        st.markdown("**Clinical question**")
-        st.write(_source_question(run_dir) or "No clinical question is recorded for this study.")
-
-    design_col, evidence_col = st.columns(2)
-    with design_col:
-        with st.container(border=True):
-            st.markdown("**Reviewed study design**")
-            if target_trial:
-                st.markdown(f"**Population**  \n{target_trial.get('population', '—')}")
-                st.markdown(f"**Treatment**  \n{target_trial.get('treatment', '—')}")
-                st.markdown(f"**Comparator**  \n{target_trial.get('comparator', '—')}")
-                st.markdown(f"**Outcome**  \n{target_trial.get('outcome', '—')}")
-                st.markdown(f"**Estimand**  \n{target_trial.get('effect_measure', '—')}")
-            else:
-                st.caption("The target-trial specification has not been generated yet.")
-    with evidence_col:
-        with st.container(border=True):
-            st.markdown("**Primary evidence**")
-            estimand = estimation.get("estimand") or {}
-            if estimand:
-                st.metric(
-                    _humanize(estimand.get("effect_measure")),
-                    f"{estimand.get('point_estimate', 0):.4f}",
-                )
-                st.caption(
-                    f"{int(estimand.get('ci_level', 0.95) * 100)}% CI: "
-                    f"[{estimand.get('ci_lower', 0):.4f}, {estimand.get('ci_upper', 0):.4f}] "
-                    f"· N = {estimand.get('n_total', '—')}"
-                )
-                st.caption(estimand.get("method", ""))
-            else:
-                st.caption("No primary causal estimate is available yet.")
-
-    st.markdown("**Evidence and review status**")
-    with st.container(horizontal=True):
-        st.metric("Approved gates", f"{sum(g.status == 'approved' for g in state.gates.values())} / {len(state.gates)}", border=True)
-        st.metric("Balance flags", flagged_balance if diagnostics else "Not run", border=True)
-        st.metric("Sensitivity", "Complete" if sensitivity else "Not run", border=True)
-        st.metric("LLM interpretation", (narrative or {}).get("review_status", "Not generated").replace("_", " ").capitalize(), border=True)
-        st.metric("CATE", "Complete" if cate else "Not run", border=True)
-
-    with st.expander("Scientific context and audit trail", icon=":material/fact_check:"):
-        if sensitivity:
-            st.markdown(
-                f"**Sensitivity analysis**  \nE-value (point estimate): "
-                f"{sensitivity.get('e_value_point', '—')} · E-value (CI limit): {sensitivity.get('e_value_ci', '—')}"
-            )
-        if cate:
-            cate_estimand = cate.get("estimand") or {}
-            st.markdown(
-                f"**Prespecified subgroup analysis**  \n{cate_estimand.get('n_prespecified_subgroups_tested', 0)} "
-                "prespecified subgroup(s) tested."
-            )
-        st.markdown("**Next step**")
-        st.write(_next_action_text(state))
-        st.caption("Use the detailed workspaces to inspect assumptions, approve decisions, and download audit artifacts.")
-
-
 def _render_target_trial_summary(run_dir: Path) -> None:
     """Read-only view of `protocol["target_trial"]` -- what the `target_trial`
     gate actually approves (see `WorkflowManager._block_if_target_trial_
@@ -3898,16 +3768,9 @@ def main() -> None:
         run_dir = RUNS_DIR / run_id
 
         st.caption(f"Study `{state.run_id}` · {state.mode} mode · updated {state.updated_at}")
-        source_question = _source_question(run_dir)
-        if source_question:
-            with st.container(border=True):
-                st.caption("Clinical question")
-                st.write(source_question)
-        _render_phase_tracker(state)
         workspace = st.segmented_control(
             "Study workspace",
             (
-                "Study summary",
                 "Current task",
                 "Study design",
                 "Mapping & plan",
@@ -3915,16 +3778,14 @@ def main() -> None:
                 "Estimation & report",
                 "Report & audit",
             ),
-            default="Study summary",
+            default="Current task",
             required=True,
             key=f"workspace_{run_id}",
             label_visibility="collapsed",
             width="stretch",
         )
 
-        if workspace == "Study summary":
-            _render_study_summary(state, run_dir)
-        elif workspace == "Current task":
+        if workspace == "Current task":
             _render_gates_tab(manager, state, run_dir)
         elif workspace == "Study design":
             _render_hypothesis_tab(manager, run_id, run_dir)

@@ -31,6 +31,7 @@ from typing import Any
 
 import streamlit as st
 
+from causal.agents.results_narrative import normalize_narrative_artifact
 from causal.companion.companion import CompanionMessage
 from causal.companion.conversation import ConversationEntry, ConversationStore, flush_intake
 from causal.companion.intake import (
@@ -556,16 +557,95 @@ def _render_estimand_dialogue(manager: WorkflowManager, run_id: str) -> None:
         st.rerun()
 
 
+def _render_study_progress(state: RunState, run_dir: Any) -> None:
+    """Compact "where is this study" view at the top of the conversation
+    panel: phase progress, next action, the reviewed question and P/T/C/O,
+    gate count, and available evidence. This is what the old "Study summary"
+    workspace tab showed, sized for the narrow left column.
+
+    `causal.ui.streamlit_app`'s helpers are reached through a lazy import:
+    that module imports this one, so a top-level import here would be a
+    cycle, but by the time this function runs both are fully loaded.
+    """
+    from causal.orchestrator.state import PHASES
+    from causal.ui import streamlit_app as app
+
+    protocol = app._read_json(run_dir / "protocol.json") or {}
+    target_trial = protocol.get("target_trial") or {}
+    estimation = app._read_json(run_dir / "estimation.json") or {}
+    diagnostics = app._read_json(run_dir / "diagnostics.json") or {}
+    sensitivity = app._read_json(run_dir / "sensitivity_analysis.json") or {}
+    narrative_raw = app._read_json(run_dir / "results_narrative.json")
+
+    index = PHASES.index(state.phase) if state.phase in PHASES else 0
+    phase_label = app._PHASE_LABELS.get(state.phase, state.phase)
+    approved = sum(gate.status == "approved" for gate in state.gates.values())
+    rejected = [
+        app._GATE_INFO.get(name, {}).get("title", name)
+        for name, gate in state.gates.items()
+        if gate.status == "rejected"
+    ]
+
+    with st.container(border=True):
+        st.progress((index + 1) / len(PHASES), text=f"{phase_label} · step {index + 1} of {len(PHASES)}")
+        if rejected:
+            st.warning(f"Blocked: {', '.join(rejected)} need resolution.", icon=":material/warning:")
+        else:
+            st.caption(f"Next: {app._next_action_text(state)}")
+
+        question = app._source_question(run_dir)
+        if question:
+            st.caption("Clinical question")
+            st.write(question)
+
+        if target_trial:
+            st.markdown(
+                f"**P** {target_trial.get('population', '—')}  \n"
+                f"**T** {target_trial.get('treatment', '—')}  \n"
+                f"**C** {target_trial.get('comparator', '—')}  \n"
+                f"**O** {target_trial.get('outcome', '—')}"
+            )
+
+        left, right = st.columns(2)
+        left.metric("Gates approved", f"{approved} / {len(state.gates)}")
+        estimand = estimation.get("estimand") or {}
+        if estimand:
+            right.metric(
+                app._humanize(estimand.get("effect_measure")),
+                f"{estimand.get('point_estimate', 0):.3f}",
+            )
+        else:
+            right.metric("Estimate", "—")
+
+        with st.expander("Workflow & evidence", icon=":material/account_tree:"):
+            for position, phase in enumerate(PHASES):
+                mark = ":material/check_circle:" if position < index else (
+                    ":material/play_circle:" if position == index else ":material/lock:"
+                )
+                st.markdown(f"{mark} {app._PHASE_LABELS.get(phase, phase)}")
+            st.divider()
+            flagged = sum(1 for entry in diagnostics.get("balance", ()) if entry.get("flagged"))
+            narrative = normalize_narrative_artifact(narrative_raw) if narrative_raw else None
+            st.caption(
+                f"Diagnostics: {f'{flagged} balance flag(s)' if diagnostics else 'not run'} · "
+                f"Sensitivity: {'complete' if sensitivity else 'not run'} · "
+                f"Interpretation: {(narrative or {}).get('review_status', 'not generated')}"
+            )
+
+
 def render_conversation_panel(manager: WorkflowManager, run_id: str | None) -> None:
     """Entry point for `main()`'s left column."""
     st.subheader("Conversation", anchor=False)
 
     if run_id is not None:
         state: RunState = manager.load(run_id)
+        run_dir = manager.runs_dir / run_id
+        _render_study_progress(state, run_dir)
+        st.divider()
         if state.phase == _ESTIMAND_PHASE:
             _render_estimand_dialogue(manager, run_id)
         else:
-            _render_thread(ConversationStore(manager.runs_dir / run_id).read())
+            _render_thread(ConversationStore(run_dir).read())
             st.caption(
                 'Transcript of the open study. Use "New study" in the sidebar to start another.'
             )

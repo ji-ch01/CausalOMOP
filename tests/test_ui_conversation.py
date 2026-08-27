@@ -32,6 +32,46 @@ def _estimand_dialogue_script(runs_dir: str, run_id: str) -> None:
     _render_estimand_dialogue(WorkflowManager(runs_dir), run_id)
 
 
+def _conversation_panel_script(runs_dir: str, run_id: str) -> None:
+    """AppTest script: render the whole panel for an open run so the study
+    progress header (the moved "Study summary" content) is exercised."""
+    import json
+    from pathlib import Path
+
+    from causal.orchestrator.state import ApprovalGate, RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.conversation import render_conversation_panel
+
+    manager = WorkflowManager(runs_dir)
+    run_dir = Path(runs_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "protocol.json").write_text(
+        json.dumps(
+            {
+                "source_question": "Does aspirin reduce 30-day mortality after MI?",
+                "target_trial": {
+                    "population": "adults admitted with MI",
+                    "treatment": "aspirin",
+                    "comparator": "no aspirin",
+                    "outcome": "30-day mortality",
+                    "effect_measure": "risk_difference",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager.save(
+        RunState(
+            run_id=run_id,
+            study_id="aspirin_mi",
+            protocol_path=str(run_dir / "protocol.json"),
+            phase="dag_review",
+            gates={"target_trial": ApprovalGate("target_trial", status="approved", reviewer="r")},
+        )
+    )
+    render_conversation_panel(manager, run_id)
+
+
 class EntryChatShapeTests(unittest.TestCase):
     def test_user_turn_maps_to_the_user_side(self):
         entry = ConversationEntry(role="user", kind="message", text="hi")
@@ -212,6 +252,23 @@ class EstimandDialogueRenderTests(unittest.TestCase):
         harness = self._app("run2")
         self.assertEqual(list(harness.exception), [])
         self.assertTrue(any("unavailable" in warning.value.lower() for warning in harness.warning))
+
+
+class StudyProgressRenderTests(unittest.TestCase):
+    def test_progress_header_renders_for_an_open_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _conversation_panel_script,
+                kwargs={"runs_dir": str(Path(temp) / "runs"), "run_id": "run1"},
+                default_timeout=30,
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        prose = " ".join(block.value for block in harness.markdown)
+        self.assertIn("aspirin", prose)
+        self.assertTrue(any("Gates approved" in metric.label for metric in harness.metric))
+        # the "Workflow & evidence" expander body lists every phase label
+        self.assertIn("causal DAG review", prose)
 
 
 if __name__ == "__main__":
