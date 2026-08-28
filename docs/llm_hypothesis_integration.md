@@ -177,6 +177,25 @@ causal.cli workflow decision-memory <run_id>` (`--json` for the raw
 object), and as a frozen `decision_memory.json` snapshot that
 `build_causal_report` writes and lists in the report's Provenance table.
 
+### Reviewer memory (cross-study)
+
+`causal.companion.reviewer_memory` is the outermost, opt-in memory layer:
+one file per reviewer at `artifacts/reviewers/<slug>/memory.json`, carrying
+their conventions *across* studies -- covariates they have excluded before
+(with the study and rationale) and the statistical-estimand strategies they
+have settled on. It is populated only when a human asks
+(`WorkflowManager.remember_run_for_reviewer` -- the "Add this run's
+decisions to my reviewer memory" button, or `workflow remember-run
+<run_id> --reviewer <name>`); `merge_run_into_memory` is the pure,
+idempotent fold (re-running for the same study replaces that study's
+entries). When `run_companion_turn` is given a `reviewer`, that memory is
+loaded read-only and rendered into the prompt under `REVIEWER CONVENTIONS`,
+with an instruction to use it for consistency but never to treat a past
+choice as one already made for this study. Same boundary as the per-run
+decision memory: decision-level text only, feeds a prompt, never a gate.
+Inspect with `workflow reviewer-memory <name>` or the **Report & audit**
+tab.
+
 ## Results narrative (post-estimation interpretation)
 
 After `causal.agents.estimation`/`causal.agents.diagnostics` compute the

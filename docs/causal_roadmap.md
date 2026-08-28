@@ -112,7 +112,11 @@ reviewable graphs.
   re-propose a covariate the reviewer threw out or re-open a settled choice.
   It changes what the companion is told, never what it can do.
   `build_causal_report` freezes it as a `decision_memory.json` snapshot and
-  lists it in the report's Provenance table.
+  lists it in the report's Provenance table. An opt-in **reviewer memory**
+  (`causal.companion.reviewer_memory`, `artifacts/reviewers/<slug>/`)
+  carries the same class of decisions *across* studies when a human asks;
+  it is rendered as `REVIEWER CONVENTIONS`, still advisory, still no
+  patient data.
 - PubMed and OpenAlex provide literature records; OptimusKG is an optional
   relation source. Retrieved identifiers form a deterministic allow-list for
   citations emitted by the model.

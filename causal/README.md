@@ -214,7 +214,10 @@ gets a deterministic **decision memory**
 covariate exclusions and decisions, distilled with no LLM -- so it does not
 re-propose something the reviewer already ruled out. Inspect it with
 `workflow decision-memory <run_id>`; `causal-report` freezes it as
-`decision_memory.json`.
+`decision_memory.json`. An opt-in **reviewer memory**
+(`causal/companion/reviewer_memory.py`, `artifacts/reviewers/<slug>/`)
+carries the same kind of decisions across studies when a human clicks "Add
+this run's decisions to my reviewer memory" (or `workflow remember-run`).
 
 ## Important implementation boundary
 

@@ -190,6 +190,13 @@ writes nothing; `python -m causal.cli workflow decision-memory <run_id>`
 prints the same digest, and `causal-report` freezes it as a
 `decision_memory.json` snapshot.
 
+An opt-in **reviewer memory** (`causal.companion.reviewer_memory`,
+`artifacts/reviewers/<slug>/memory.json`) extends this across studies:
+prior covariate exclusions and estimand strategies for the sidebar
+reviewer, folded in only on an explicit "Add this run's decisions to my
+reviewer memory" (or `workflow remember-run`), and shown to the dialogue as
+`REVIEWER CONVENTIONS` -- advisory context, never a decision already made.
+
 ## Estimation and the causal report
 
 Only once `clinical_mapping`, `analysis_plan`, and `statistical_estimand` are
