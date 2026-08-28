@@ -483,10 +483,11 @@ def _run_companion_reply(manager: WorkflowManager, run_id: str, store: Conversat
     on any provider/parse failure it records the message for the panel to
     show and returns False without writing anything."""
     history = estimand_dialogue_history(store.read())
+    reviewer = (st.session_state.get("reviewer_name") or "").strip() or None
     status = st.status("Companion is thinking...", expanded=False)
     try:
         resolved_llm = build_hypothesis_llm()
-        turn = manager.run_companion_turn(run_id, resolved_llm.call, history)
+        turn = manager.run_companion_turn(run_id, resolved_llm.call, history, reviewer=reviewer)
     except Exception as exc:  # noqa: BLE001 - surfaced in the panel, not swallowed
         status.update(label="Companion unavailable", state="error")
         st.session_state[_companion_error_key(run_id)] = str(exc)

@@ -2954,6 +2954,27 @@ class WorkflowRunCompanionTurnTests(unittest.TestCase):
         self.assertEqual(len(after.history), len(before.history))
         self.assertFalse((self.run_dir / "decision_memory.json").exists())
 
+    def test_reviewer_memory_reaches_the_prompt_only_when_a_reviewer_is_given(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "old_covariate", "reviewer": "Dr. Chen", "comment": "post-treatment",
+             "decided_at": "2026-07-01T00:00:00+00:00"}
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+        self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+
+        without = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(self.run_id, without, [])
+        self.assertIn("No cross-study conventions recorded", without.prompts[0])
+
+        with_reviewer = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(self.run_id, with_reviewer, [], reviewer="Dr. Chen")
+        prompt = with_reviewer.prompts[0]
+        self.assertIn("REVIEWER CONVENTIONS", prompt)
+        self.assertIn("excluded in earlier studies", prompt)
+        self.assertIn("old_covariate", prompt)
+
     def test_rejects_the_wrong_phase(self):
         state = self.manager.load(self.run_id)
         state.phase = "execution"
@@ -2986,6 +3007,60 @@ class WorkflowRunCompanionTurnTests(unittest.TestCase):
         })
         with self.assertRaises(ValueError):
             self.manager.run_companion_turn(self.run_id, _CapturingLLM(smuggled), [])
+
+
+class WorkflowReviewerMemoryTests(unittest.TestCase):
+    """`remember_run_for_reviewer` / `reviewer_memory` -- the opt-in
+    cross-study memory (`causal.companion.reviewer_memory`)."""
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.manager, self.run_id, self.run_dir = _bring_run_to_estimand_review(
+            Path(self.temp.name), self.datasets
+        )
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "baseline_lactate", "reviewer": "Dr. Chen",
+             "comment": "post-treatment", "decided_at": "2026-08-01T00:00:00+00:00"}
+        ]
+        protocol["statistical_estimand_settings"] = {
+            "missing_data_strategy": "complete_case_analysis",
+            "censoring_strategy": "ignore_censoring_administrative_waiver",
+            "estimation_procedure": "plug_in_standardization",
+        }
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+
+    def test_unknown_reviewer_has_empty_memory(self):
+        self.assertTrue(self.manager.reviewer_memory("Nobody New").is_empty())
+
+    def test_remember_folds_the_run_and_persists_under_a_slug(self):
+        merged = self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        self.assertEqual([e.label for e in merged.exclusions], ["baseline_lactate"])
+        self.assertEqual(len(merged.estimand_choices), 1)
+
+        path = Path(self.temp.name) / "reviewers" / "dr_chen" / "memory.json"
+        self.assertTrue(path.is_file())
+        self.assertEqual(self.manager.reviewer_memory("Dr. Chen"), merged)
+
+    def test_remember_is_idempotent_for_the_same_study(self):
+        self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        second = self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        self.assertEqual([e.label for e in second.exclusions], ["baseline_lactate"])
+        self.assertEqual(len(second.estimand_choices), 1)
+
+    def test_remember_does_not_touch_the_run(self):
+        before = self.manager.load(self.run_id)
+        self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        after = self.manager.load(self.run_id)
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertFalse((self.run_dir / "decision_memory.json").exists())
+
+    def test_empty_reviewer_name_raises(self):
+        with self.assertRaises(ValueError):
+            self.manager.remember_run_for_reviewer(self.run_id, "   ")
 
 
 def _synthetic_cohort_csv(n: int = 300, seed: int = 11) -> str:

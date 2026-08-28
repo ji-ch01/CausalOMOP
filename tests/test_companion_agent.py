@@ -23,6 +23,7 @@ from causal.companion.companion import (
     parse_results_companion_turn,
 )
 from causal.companion.decision_memory import DecisionMemory, RejectedCovariate
+from causal.companion.reviewer_memory import ReviewerMemory, RememberedExclusion
 
 _PLACEHOLDERS = (
     "{{CONVERSATION}}",
@@ -30,6 +31,7 @@ _PLACEHOLDERS = (
     "{{ADJUSTMENT_SET}}",
     "{{CENSORING_DEFINITION_APPROVED}}",
     "{{DECISION_MEMORY}}",
+    "{{REVIEWER_MEMORY}}",
     "{{CURRENT_SETTINGS}}",
     "{{FEASIBILITY_SUMMARY}}",
     "{{FOLLOWUP_AUDIT_SUMMARY}}",
@@ -72,6 +74,7 @@ class BuildEstimandDialoguePromptTests(unittest.TestCase):
             "ADJ: {{ADJUSTMENT_SET}}\n"
             "CENSOR_OK: {{CENSORING_DEFINITION_APPROVED}}\n"
             "DECISIONS: {{DECISION_MEMORY}}\n"
+            "CONVENTIONS: {{REVIEWER_MEMORY}}\n"
             "SETTINGS: {{CURRENT_SETTINGS}}\n"
             "FEAS: {{FEASIBILITY_SUMMARY}}\n"
             "FOLLOWUP: {{FOLLOWUP_AUDIT_SUMMARY}}\n"
@@ -146,6 +149,29 @@ class BuildEstimandDialoguePromptTests(unittest.TestCase):
             self.template, history=[], context=self._context()
         )
         self.assertIn("No reviewer decisions have been recorded", prompt)
+
+    def test_reviewer_memory_renders_cross_study_conventions(self):
+        context = self._context(
+            reviewer_memory=ReviewerMemory(
+                reviewer_id="dr_chen",
+                exclusions=(
+                    RememberedExclusion(
+                        "baseline_lactate", "post-treatment", "aspirin_ami",
+                        "2026-08-01T00:00:00+00:00",
+                    ),
+                ),
+            )
+        )
+        prompt = build_estimand_dialogue_prompt(self.template, history=[], context=context)
+        self.assertIn("CONVENTIONS:", prompt)
+        self.assertIn("excluded in earlier studies", prompt)
+        self.assertIn("aspirin_ami", prompt)
+
+    def test_reviewer_memory_defaults_to_the_empty_sentence(self):
+        prompt = build_estimand_dialogue_prompt(
+            self.template, history=[], context=self._context()
+        )
+        self.assertIn("No cross-study conventions recorded", prompt)
 
     def test_censoring_definition_flag_renders_yes_no(self):
         yes = build_estimand_dialogue_prompt(

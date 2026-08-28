@@ -62,6 +62,11 @@ from causal.companion.companion import (
     parse_results_companion_turn,
 )
 from causal.companion.decision_memory import DecisionMemory, distill_decision_memory
+from causal.companion.reviewer_memory import (
+    ReviewerMemory,
+    merge_run_into_memory,
+    slugify_reviewer,
+)
 from causal.llm.base import LLMCallable
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
@@ -4523,12 +4528,18 @@ class WorkflowManager:
         llm: LLMCallable,
         history: Sequence[CompanionMessage],
         *,
+        reviewer: str | None = None,
         prompt_path: Path = DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
     ) -> CompanionTurn:
         """One turn of the conversational assist at the `statistical_estimand`
         gate (`causal.companion.companion`). Owns the `llm(prompt)` call and
         the JSON-artifact reads; the pure prompt-build/parse lives in the
         companion module, matching `propose_estimation_procedure` above.
+
+        When `reviewer` is given, that reviewer's cross-study memory
+        (`causal.companion.reviewer_memory`) is loaded read-only and added to
+        the prompt as advisory context -- their prior exclusions and estimand
+        choices, never a decision already made here.
 
         Read-only with respect to run state: it takes no `_RunLock`, records
         nothing in `state.history`, and writes no file. The conversation
@@ -4568,6 +4579,7 @@ class WorkflowManager:
                 (query_settings or {}).get("censoring_definition_approved", False)
             ),
             decision_memory=self._decision_memory(state, protocol),
+            reviewer_memory=self.reviewer_memory(reviewer) if reviewer else ReviewerMemory(),
         )
         prompt = build_estimand_dialogue_prompt(prompt_path, history=history, context=context)
         return parse_companion_turn(llm(prompt))
@@ -4610,6 +4622,56 @@ class WorkflowManager:
             },
             rejected_covariates=protocol.get("rejected_covariates") or [],
         )
+
+    @property
+    def _reviewers_dir(self) -> Path:
+        return self.runs_dir.parent / "reviewers"
+
+    def reviewer_memory(self, reviewer: str) -> ReviewerMemory:
+        """This reviewer's cross-study memory
+        (`causal.companion.reviewer_memory`), or an empty one if they have
+        never saved anything. Read-only; safe from a render path."""
+        path = self._reviewers_dir / slugify_reviewer(reviewer) / "memory.json"
+        if not path.is_file():
+            return ReviewerMemory(reviewer_id=slugify_reviewer(reviewer))
+        return ReviewerMemory.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def remember_run_for_reviewer(self, run_id: str, reviewer: str) -> ReviewerMemory:
+        """Fold this run's decisions (excluded covariates, the settled
+        statistical-estimand strategy) into `reviewer`'s cross-study memory.
+
+        Opt-in: nothing calls this automatically. Idempotent -- re-running it
+        for the same study replaces that study's entries rather than
+        appending (`merge_run_into_memory`). Writes only
+        `artifacts/reviewers/<slug>/memory.json`; the run itself is untouched
+        (no lock on the run, no `state.history` entry).
+        """
+        slug = slugify_reviewer(reviewer)
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol = self._read_optional_json(run_dir / "protocol.json")
+        decision_memory = self._decision_memory(state, protocol)
+
+        reviewer_dir = self._reviewers_dir / slug
+        reviewer_dir.mkdir(parents=True, exist_ok=True)
+        with _RunLock(reviewer_dir):
+            current = self.reviewer_memory(reviewer)
+            merged = merge_run_into_memory(
+                current,
+                study_id=state.study_id,
+                decision_memory=decision_memory,
+                estimand_settings=protocol.get("statistical_estimand_settings") or {},
+            )
+            merged = ReviewerMemory(
+                reviewer_id=slug,
+                exclusions=merged.exclusions,
+                estimand_choices=merged.estimand_choices,
+                updated_at=merged.updated_at,
+            )
+            temporary = (reviewer_dir / "memory.json").with_suffix(".tmp")
+            temporary.write_text(json.dumps(merged.to_dict(), indent=2), encoding="utf-8")
+            temporary.replace(reviewer_dir / "memory.json")
+        return merged
 
     def set_cate_cutpoint(self, run_id: str, covariate_name: str, cutpoint: float, reviewer: str) -> RunState:
         """Record a reviewer-entered cutpoint for splitting a continuous

@@ -69,6 +69,10 @@ deliberate. Otherwise choose between:
   covariate, and do not quietly re-open a settled choice. If the reviewer now
   asks for something that contradicts a recorded decision, name that decision
   and ask them to confirm they want to change it before you act on it.
+- REVIEWER CONVENTIONS below is context from this reviewer's earlier studies,
+  not decisions made here. Use it to stay consistent -- if this study's numbers
+  point somewhere that contradicts their usual choice, say so plainly -- but
+  never present a past choice as though it has already been made for this study.
 - Move through the choices in order (missing data, censoring, estimator). Ask
   the reviewer before moving on. Answer their "what if" questions about a
   choice before they commit to it.
@@ -114,6 +118,9 @@ CENSORED COLUMN APPROVED: {{CENSORING_DEFINITION_APPROVED}}
 
 PRIOR DECISIONS (what the reviewer has already ruled on this run):
 {{DECISION_MEMORY}}
+
+REVIEWER CONVENTIONS (from this reviewer's earlier studies -- advisory only):
+{{REVIEWER_MEMORY}}
 
 CURRENTLY SAVED STRATEGY (may be re-set):
 {{CURRENT_SETTINGS}}

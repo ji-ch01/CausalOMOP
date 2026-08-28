@@ -44,6 +44,7 @@ from causal.agents.results_narrative import (
 )
 from causal.companion.actions import ProposedAction, validate_proposed_action
 from causal.companion.decision_memory import DecisionMemory
+from causal.companion.reviewer_memory import ReviewerMemory
 
 DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH = Path("causal/prompts/estimand_dialogue.md")
 DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH = Path("causal/prompts/results_dialogue.md")
@@ -89,6 +90,10 @@ class EstimandDialogueContext:
     #: (`causal.companion.decision_memory`) -- excluded covariates and settled
     #: choices the companion must not silently re-propose.
     decision_memory: DecisionMemory = field(default_factory=DecisionMemory)
+    #: The reviewer's conventions across earlier studies
+    #: (`causal.companion.reviewer_memory`) -- advisory only, empty unless a
+    #: reviewer id was passed to `run_companion_turn`.
+    reviewer_memory: ReviewerMemory = field(default_factory=ReviewerMemory)
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,7 @@ def build_estimand_dialogue_prompt(
         "{{ADJUSTMENT_SET}}": _adjustment_set(context.cohort_manifest),
         "{{CENSORING_DEFINITION_APPROVED}}": "yes" if context.censoring_definition_approved else "no",
         "{{DECISION_MEMORY}}": context.decision_memory.format_for_prompt(),
+        "{{REVIEWER_MEMORY}}": context.reviewer_memory.format_for_prompt(),
         "{{CURRENT_SETTINGS}}": (
             json.dumps(context.current_settings, indent=2)
             if context.current_settings
