@@ -3515,6 +3515,33 @@ class WorkflowCausalReportTests(WorkflowRunEstimationTests):
         self.assertIn("| sensitivity_analysis.json | sensitivity_agent |", text)
         self.assertIn("| cate.json | cate_agent |", text)
 
+    def test_report_snapshots_the_decision_memory(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "baseline_lactate", "reviewer": "Dr. Chen",
+             "comment": "post-treatment", "decided_at": "2026-08-20T09:00:00+00:00"}
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+        self.manager.advance(self.run_id)
+        self.manager.advance(self.run_id)
+
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("## Reviewer decisions", text)
+        self.assertIn("baseline_lactate", text)
+
+        snapshot_path = self.run_dir / "decision_memory.json"
+        self.assertTrue(snapshot_path.is_file())
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [item["label"] for item in snapshot["rejected_covariates"]], ["baseline_lactate"]
+        )
+        self.assertEqual(snapshot["metadata"]["agent_name"], "decision_memory")
+        state = self.manager.load(self.run_id)
+        self.assertIn("decision_memory.json", state.artifacts)
+        self.assertIn("| decision_memory.json | decision_memory |", text)
+
 
 class WorkflowCausalReportWithoutEstimateTests(WorkflowMaterializeAnalyticDatasetTests):
     """A report built before `run_estimation` ever runs (e.g. a legacy run,

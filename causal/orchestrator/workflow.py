@@ -3911,6 +3911,7 @@ class WorkflowManager:
         if state.phase not in {"results_review", "report"}:
             raise RuntimeError("Causal report requires the results_review or report phase")
         run_dir = self.runs_dir / run_id
+        protocol = self._read_optional_json(run_dir / "protocol.json")
         study_spec = self._read_optional_json(run_dir / "study_specification.json")
         statistical_estimand = self._read_optional_json(run_dir / "statistical_estimand.json")
         dataset_manifest = self._read_optional_json(run_dir / "dataset_manifest.json")
@@ -4166,6 +4167,29 @@ class WorkflowManager:
                 f"| {gate.name} | {gate.status} | {gate.reviewer or '-'} | {gate.decided_at or '-'} |"
             )
 
+        decision_memory = self._decision_memory(state, protocol or {})
+        (run_dir / "decision_memory.json").write_text(
+            json.dumps(
+                {
+                    **decision_memory.to_dict(),
+                    "metadata": artifact_metadata(
+                        "decision_memory", "1.0", {"study_id": state.study_id}
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        lines.extend([
+            "", "## Reviewer decisions", "",
+            "> A deterministic digest (no LLM) of the covariate exclusions and settled choices "
+            "distilled from the audit trail and the rejected gates -- the context the estimand-"
+            "dialogue companion is given so it does not re-propose a ruled-out option. Snapshot "
+            "written as `decision_memory.json`.",
+            "",
+            decision_memory.format_for_prompt(),
+        ])
+
         lines.extend(["", "## Audit trail", "", "| At | Event | Detail |", "|---|---|---|"])
         for entry in state.history:
             lines.append(f"| {entry['at']} | {entry['event']} | {entry['detail']} |")
@@ -4174,7 +4198,7 @@ class WorkflowManager:
         for name in (
             "hypothesis.json", "study_specification.json", "statistical_estimand.json",
             "cohort_manifest.json", "dataset_manifest.json", "estimation.json", "diagnostics.json",
-            "sensitivity_analysis.json", "cate.json", "results_narrative.json",
+            "sensitivity_analysis.json", "cate.json", "results_narrative.json", "decision_memory.json",
         ):
             payload = self._read_optional_json(run_dir / name)
             metadata = payload.get("metadata") if payload else None
@@ -4212,8 +4236,9 @@ class WorkflowManager:
         report_path.write_text("\n".join(lines), encoding="utf-8")
         with _RunLock(run_dir):
             state = self.load(run_id)
-            if "causal_report.md" not in state.artifacts:
-                state.artifacts.append("causal_report.md")
+            for artifact_name in ("causal_report.md", "decision_memory.json"):
+                if artifact_name not in state.artifacts:
+                    state.artifacts.append(artifact_name)
             state.record("causal_report_generated", "causal_report.md")
             self.save(state)
         return report_path
