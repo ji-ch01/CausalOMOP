@@ -32,6 +32,15 @@ The Streamlit UI runs this intake as a conversation panel
 `MAX_CLARIFICATION_ROUNDS`), and the whole exchange is persisted to the run's
 `conversation.jsonl` -- a record, not an approval path.
 
+Descriptive follow-ups also carry context. When earlier FastOMOP exchanges
+are in the thread, the last `MAX_DESCRIPTIVE_CONTEXT` `(question, answer)`
+pairs are folded in (`combine_descriptive_followup`) so a terse follow-up
+like "and how many were women?" is self-contained -- the gate classifies it,
+and FastOMOP answers it, against that context. The context reaches only the
+gate and the FastOMOP call, never the causal drafting step (a target trial
+is always drafted from the clean question). This is a bounded in-session
+window, not a persisted store.
+
 ## Evidence retrieval and citation checks
 
 The first draft supplies short clinical search terms. Deterministic code builds
