@@ -11,12 +11,14 @@ from unittest import mock
 
 from causal.agents.user_question import UserQuestionHypothesisService
 from causal.companion.intake import (
+    MAX_DESCRIPTIVE_CONTEXT,
     ClarificationNeeded,
     DescriptiveAnswer,
     DraftOptions,
     QuestionIntake,
     StudyDrafted,
     combine_clarifications,
+    combine_descriptive_followup,
 )
 from causal.fastomop_bridge import FastOMOPAnswer
 from causal.llm import ResolvedLLM
@@ -130,6 +132,31 @@ class QuestionIntakeTests(unittest.TestCase):
         self.assertEqual(outcome.sql, "SELECT COUNT(*) FROM person")
         self.assertFalse(self.runs_dir.exists() and any(self.runs_dir.iterdir()))
 
+    def test_descriptive_context_reaches_the_gate_and_fastomop(self):
+        intake, llm = self._intake(
+            {"category": "descriptive", "reasoning": "count, resolved against context"}
+        )
+        fake_answer = FastOMOPAnswer(answer="1,832 women", sql_query="SELECT ...")
+        with mock.patch("causal.companion.intake.ask_fastomop", return_value=fake_answer) as ask:
+            outcome = intake.run(
+                "and how many were women?",
+                descriptive_context=[("How many sepsis patients are there?", "4,210 patients")],
+            )
+        self.assertIsInstance(outcome, DescriptiveAnswer)
+        gate_prompt = next(p for p in llm.prompts if p.startswith(_GATE_MARKER))
+        self.assertIn("4,210 patients", gate_prompt)
+        self.assertIn("and how many were women?", gate_prompt)
+        asked = ask.call_args.args[0]
+        self.assertIn("How many sepsis patients are there?", asked)
+        self.assertIn("and how many were women?", asked)
+
+    def test_descriptive_context_is_not_passed_to_the_causal_drafting_call(self):
+        intake, llm = self._intake({"category": "causal", "reasoning": "clear intervention"})
+        intake.run(QUESTION, descriptive_context=[("How many patients?", "4,210")])
+        draft_prompts = [p for p in llm.prompts if not p.startswith(_GATE_MARKER)]
+        self.assertTrue(draft_prompts)
+        self.assertFalse(any("4,210" in p for p in draft_prompts))
+
     def test_needs_clarification_returns_the_clarifying_question_without_a_run(self):
         intake, _ = self._intake(
             {
@@ -209,6 +236,35 @@ class CombineClarificationsTests(unittest.TestCase):
         )
         self.assertLess(combined.index("Clarification 1"), combined.index("Clarification 2"))
         self.assertIn("A: ICU adults", combined)
+
+
+class CombineDescriptiveFollowupTests(unittest.TestCase):
+    def test_no_context_returns_the_stripped_question(self):
+        self.assertEqual(combine_descriptive_followup("  how many?  ", []), "how many?")
+
+    def test_blank_pairs_are_ignored(self):
+        self.assertEqual(
+            combine_descriptive_followup("q", [("", "42"), ("  ", ""), ("real?", "  ")]),
+            "q",
+        )
+
+    def test_context_is_prefixed_with_numbered_q_and_a(self):
+        combined = combine_descriptive_followup(
+            "and how many were women?",
+            [("How many sepsis patients?", "4,210"), ("How many in the ICU?", "3,001")],
+        )
+        self.assertIn("Q1: How many sepsis patients?", combined)
+        self.assertIn("A1: 4,210", combined)
+        self.assertIn("Q2: How many in the ICU?", combined)
+        self.assertLess(combined.index("Q1:"), combined.index("Q2:"))
+        self.assertTrue(combined.rstrip().endswith("and how many were women?"))
+
+    def test_context_is_capped_at_the_window_size(self):
+        pairs = [(f"q{i}", f"a{i}") for i in range(MAX_DESCRIPTIVE_CONTEXT + 3)]
+        combined = combine_descriptive_followup("follow-up", pairs)
+        self.assertNotIn("q0", combined)
+        self.assertIn(f"q{MAX_DESCRIPTIVE_CONTEXT + 2}", combined)
+        self.assertEqual(combined.count("\nQ"), MAX_DESCRIPTIVE_CONTEXT)
 
 
 if __name__ == "__main__":

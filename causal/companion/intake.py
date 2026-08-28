@@ -48,9 +48,19 @@ if TYPE_CHECKING:
 #: the assistant asked, and the reviewer's reply.
 ClarificationRound = tuple[str, str]
 
+#: One earlier answered descriptive question and FastOMOP's answer, replayed
+#: as context so a terse follow-up ("and how many were women?") is
+#: self-contained.
+DescriptiveExchange = tuple[str, str]
+
 #: How many times the reviewer may answer a clarifying question before the
 #: panel stops re-gating and asks them to rephrase (or force the causal path).
 MAX_CLARIFICATION_ROUNDS = 4
+
+#: How many prior descriptive exchanges to replay to the gate and FastOMOP
+#: for a follow-up. Bounded -- the point is "who is *them*", not a full
+#: session history.
+MAX_DESCRIPTIVE_CONTEXT = 3
 
 
 @dataclass(frozen=True)
@@ -118,11 +128,19 @@ class QuestionIntake:
         question: str,
         options: DraftOptions | None = None,
         *,
+        descriptive_context: Sequence[DescriptiveExchange] = (),
         on_llm_output: LLMOutputCallback | None = None,
         on_stage: Callable[[str], None] | None = None,
         on_gate_result: Callable[[QuestionGateResult], None] | None = None,
     ) -> IntakeOutcome:
         """Classify `question` and act on the classification.
+
+        `descriptive_context` is recent answered FastOMOP exchanges from the
+        same session, most recent last. When present, they are folded in
+        (`combine_descriptive_followup`) so both the gate and FastOMOP see a
+        terse follow-up ("and how many were women?") in context. It is never
+        passed to the causal drafting call -- a target trial is drafted from
+        the clean question only.
 
         `on_gate_result` fires once with the parsed gate verdict (for every
         category) before the outcome is produced, so a caller can show the
@@ -137,6 +155,8 @@ class QuestionIntake:
         if not question:
             raise ValueError("Clinical question is required")
 
+        contextual_question = combine_descriptive_followup(question, descriptive_context)
+
         def _stage(message: str) -> None:
             if on_stage is not None:
                 on_stage(message)
@@ -144,13 +164,13 @@ class QuestionIntake:
         if not options.skip_question_gate:
             _stage("Classifying the question (causal / descriptive / needs clarification)...")
             gate_result = parse_gate_response(
-                self.resolved_llm.call(build_gate_prompt(self.gate_prompt_path, question))
+                self.resolved_llm.call(build_gate_prompt(self.gate_prompt_path, contextual_question))
             )
             if on_gate_result is not None:
                 on_gate_result(gate_result)
             if gate_result.category == "descriptive":
                 _stage("Descriptive question -- routing to FastOMOP...")
-                answer = ask_fastomop(question, datasets=self.datasets)
+                answer = ask_fastomop(contextual_question, datasets=self.datasets)
                 return DescriptiveAnswer(
                     reasoning=gate_result.reasoning,
                     answer=answer.answer,
@@ -202,3 +222,31 @@ def combine_clarifications(original_question: str, rounds: Sequence[Clarificatio
             f"\nA: {answer.strip()}"
         )
     return combined
+
+
+def combine_descriptive_followup(
+    question: str, prior_exchanges: Sequence[DescriptiveExchange]
+) -> str:
+    """Prefix recent answered FastOMOP exchanges so a follow-up is
+    self-contained.
+
+    `prior_exchanges` is `(question, answer)` pairs, oldest first; only the
+    last `MAX_DESCRIPTIVE_CONTEXT` are kept. Empty or all-blank input returns
+    the question stripped and unchanged, so a first question never carries a
+    context header. The result is used for the gate and the FastOMOP call
+    only -- never the causal drafting path.
+    """
+    usable = [
+        (q.strip(), a.strip())
+        for q, a in prior_exchanges
+        if q and q.strip() and a and a.strip()
+    ][-MAX_DESCRIPTIVE_CONTEXT:]
+    if not usable:
+        return question.strip()
+    lines = ["Earlier descriptive questions I asked in this session, with FastOMOP's answers:"]
+    for index, (prior_question, prior_answer) in enumerate(usable, start=1):
+        lines.append(f"Q{index}: {prior_question}")
+        lines.append(f"A{index}: {prior_answer}")
+    lines.append("")
+    lines.append(f"Answer only this follow-up question, resolving any references to the above: {question.strip()}")
+    return "\n".join(lines)
