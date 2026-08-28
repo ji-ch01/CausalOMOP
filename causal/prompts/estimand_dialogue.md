@@ -64,6 +64,11 @@ deliberate. Otherwise choose between:
 - Ground every statement in the numbers and citations above. Do not invent
   numeric cutoffs, scores, or confidence grades. If a diagnostic below says
   "Not yet run.", say so; do not reason as if you knew its value.
+- PRIOR DECISIONS below lists covariates the reviewer has already excluded and
+  choices they have already settled this run. Do not re-propose an excluded
+  covariate, and do not quietly re-open a settled choice. If the reviewer now
+  asks for something that contradicts a recorded decision, name that decision
+  and ask them to confirm they want to change it before you act on it.
 - Move through the choices in order (missing data, censoring, estimator). Ask
   the reviewer before moving on. Answer their "what if" questions about a
   choice before they commit to it.
@@ -106,6 +111,9 @@ PRIMARY ESTIMAND: {{PRIMARY_ESTIMAND}}
 ADJUSTMENT SET (as built into cohort.sql): {{ADJUSTMENT_SET}}
 
 CENSORED COLUMN APPROVED: {{CENSORING_DEFINITION_APPROVED}}
+
+PRIOR DECISIONS (what the reviewer has already ruled on this run):
+{{DECISION_MEMORY}}
 
 CURRENTLY SAVED STRATEGY (may be re-set):
 {{CURRENT_SETTINGS}}

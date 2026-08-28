@@ -43,6 +43,7 @@ from causal.agents.results_narrative import (
     narrative_result_from_payload,
 )
 from causal.companion.actions import ProposedAction, validate_proposed_action
+from causal.companion.decision_memory import DecisionMemory
 
 DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH = Path("causal/prompts/estimand_dialogue.md")
 DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH = Path("causal/prompts/results_dialogue.md")
@@ -84,6 +85,10 @@ class EstimandDialogueContext:
     positivity_audit: dict[str, Any] = field(default_factory=dict)
     covariate_missingness: dict[str, Any] = field(default_factory=dict)
     censoring_definition_approved: bool = False
+    #: What the reviewer has already ruled on this run
+    #: (`causal.companion.decision_memory`) -- excluded covariates and settled
+    #: choices the companion must not silently re-propose.
+    decision_memory: DecisionMemory = field(default_factory=DecisionMemory)
 
 
 @dataclass(frozen=True)
@@ -146,6 +151,7 @@ def build_estimand_dialogue_prompt(
         "{{PRIMARY_ESTIMAND}}": _primary_estimand(context.study_specification),
         "{{ADJUSTMENT_SET}}": _adjustment_set(context.cohort_manifest),
         "{{CENSORING_DEFINITION_APPROVED}}": "yes" if context.censoring_definition_approved else "no",
+        "{{DECISION_MEMORY}}": context.decision_memory.format_for_prompt(),
         "{{CURRENT_SETTINGS}}": (
             json.dumps(context.current_settings, indent=2)
             if context.current_settings

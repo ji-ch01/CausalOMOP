@@ -22,12 +22,14 @@ from causal.companion.companion import (
     parse_companion_turn,
     parse_results_companion_turn,
 )
+from causal.companion.decision_memory import DecisionMemory, RejectedCovariate
 
 _PLACEHOLDERS = (
     "{{CONVERSATION}}",
     "{{PRIMARY_ESTIMAND}}",
     "{{ADJUSTMENT_SET}}",
     "{{CENSORING_DEFINITION_APPROVED}}",
+    "{{DECISION_MEMORY}}",
     "{{CURRENT_SETTINGS}}",
     "{{FEASIBILITY_SUMMARY}}",
     "{{FOLLOWUP_AUDIT_SUMMARY}}",
@@ -69,6 +71,7 @@ class BuildEstimandDialoguePromptTests(unittest.TestCase):
             "ESTIMAND: {{PRIMARY_ESTIMAND}}\n"
             "ADJ: {{ADJUSTMENT_SET}}\n"
             "CENSOR_OK: {{CENSORING_DEFINITION_APPROVED}}\n"
+            "DECISIONS: {{DECISION_MEMORY}}\n"
             "SETTINGS: {{CURRENT_SETTINGS}}\n"
             "FEAS: {{FEASIBILITY_SUMMARY}}\n"
             "FOLLOWUP: {{FOLLOWUP_AUDIT_SUMMARY}}\n"
@@ -122,6 +125,27 @@ class BuildEstimandDialoguePromptTests(unittest.TestCase):
         prompt = build_estimand_dialogue_prompt(self.template, history=[], context=context)
         self.assertIn("FEAS: Not yet run.", prompt)
         self.assertIn('"censored": 41', prompt)
+
+    def test_decision_memory_renders_excluded_covariates(self):
+        context = self._context(
+            decision_memory=DecisionMemory(
+                rejected_covariates=(
+                    RejectedCovariate(
+                        "baseline_lactate", "Dr. Chen", "post-treatment", "2026-08-20T09:00:00+00:00"
+                    ),
+                )
+            )
+        )
+        prompt = build_estimand_dialogue_prompt(self.template, history=[], context=context)
+        self.assertIn("DECISIONS:", prompt)
+        self.assertIn("baseline_lactate", prompt)
+        self.assertIn("Covariates the reviewer has excluded:", prompt)
+
+    def test_decision_memory_defaults_to_the_empty_sentence(self):
+        prompt = build_estimand_dialogue_prompt(
+            self.template, history=[], context=self._context()
+        )
+        self.assertIn("No reviewer decisions have been recorded", prompt)
 
     def test_censoring_definition_flag_renders_yes_no(self):
         yes = build_estimand_dialogue_prompt(

@@ -61,6 +61,7 @@ from causal.companion.companion import (
     parse_companion_turn,
     parse_results_companion_turn,
 )
+from causal.companion.decision_memory import DecisionMemory, distill_decision_memory
 from causal.llm.base import LLMCallable
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
@@ -4541,9 +4542,49 @@ class WorkflowManager:
             censoring_definition_approved=bool(
                 (query_settings or {}).get("censoring_definition_approved", False)
             ),
+            decision_memory=self._decision_memory(state, protocol),
         )
         prompt = build_estimand_dialogue_prompt(prompt_path, history=history, context=context)
         return parse_companion_turn(llm(prompt))
+
+    def decision_memory(self, run_id: str) -> DecisionMemory:
+        """The reviewer-decision digest for a run
+        (`causal.companion.decision_memory`) -- what the estimand dialogue is
+        told the reviewer has already ruled on. Recomputed from `state.json`
+        and `protocol.json` on every call; never cached and never written, so
+        it is safe to call from a render path.
+        """
+        state = self.load(run_id)
+        protocol_path = self.runs_dir / run_id / "protocol.json"
+        protocol = (
+            json.loads(protocol_path.read_text(encoding="utf-8"))
+            if protocol_path.is_file()
+            else {}
+        )
+        return self._decision_memory(state, protocol)
+
+    def _decision_memory(self, state: RunState, protocol: dict[str, Any]) -> DecisionMemory:
+        """Distil what the reviewer has already ruled on for this run
+        (`causal.companion.decision_memory`) so a companion turn can be told
+        not to re-propose an excluded covariate or re-open a settled choice.
+
+        Pure derivation from `state.history`, the decided gates, and
+        `protocol.json`'s `rejected_covariates` -- reads nothing new from
+        disk and writes nothing, so a companion turn stays read-only.
+        """
+        return distill_decision_memory(
+            history=state.history,
+            gates={
+                name: {
+                    "status": gate.status,
+                    "reviewer": gate.reviewer,
+                    "comment": gate.comment,
+                    "decided_at": gate.decided_at,
+                }
+                for name, gate in state.gates.items()
+            },
+            rejected_covariates=protocol.get("rejected_covariates") or [],
+        )
 
     def set_cate_cutpoint(self, run_id: str, covariate_name: str, cutpoint: float, reviewer: str) -> RunState:
         """Record a reviewer-entered cutpoint for splitting a continuous

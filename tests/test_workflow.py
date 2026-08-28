@@ -2915,6 +2915,45 @@ class WorkflowRunCompanionTurnTests(unittest.TestCase):
             json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8")),
         )
 
+    def test_prompt_carries_the_decision_memory(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {
+                "label": "baseline_lactate",
+                "reviewer": "Dr. Chen",
+                "comment": "measured after the exposure; post-treatment",
+                "decided_at": "2026-08-20T09:00:00+00:00",
+            }
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+
+        llm = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(self.run_id, llm, [])
+        prompt = llm.prompts[0]
+        self.assertIn("PRIOR DECISIONS", prompt)
+        self.assertIn("baseline_lactate", prompt)
+        # a covariate review the fixture recorded on the way to estimand_review
+        self.assertIn("SOFA score", prompt)
+
+    def test_decision_memory_read_helper_is_pure(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "baseline_lactate", "reviewer": "Dr. Chen", "comment": "post-treatment",
+             "decided_at": "2026-08-20T09:00:00+00:00"}
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+
+        before = self.manager.load(self.run_id)
+        memory = self.manager.decision_memory(self.run_id)
+        after = self.manager.load(self.run_id)
+
+        self.assertEqual([item.label for item in memory.rejected_covariates], ["baseline_lactate"])
+        self.assertTrue(memory.decisions)  # covariate reviews from the fixture
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertFalse((self.run_dir / "decision_memory.json").exists())
+
     def test_rejects_the_wrong_phase(self):
         state = self.manager.load(self.run_id)
         state.phase = "execution"
