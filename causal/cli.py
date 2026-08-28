@@ -371,6 +371,18 @@ def main() -> int:
     )
     workflow_decision_memory.add_argument("run_id")
     workflow_decision_memory.add_argument("--json", action="store_true")
+    workflow_reviewer_memory = workflow_sub.add_parser(
+        "reviewer-memory",
+        help="show a reviewer's opt-in cross-study memory (prior exclusions and estimand choices)",
+    )
+    workflow_reviewer_memory.add_argument("reviewer")
+    workflow_reviewer_memory.add_argument("--json", action="store_true")
+    workflow_remember_run = workflow_sub.add_parser(
+        "remember-run",
+        help="fold this run's decisions into a reviewer's cross-study memory (opt-in)",
+    )
+    workflow_remember_run.add_argument("run_id")
+    workflow_remember_run.add_argument("--reviewer", required=True)
     workflow_narrative = workflow_sub.add_parser(
         "narrative",
         help="optional LLM interpretation of an already-computed estimate (advisory only)",
@@ -655,6 +667,14 @@ def main() -> int:
         elif args.workflow_command == "decision-memory":
             memory = manager.decision_memory(args.run_id)
             print(json.dumps(memory.to_dict(), indent=2) if args.json else memory.format_for_prompt())
+            return 0
+        elif args.workflow_command == "reviewer-memory":
+            memory = manager.reviewer_memory(args.reviewer)
+            print(json.dumps(memory.to_dict(), indent=2) if args.json else memory.format_for_prompt())
+            return 0
+        elif args.workflow_command == "remember-run":
+            memory = manager.remember_run_for_reviewer(args.run_id, args.reviewer)
+            print(json.dumps(memory.to_dict(), indent=2))
             return 0
         elif args.workflow_command == "narrative":
             resolved_llm = build_hypothesis_llm(model=args.model)
