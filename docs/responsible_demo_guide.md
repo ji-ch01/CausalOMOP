@@ -178,6 +178,18 @@ manual action, and the "Fill the form directly" expander is the same call
 without the dialogue. The companion is fed only JSON artifacts, never
 `analytic_dataset.parquet`.
 
+Each turn also carries a **decision memory**
+(`causal.companion.decision_memory`): a deterministic, no-LLM digest of the
+covariates the reviewer already excluded (`protocol.json`'s
+`rejected_covariates`) and the choices already recorded this run (decision
+entries in `state.json`'s history, gate invalidations, and any rejected
+gate with its review comment). The prompt tells the companion not to
+re-propose an excluded covariate or quietly re-open a settled choice. It is
+derived from state the turn already loads, so `run_companion_turn` still
+writes nothing; `python -m causal.cli workflow decision-memory <run_id>`
+prints the same digest, and `causal-report` freezes it as a
+`decision_memory.json` snapshot.
+
 ## Estimation and the causal report
 
 Only once `clinical_mapping`, `analysis_plan`, and `statistical_estimand` are

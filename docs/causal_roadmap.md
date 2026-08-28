@@ -104,6 +104,15 @@ reviewable graphs.
   (`save_results_narrative_draft`), which then goes through the same
   deterministic `verify_narrative` and the same human
   `review_results_narrative` approval as a one-shot narrative.
+- The estimand companion is additionally fed a **decision memory**
+  (`causal.companion.decision_memory`): a deterministic, no-LLM digest of the
+  reviewer's already-recorded exclusions (`protocol.json`'s
+  `rejected_covariates`) and decisions (`state.history` entries, gate
+  invalidations, and any rejected gate with its comment), so it will not
+  re-propose a covariate the reviewer threw out or re-open a settled choice.
+  It changes what the companion is told, never what it can do.
+  `build_causal_report` freezes it as a `decision_memory.json` snapshot and
+  lists it in the report's Provenance table.
 - PubMed and OpenAlex provide literature records; OptimusKG is an optional
   relation source. Retrieved identifiers form a deterministic allow-list for
   citations emitted by the model.

@@ -208,7 +208,13 @@ is answerable over multiple rounds and the exchange is persisted per run as
 left panel becomes an active dialogue at the two points a run most needs
 one -- the `statistical_estimand` gate (estimand dialogue) and results
 review (results-interpretation dialogue) -- each a read-only companion turn
-whose only outcome is a human-confirmed card.
+whose only outcome is a human-confirmed card. The estimand dialogue also
+gets a deterministic **decision memory**
+(`causal/companion/decision_memory.py`) -- the reviewer's already-recorded
+covariate exclusions and decisions, distilled with no LLM -- so it does not
+re-propose something the reviewer already ruled out. Inspect it with
+`workflow decision-memory <run_id>`; `causal-report` freezes it as
+`decision_memory.json`.
 
 ## Important implementation boundary
 

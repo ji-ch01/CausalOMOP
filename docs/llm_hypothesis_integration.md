@@ -117,7 +117,7 @@ the question gate and the results narrative:
 conversation so far + JSON-safe run artifacts (study_specification.json,
   cohort_manifest.json adjustment set, feasibility / follow-up / positivity /
   covariate-missingness counts, whether the per-row censored column is
-  approved) -- never analytic_dataset.parquet
+  approved) + the decision memory (see below) -- never analytic_dataset.parquet
   -> estimand_dialogue prompt
   -> strict-JSON response: { reply, proposed_action | null }
   -> causal.companion.actions.validate_proposed_action
@@ -140,6 +140,33 @@ To exercise this panel without a working OMCP/BigQuery stack,
 `python scripts/stage_demo_run.py --to estimand_review` stages a fully
 synthetic run (auto-approved gates, fabricated cohort) straight into the
 phase and prints its run id for the Streamlit sidebar.
+
+### Decision memory
+
+A dialogue turn only replays the natural-language transcript, so on its own
+the companion has no memory of what the reviewer already *decided* and will
+re-propose a covariate they excluded. `causal.companion.decision_memory`
+closes that gap. `distill_decision_memory` is a pure, deterministic digest
+(no LLM, same spirit as `verify_narrative`) of:
+
+- `protocol.json`'s `rejected_covariates` -- the audited covariate exclusions
+  (this field already existed; nothing read it back before), and
+- the decision-shaped entries of `RunState.history` plus the decided
+  `ApprovalGate`s with their review comments,
+
+merged into one timeline and rendered into the prompt under `PRIOR
+DECISIONS`. The prompt instructs the companion not to re-propose an excluded
+covariate or silently re-open a settled choice. `WorkflowManager.
+_decision_memory` builds it from the `RunState`/`protocol.json` it already
+loads for the turn, so `run_companion_turn` stays read-only.
+
+From the gate objects only a `rejected` gate is replayed (a routine
+approval does not change how the companion should behave); gate
+*invalidations* come through the history stream. It is inspectable three
+ways: live in the Streamlit **Report & audit** tab, via `python -m
+causal.cli workflow decision-memory <run_id>` (`--json` for the raw
+object), and as a frozen `decision_memory.json` snapshot that
+`build_causal_report` writes and lists in the report's Provenance table.
 
 ## Results narrative (post-estimation interpretation)
 
