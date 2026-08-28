@@ -36,9 +36,11 @@ from causal.companion.companion import CompanionMessage
 from causal.companion.conversation import ConversationEntry, ConversationStore, flush_intake
 from causal.companion.intake import (
     MAX_CLARIFICATION_ROUNDS,
+    MAX_DESCRIPTIVE_CONTEXT,
     ClarificationNeeded,
     ClarificationRound,
     DescriptiveAnswer,
+    DescriptiveExchange,
     DraftOptions,
     QuestionIntake,
     StudyDrafted,
@@ -119,6 +121,29 @@ def appended_rounds(
 
 def clarification_exhausted(rounds: Sequence[ClarificationRound]) -> bool:
     return len(rounds) > MAX_CLARIFICATION_ROUNDS
+
+
+def prior_descriptive_exchanges(
+    entries: Sequence[ConversationEntry],
+) -> list[DescriptiveExchange]:
+    """The answered FastOMOP exchanges in the thread so far, oldest first,
+    as `(question, answer)` pairs -- the session window that lets a terse
+    follow-up be resolved (`combine_descriptive_followup`). The question is
+    read from the answer entry's `data["question"]`, falling back to the
+    most recent preceding `user` turn for entries written before that field
+    existed. Capped at `MAX_DESCRIPTIVE_CONTEXT`."""
+    exchanges: list[DescriptiveExchange] = []
+    last_user_text = ""
+    for entry in entries:
+        if entry.role == "user" and entry.text.strip():
+            last_user_text = entry.text.strip()
+        if entry.kind != "fastomop_answer":
+            continue
+        question = str(entry.data.get("question") or "").strip() or last_user_text
+        answer = entry.text.strip()
+        if question and answer:
+            exchanges.append((question, answer))
+    return exchanges[-MAX_DESCRIPTIVE_CONTEXT:]
 
 
 def reset_intake() -> None:
@@ -337,6 +362,7 @@ def _handle_submission(manager: WorkflowManager, text: str, form: Mapping[str, A
         outcome = intake.run(
             question,
             draft_options_from_form(form),
+            descriptive_context=prior_descriptive_exchanges(buffer),
             on_stage=status.write,
             on_llm_output=lambda output: status.write(f"Received `{output.stage}` from the LLM."),
             on_gate_result=lambda result: buffer.append(
@@ -383,7 +409,11 @@ def _apply_outcome(
                 role="assistant",
                 kind="fastomop_answer",
                 text=outcome.answer,
-                data={"sql": outcome.sql, "reasoning": outcome.reasoning},
+                data={
+                    "question": original_question,
+                    "sql": outcome.sql,
+                    "reasoning": outcome.reasoning,
+                },
             )
         )
         st.session_state.pop(_CLARIFICATION_KEY, None)

@@ -160,6 +160,48 @@ class ClarificationBookkeepingTests(unittest.TestCase):
         self.assertTrue(panel.clarification_exhausted([*at_cap, ("q", "a")]))
 
 
+class PriorDescriptiveExchangesTests(unittest.TestCase):
+    def test_empty_thread_yields_nothing(self):
+        self.assertEqual(panel.prior_descriptive_exchanges([]), [])
+
+    def test_pairs_each_answer_with_its_stored_question(self):
+        entries = [
+            ConversationEntry(role="user", kind="message", text="How many sepsis patients?"),
+            ConversationEntry(
+                role="assistant", kind="fastomop_answer", text="4,210",
+                data={"question": "How many sepsis patients?", "sql": "SELECT ..."},
+            ),
+        ]
+        self.assertEqual(
+            panel.prior_descriptive_exchanges(entries),
+            [("How many sepsis patients?", "4,210")],
+        )
+
+    def test_falls_back_to_the_preceding_user_turn_when_no_stored_question(self):
+        entries = [
+            ConversationEntry(role="user", kind="message", text="How many in the ICU?"),
+            ConversationEntry(role="assistant", kind="fastomop_answer", text="3,001", data={}),
+        ]
+        self.assertEqual(
+            panel.prior_descriptive_exchanges(entries), [("How many in the ICU?", "3,001")]
+        )
+
+    def test_non_fastomop_turns_are_skipped_and_window_is_capped(self):
+        entries = []
+        for i in range(5):
+            entries.append(ConversationEntry(role="user", kind="message", text=f"q{i}"))
+            entries.append(
+                ConversationEntry(
+                    role="assistant", kind="fastomop_answer", text=f"a{i}",
+                    data={"question": f"q{i}"},
+                )
+            )
+        entries.append(ConversationEntry(role="assistant", kind="message", text="not a count"))
+        exchanges = panel.prior_descriptive_exchanges(entries)
+        self.assertEqual(len(exchanges), panel.MAX_DESCRIPTIVE_CONTEXT)
+        self.assertEqual(exchanges[-1], ("q4", "a4"))
+
+
 class EstimandDialogueHistoryTests(unittest.TestCase):
     def test_keeps_only_estimand_phase_user_and_assistant_turns(self):
         entries = [
