@@ -3086,6 +3086,55 @@ def _render_decision_memory(manager: WorkflowManager, run_id: str) -> None:
         st.code(memory.format_for_prompt(), language="text")
 
 
+def _render_reviewer_memory(manager: WorkflowManager, run_id: str) -> None:
+    """The opt-in cross-study memory (`causal.companion.reviewer_memory`) for
+    the reviewer named in the sidebar: what it currently holds, and a button
+    to fold this run's decisions into it. Advisory only -- it feeds the
+    estimand dialogue prompt, never a gate."""
+    reviewer = (st.session_state.get("reviewer_name") or "").strip()
+    st.subheader("Reviewer memory")
+    if not reviewer:
+        st.caption("Enter your name in the sidebar to see or update your cross-study memory.")
+        return
+    st.caption(
+        f"Conventions carried across studies for **{reviewer}** -- prior covariate exclusions "
+        "and estimand strategies, shown to the estimand dialogue as advisory context. Opt-in."
+    )
+    if st.button("Add this run's decisions to my reviewer memory", key=f"remember_run_{run_id}"):
+        manager.remember_run_for_reviewer(run_id, reviewer)
+        st.rerun()
+
+    memory = manager.reviewer_memory(reviewer)
+    if memory.is_empty():
+        st.caption("Nothing recorded yet.")
+        return
+    if memory.exclusions:
+        st.markdown("**Excluded covariates (all studies)**")
+        st.dataframe(
+            [
+                {"Covariate": e.label, "Reason": e.reason or "-", "Study": e.study_id, "When": e.decided_at}
+                for e in memory.exclusions
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+    if memory.estimand_choices:
+        st.markdown("**Estimand strategies chosen before**")
+        st.dataframe(
+            [
+                {
+                    "Study": c.study_id,
+                    "Missing data": c.missing_data_strategy,
+                    "Censoring": c.censoring_strategy,
+                    "Estimator": c.estimation_procedure,
+                }
+                for c in memory.estimand_choices
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+
 def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
     st.subheader("Demo report")
     st.caption(
@@ -3118,6 +3167,7 @@ def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path)
         st.caption("No history recorded yet.")
 
     _render_decision_memory(manager, state.run_id)
+    _render_reviewer_memory(manager, state.run_id)
 
     st.subheader("Artifacts")
     for artifact_name in state.artifacts:

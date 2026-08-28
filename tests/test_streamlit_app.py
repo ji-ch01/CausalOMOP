@@ -592,6 +592,79 @@ class DecisionMemorySmokeTests(unittest.TestCase):
         self.assertIn("dag_review rejected by Dr. Chen", rendered)
 
 
+def _reviewer_memory_script(root_dir: str, reviewer: str) -> None:
+    """AppTest script: render `_render_reviewer_memory` for a seeded run,
+    with `reviewer` (possibly blank) in session state."""
+    import json
+    from pathlib import Path
+
+    import streamlit as st
+
+    from causal.orchestrator.state import RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_reviewer_memory
+
+    root = Path(root_dir)
+    run_dir = root / "runs" / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "protocol.json").write_text(
+        json.dumps(
+            {
+                "study_id": "albumin_sepsis",
+                "rejected_covariates": [
+                    {"label": "baseline_lactate", "reviewer": "Dr. Chen",
+                     "comment": "post-treatment", "decided_at": "2026-08-01T00:00:00+00:00"}
+                ],
+                "statistical_estimand_settings": {
+                    "missing_data_strategy": "complete_case_analysis",
+                    "censoring_strategy": "ignore_censoring_administrative_waiver",
+                    "estimation_procedure": "plug_in_standardization",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = WorkflowManager(root / "runs")
+    manager.save(
+        RunState(
+            run_id="run1", study_id="albumin_sepsis",
+            protocol_path=str(run_dir / "protocol.json"), phase="report",
+        )
+    )
+    if reviewer:
+        st.session_state["reviewer_name"] = reviewer
+    _render_reviewer_memory(manager, "run1")
+
+
+class ReviewerMemorySmokeTests(unittest.TestCase):
+    def test_no_reviewer_name_prompts_for_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _reviewer_memory_script, kwargs={"root_dir": temp, "reviewer": ""},
+                default_timeout=30,
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Enter your name in the sidebar" in c.value for c in harness.caption))
+
+    def test_button_folds_the_run_into_the_reviewer_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _reviewer_memory_script, kwargs={"root_dir": temp, "reviewer": "Dr. Chen"},
+                default_timeout=30,
+            )
+            harness.run()
+            self.assertEqual(list(harness.exception), [])
+            button = next(
+                b for b in harness.button if "Add this run's decisions" in b.label
+            )
+            button.click().run()
+        self.assertEqual(list(harness.exception), [])
+        cells = " ".join(str(df.value.to_dict()) for df in harness.dataframe)
+        self.assertIn("baseline_lactate", cells)
+        self.assertIn("plug_in_standardization", cells)
+
+
 def _results_narrative_section_script(run_dir: str) -> None:
     """AppTest script: render `_render_results_narrative_section` for a run
     that has an estimate but no interpretation yet, to guard that arriving at
