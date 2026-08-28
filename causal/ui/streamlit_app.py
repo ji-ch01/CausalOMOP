@@ -3039,6 +3039,53 @@ def _format_history_event(event: str) -> str:
     return _EVENT_LABELS.get(event, _humanize(event))
 
 
+def _render_decision_memory(manager: WorkflowManager, run_id: str) -> None:
+    """Show the deterministic decision digest the estimand dialogue is fed
+    (`causal.companion.decision_memory`) -- the reviewer's already-recorded
+    covariate exclusions and settled choices. Recomputed live; nothing here
+    writes. This is the "what does the companion remember" transparency
+    surface, so the demo can show it is not a black box."""
+    memory = manager.decision_memory(run_id)
+    st.subheader("Decision memory")
+    if memory.is_empty():
+        st.caption(
+            "No reviewer decisions recorded yet. Once covariates are excluded or gates "
+            "decided, the estimand dialogue is told about them here."
+        )
+        return
+    st.caption(
+        "The deterministic digest of prior decisions fed to the estimand-dialogue companion "
+        "so it does not re-propose something you already ruled out. No LLM produces this."
+    )
+    if memory.rejected_covariates:
+        st.markdown("**Excluded covariates**")
+        st.dataframe(
+            [
+                {
+                    "Covariate": item.label,
+                    "Reviewer": item.reviewer,
+                    "Reason": item.comment or "—",
+                    "When": item.decided_at,
+                }
+                for item in memory.rejected_covariates
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+    if memory.decisions:
+        st.markdown("**Recorded decisions**")
+        st.dataframe(
+            [
+                {"When": item.at, "Kind": item.category, "Decision": item.summary}
+                for item in memory.decisions
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+    with st.expander("Exactly as the companion sees it"):
+        st.code(memory.format_for_prompt(), language="text")
+
+
 def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
     st.subheader("Demo report")
     st.caption(
@@ -3069,6 +3116,8 @@ def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path)
         )
     else:
         st.caption("No history recorded yet.")
+
+    _render_decision_memory(manager, state.run_id)
 
     st.subheader("Artifacts")
     for artifact_name in state.artifacts:

@@ -534,6 +534,64 @@ class EstimandReviewFormSmokeTests(unittest.TestCase):
         self.assertTrue(any("conversation on the left" in block.value for block in harness.info))
 
 
+def _decision_memory_script(runs_dir: str) -> None:
+    """AppTest script: render `_render_decision_memory` for a run that has a
+    rejected covariate and a decided gate, so the transparency surface is
+    exercised end to end (workflow read helper + dataframes + the
+    "as the companion sees it" block)."""
+    import json
+    from pathlib import Path
+
+    from causal.orchestrator.state import ApprovalGate, RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_decision_memory
+
+    root = Path(runs_dir)
+    run_dir = root / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "protocol.json").write_text(
+        json.dumps(
+            {
+                "study_id": "s",
+                "rejected_covariates": [
+                    {
+                        "label": "baseline_lactate",
+                        "reviewer": "Dr. Chen",
+                        "comment": "post-treatment",
+                        "decided_at": "2026-08-20T09:00:00+00:00",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = WorkflowManager(root)
+    state = RunState(
+        run_id="run1", study_id="s", protocol_path=str(run_dir / "protocol.json"), phase="estimand_review"
+    )
+    state.gates["dag_review"] = ApprovalGate(
+        name="dag_review", status="rejected", reviewer="Dr. Chen",
+        comment="adjustment set is missing renal function",
+        decided_at="2026-08-20T10:00:00+00:00",
+    )
+    manager.save(state)
+    _render_decision_memory(manager, "run1")
+
+
+class DecisionMemorySmokeTests(unittest.TestCase):
+    def test_render_shows_the_exclusion_and_the_rejected_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _decision_memory_script, kwargs={"runs_dir": temp}, default_timeout=30
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Decision memory" in block.value for block in harness.subheader))
+        rendered = " ".join(block.value for block in harness.code)
+        self.assertIn("baseline_lactate", rendered)
+        self.assertIn("dag_review rejected by Dr. Chen", rendered)
+
+
 def _results_narrative_section_script(run_dir: str) -> None:
     """AppTest script: render `_render_results_narrative_section` for a run
     that has an estimate but no interpretation yet, to guard that arriving at
