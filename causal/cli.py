@@ -11,7 +11,7 @@ import sys
 
 from causal.bigquery import BigQueryOMOPGateway, make_google_client
 from causal.config import BigQueryDatasets
-from causal.agents import HypothesisAgent, UserQuestionHypothesisService
+from causal.agents import HypothesisAgent
 from causal.agents.dag_identification import build_study_specification, review_dag
 from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.hypothesis import (
@@ -20,9 +20,14 @@ from causal.agents.hypothesis import (
     DAG_VARIABLE_ROLES,
     DAG_VARIABLE_TEMPORAL_CLASSES,
 )
-from causal.agents.question_gate import DEFAULT_GATE_PROMPT_PATH, build_gate_prompt, parse_gate_response
 from causal.agents.user_question import LLMRawOutput
-from causal.fastomop_bridge import FastOMOPError, ask_fastomop
+from causal.companion.intake import (
+    ClarificationNeeded,
+    DescriptiveAnswer,
+    DraftOptions,
+    QuestionIntake,
+)
+from causal.fastomop_bridge import FastOMOPError
 from causal.knowledge_graph import OptimusKGClient
 from causal.literature import LiteratureOrchestrator, OpenAlexClient, PubMedClient
 from causal.llm import build_hypothesis_llm
@@ -447,62 +452,57 @@ def main() -> int:
             state = manager.start(args.protocol, args.mode)
         elif args.workflow_command == "start-question":
             resolved_llm = build_hypothesis_llm(model=args.model)
-            if not args.skip_question_gate:
-                gate_result = parse_gate_response(
-                    resolved_llm.call(build_gate_prompt(DEFAULT_GATE_PROMPT_PATH, args.question))
-                )
-                if gate_result.category == "descriptive":
-                    print(
-                        "This looks like a descriptive/retrieval question, not a causal one -- "
-                        "routing it to FastOMOP (agno_fastomop) instead of the causal target-trial "
-                        f"pipeline.\nReasoning: {gate_result.reasoning}",
-                        file=sys.stderr,
-                    )
-                    try:
-                        result = ask_fastomop(args.question, datasets=datasets)
-                    except (FastOMOPError, FileNotFoundError) as exc:
-                        print(f"FastOMOP query failed: {exc}", file=sys.stderr)
-                        return 1
-                    if result.sql_query:
-                        print("--- SQL ---")
-                        print(result.sql_query)
-                        print("--- ANSWER ---")
-                    print(result.answer)
-                    return 0
-                if gate_result.category == "needs_clarification":
-                    print(
-                        "This question needs to be sharpened before drafting a causal study.\n"
-                        f"Reasoning: {gate_result.reasoning}\n"
-                        f"Clarifying question: {gate_result.clarifying_question}",
-                        file=sys.stderr,
-                    )
-                    return 2
-            literature = (
-                None if args.skip_literature
-                else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
-            )
-            knowledge_graph = (
-                None if args.skip_knowledge_graph or not OptimusKGClient.is_available()
-                else OptimusKGClient()
-            )
-            generate_kwargs = {}
-            if args.max_critique_rounds is not None:
-                generate_kwargs["max_critique_rounds"] = args.max_critique_rounds
-            if args.tournament_size is not None:
-                generate_kwargs["tournament_size"] = args.tournament_size
-            generated = UserQuestionHypothesisService().generate(
-                args.question,
-                resolved_llm.call,
+            intake = QuestionIntake(
+                manager=manager,
+                resolved_llm=resolved_llm,
+                literature=(
+                    None if args.skip_literature
+                    else LiteratureOrchestrator(pubmed=PubMedClient(), openalex=OpenAlexClient())
+                ),
+                knowledge_graph=(
+                    None if args.skip_knowledge_graph or not OptimusKGClient.is_available()
+                    else OptimusKGClient()
+                ),
                 data_source=datasets.describe(),
-                literature=literature,
-                knowledge_graph=knowledge_graph,
-                on_llm_output=_print_raw_llm_output,
-                enable_critique=not args.skip_critique,
-                **generate_kwargs,
+                datasets=datasets,
             )
-            state = manager.start_generated(
-                generated, args.mode, f"{resolved_llm.provider}:{resolved_llm.model}"
-            )
+            try:
+                outcome = intake.run(
+                    args.question,
+                    DraftOptions(
+                        mode=args.mode,
+                        skip_question_gate=args.skip_question_gate,
+                        enable_critique=not args.skip_critique,
+                        max_critique_rounds=args.max_critique_rounds,
+                        tournament_size=args.tournament_size,
+                    ),
+                    on_llm_output=_print_raw_llm_output,
+                )
+            except (FastOMOPError, FileNotFoundError) as exc:
+                print(f"FastOMOP query failed: {exc}", file=sys.stderr)
+                return 1
+            if isinstance(outcome, DescriptiveAnswer):
+                print(
+                    "This looks like a descriptive/retrieval question, not a causal one -- "
+                    "routed to FastOMOP (agno_fastomop) instead of the causal target-trial "
+                    f"pipeline.\nReasoning: {outcome.reasoning}",
+                    file=sys.stderr,
+                )
+                if outcome.sql:
+                    print("--- SQL ---")
+                    print(outcome.sql)
+                    print("--- ANSWER ---")
+                print(outcome.answer)
+                return 0
+            if isinstance(outcome, ClarificationNeeded):
+                print(
+                    "This question needs to be sharpened before drafting a causal study.\n"
+                    f"Reasoning: {outcome.reasoning}\n"
+                    f"Clarifying question: {outcome.clarifying_question}",
+                    file=sys.stderr,
+                )
+                return 2
+            state = outcome.state
         elif args.workflow_command == "status":
             state = manager.load(args.run_id)
         elif args.workflow_command == "gate":
