@@ -1,7 +1,8 @@
 {
   "study_id": "albumin_sepsis_28d_mimic_omop",
-  "status": "draft_blocked_on_drug_concept_mapping",
-  "source_question": "Among adult ICU patients with sepsis, what is the effect of crystalloids plus albumin versus crystalloids alone, initiated within 24 hours of ICU admission, on 28-day all-cause mortality?",
+  "status": "draft_blocked_on_inputevents_etl_scope_and_sepsis3_phenotype",
+  "status_detail": "drug_exposure is now 96.8% mapped (reference_paper_extraction.md section 9a), so drug-concept mapping is no longer the blocker. Remaining blockers: (1) ICU infusions (inputevents) are outside the OMOP ETL scope, so albumin and the crystalloid infusions that define time zero are absent -- see docs/mimic_omop_coverage_workplan.md workstream B; (2) the Sepsis-3 population must be reconstructed, not taken from a condition code -- workstream C.3; (3) baseline covariate coverage (reference uses 24 features, first_pass_covariates has 9).",
+  "source_question": "Among adult ICU patients with sepsis, what is the effect of crystalloids plus albumin versus crystalloids alone, both initiated within the first 24 hours of the ICU stay, on 28-day all-cause mortality?",
   "reference": {
     "doi": "10.1371/journal.pdig.0000721",
     "code": "https://github.com/soda-inria/causal_ehr_mimic"
@@ -9,41 +10,47 @@
   "data_source": "runtime-configured restricted OMOP dataset",
   "target_trial": {
     "population": "Adults with sepsis admitted to ICU",
-    "treatment": "Crystalloids plus albumin within 24 hours of ICU admission",
-    "comparator": "Crystalloids without albumin within 24 hours of ICU admission",
-    "time_zero": "ICU admission",
+    "treatment": "Crystalloids plus albumin, both given within the first 24 hours of the ICU stay, with the first albumin dose after the first crystalloid dose",
+    "comparator": "Crystalloids only within the first 24 hours of the ICU stay (no albumin in that window)",
+    "time_zero": "First crystalloid administration within the first 24 hours of the ICU stay (inclusion_start); NOT ICU admission itself",
     "grace_period_hours": 24,
     "outcome": "All-cause mortality within 28 days",
     "follow_up_days": 28,
     "primary_estimand": "ATE",
-    "secondary_estimands": ["CATE by age", "CATE by sex", "CATE by septic shock"],
+    "secondary_estimands": ["CATE by age", "CATE by sex", "CATE by race", "CATE by septic shock"],
     "eligibility_criteria": [
       "Adult (>=18 years) at ICU admission",
-      "Sepsis diagnosis at or within a defined window of ICU admission",
-      "First qualifying ICU admission for the hospitalization",
-      "No albumin or crystalloid administration recorded before ICU admission (index event)"
+      "Sepsis-3 during the ICU stay (SOFA >= 2 with suspected infection, the latter defined by an antibiotic course plus a body-fluid culture within the Sepsis-3 timing window), reconstructed from measurement / drug_exposure / culture records -- NOT from a sepsis condition-occurrence code: a diagnosis-code phenotype gives ~3,048 patients versus the reference ~18,421 (see concept_audit.md and reference_paper_extraction.md sections 2a and 9)",
+      "First ICU stay per patient only",
+      "Survived and remained in the ICU for at least 24 hours (ICU length of stay >= 1 day)",
+      "At least one crystalloid administration within the first 24 hours of the ICU stay -- this is the inclusion trigger and defines time zero; patients with no crystalloid in that window are excluded"
     ],
-    "assignment_procedure": "Not randomized; treatment arm (crystalloids plus albumin vs. crystalloids alone) is determined by the treating clinician's choice within the 24-hour grace period after ICU admission (observational target-trial emulation, not an RCT).",
+    "assignment_procedure": "Not randomized; treatment arm (crystalloids plus albumin vs. crystalloids alone) is determined by the treating clinician's choice within the 24-hour exposure-eligibility window that begins at time zero, i.e. the first crystalloid dose (observational target-trial emulation, not an RCT).",
     "censoring_strategy": "Administrative censoring at the earlier of end of the observed data (observation period) or 28 days after time zero, for anyone who has neither died nor been observed for the full follow-up window.",
-    "analysis_strategy": "Intention-to-treat analog: treatment status is fixed by exposure within the 24-hour grace period and not updated afterward; a later crossover between arms is not accounted for.",
+    "analysis_strategy": "Intention-to-treat analog: treatment status is fixed by exposure within the 24-hour exposure-eligibility window and not updated afterward; a later crossover between arms is not accounted for.",
     "effect_measure": "risk_difference",
-    "treatment_value": "Crystalloids plus albumin, initiated within 24 hours of ICU admission",
-    "comparator_value": "Crystalloids alone, no albumin within 24 hours of ICU admission"
+    "treatment_value": "Crystalloids plus albumin, both initiated within the first 24 hours of the ICU stay (albumin after the first crystalloid)",
+    "comparator_value": "Crystalloids only, no albumin within the first 24 hours of the ICU stay"
   },
   "design_constraints": [
     "Align eligibility, treatment assignment, and start of follow-up to prevent immortal-time bias",
     "Use only covariates measured before or during the predefined baseline window",
     "Do not promote text-matched concepts to executable concept sets without human validation",
-    "eligibility_criteria/assignment_procedure/censoring_strategy/analysis_strategy/effect_measure/treatment_value/comparator_value (added 2026-08-07) are inferred from standard target-trial-emulation conventions and this study's own design_constraints/query_settings, not transcribed verbatim from the reference paper's methods section -- verify against the paper directly before treating them as an exact restatement of its published protocol."
+    "target_trial.grace_period_hours (24) is the exposure-eligibility / ascertainment window: albumin must start within 24 h of time zero AND after the first crystalloid dose. It is not a grace period for outcome-free survival in the usual target-trial sense. The reference authors argue 24 h is short enough that the induced immortal time is negligible and test that claim by re-running the exposure window at 6 h / 24 h / 72 h (reference_paper_extraction.md sections 3 and 7a).",
+    "time_zero / follow-up clock: the reference study starts follow-up and all effect estimates at the first crystalloid administration within the first 24 h of the ICU stay (inclusion_start), not at ICU admission. icu_time_zero.json still anchors on ICU admission because ICU infusions (inputevents) are outside the current OMOP ETL scope (reference_paper_extraction.md section 9a); realign to first-crystalloid once infusion data is available.",
+    "secondary_estimands: the age effect modifier is dichotomised >=60 vs <60 for subgroup display, with continuous admission_age also fed to the CATE model; 'septic shock' is a derived pre-treatment clinical state (Sepsis-3 shock criteria), not condition concept 196236 (reference_paper_extraction.md section 8).",
+    "eligibility_criteria/assignment_procedure/censoring_strategy/analysis_strategy/effect_measure/treatment_value/comparator_value (added 2026-08-07, corrected 2026-08-29 against reference_paper_extraction.md) are aligned to the reference paper and the authors' analysis code (soda-inria/causal_ehr_mimic); the paper itself under-specifies several of them, so the code is the authoritative source -- verify against both before treating them as an exact restatement of the published protocol."
   ],
   "concept_sets": {
     "sepsis": {
       "role": "population", "domain": "condition",
-      "status": "candidate_pending_human_approval", "concept_ids": [132797]
+      "status": "placeholder_requires_sepsis3_reconstruction", "concept_ids": [132797],
+      "note": "132797 is the standard SNOMED 'Sepsis' concept and a legitimate concept-mapping benchmark target (reference_concept_mappings.json), but it must NOT define the study population: a diagnosis-code phenotype yields ~3,048 patients vs the reference ~18,421. The population needs a reconstructed Sepsis-3 phenotype (SOFA >= 2 with suspected infection) -- see eligibility_criteria and docs/mimic_omop_coverage_workplan.md workstream C.3."
     },
     "septic_shock": {
       "role": "effect_modifier", "domain": "condition",
-      "status": "candidate_pending_human_approval", "concept_ids": [196236]
+      "status": "placeholder_derived_state_not_a_condition_code", "concept_ids": [196236],
+      "note": "196236 is the standard SNOMED 'Septic shock' concept (a valid concept-mapping benchmark target), but this effect modifier is a derived pre-treatment clinical state (Sepsis-3 shock criteria: vasopressor requirement plus lactate > 2 mmol/L), not a diagnosis code -- see design_constraints and reference_paper_extraction.md section 8."
     },
     "albumin": {
       "role": "treatment", "domain": "drug",
