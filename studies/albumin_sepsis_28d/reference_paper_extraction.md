@@ -57,7 +57,7 @@ result. Outstanding supplements are listed in §11.
 
 | Component | Value | Source |
 |---|---|---|
-| **Population** | Adults (**age > 18** at ICU admission) with **Sepsis-3** during the ICU stay; **first ICU stay** only; **survived and stayed ≥ 24 h** ("sufficient follow-up of at least 24 hours") | `[PAPER p.8]` + `[CODE]` |
+| **Population** | Adults (**age ≥ 18** at ICU admission — paper prose and S5 Fig say "over 18", the code filters `age >= 18`) with **Sepsis-3** during the ICU stay; **first ICU stay** only; **survived and stayed ≥ 24 h** ("sufficient follow-up of at least 24 hours"; code: ICU LOS ≥ 1 day) | `[PAPER p.8]` + `[CODE]` |
 | **Intervention** | **Crystalloids + albumin**, both within the **first 24 h** of the ICU stay, with the first albumin dose *after* the first crystalloid dose | `[PAPER]` + `[CODE]` |
 | **Control** | **Crystalloids only** in the first 24 h (no albumin in the window) | `[PAPER]` + `[CODE]` |
 | **Contrast type** | Add-on (albumin added to crystalloid vs. crystalloid alone); **every** subject receives crystalloids — this is the inclusion trigger, not a covariate | `[CODE]` — matches `protocol.json.query_settings.exposure_contrast = "add_on"` |
@@ -303,6 +303,13 @@ Qualitative claims to reproduce `[PAPER]`:
   clinical state, **not** a diagnosis code), sex (`Female`), race (`White`).
   Fig 2/Fig 3 of S7 Appendix also feed continuous `admission_age` to the
   final model; the ≥ 60 split is for the box-plot display only.
+- **`septic_shock` exact definition** `[CODE]` (`caumim.variables.selection.
+  get_septic_shock_from_features`): `sepsis3 == True` **AND** any vasopressor
+  (dopamine / epinephrine / norepinephrine / phenylephrine / vasopressin /
+  dobutamine / milrinone, value > 0) **AND** serum lactate **≥ 2 mmol/L**
+  (code uses `>= 2`; the Sepsis-3 text and the code's own docstring say
+  `> 2`). MAP < 65 is *simplified to* "on vasopressors". All ascertained
+  pre-treatment.
 - **CATE method (S7 Appendix):** Double ML residual-on-residual —
   regress `Ỹ = Y − m̂(X)` on `Ã = A − ê(X)` interacted with the
   heterogeneity features `X_CATE`, minimising `Eₙ[(Ỹ − τ(X_CATE)·Ã)²]`.
@@ -448,6 +455,15 @@ inconsistent; those were fixed in the same pass:
 | `protocol.json` `concept_sets.sepsis` | `status` → `"placeholder_requires_sepsis3_reconstruction"` + `note`: 132797 stays as a concept-mapping benchmark target but must not define the population (dx-code phenotype gives ~3,048 vs ~18,421) |
 | `protocol.json` `concept_sets.septic_shock` | `status` → `"placeholder_derived_state_not_a_condition_code"` + `note`: 196236 is a valid search target, but the effect modifier is a derived Sepsis-3 shock state |
 | `reference_concept_mappings.json` note | stale `status='candidate_pending_human_approval'` cross-reference updated to match the placeholder statuses |
+
+### 10c. Wording-precision fixes (applied 2026-08-29, after a consistency re-check)
+
+| File / field | Fix |
+|---|---|
+| `protocol.json` `design_constraints` grace-period note | "albumin must start within 24 h of **time zero**" → "both the first crystalloid and the first albumin dose must fall within the first 24 h of **the ICU stay**, albumin after the first crystalloid". Time zero is itself inside that window (the first crystalloid), so "24 h of time zero" could nominally admit albumin up to ~48 h post-admission. The `treatment` / `source_question` / `treatment_value` fields were already correct. |
+| `protocol.json` `assignment_procedure` | same fix — "window that begins at time zero" → "the first 24 h of the ICU stay (which contains time zero)". |
+| `protocol.json` `concept_sets.septic_shock.note` + `design_constraints` | "vasopressor requirement plus lactate **> 2**" → the exact `caumim.variables.selection.get_septic_shock_from_features` definition: Sepsis-3 positive **AND** any of 7 named vasopressors **AND** lactate **`>= 2`** mmol/L (code filters `>= 2`; Sepsis-3 text says `> 2`). Recorded in §8. |
+| `reference_paper_extraction.md` §2 / §8 | §2 population age harmonised to `≥ 18` (code-authoritative; paper prose / S5 Fig say "over 18"); §8 gained the verified `septic_shock` formula. |
 
 ### 10b. Still open (not yet done)
 

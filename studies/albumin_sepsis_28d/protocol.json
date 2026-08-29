@@ -25,7 +25,7 @@
       "Survived and remained in the ICU for at least 24 hours (ICU length of stay >= 1 day)",
       "At least one crystalloid administration within the first 24 hours of the ICU stay -- this is the inclusion trigger and defines time zero; patients with no crystalloid in that window are excluded"
     ],
-    "assignment_procedure": "Not randomized; treatment arm (crystalloids plus albumin vs. crystalloids alone) is determined by the treating clinician's choice within the 24-hour exposure-eligibility window that begins at time zero, i.e. the first crystalloid dose (observational target-trial emulation, not an RCT).",
+    "assignment_procedure": "Not randomized; treatment arm (crystalloids plus albumin vs. crystalloids alone) is determined by the treating clinician's choice within the exposure-eligibility window, i.e. the first 24 h of the ICU stay (which contains time zero, the first crystalloid dose); an observational target-trial emulation, not an RCT.",
     "censoring_strategy": "Administrative censoring at the earlier of end of the observed data (observation period) or 28 days after time zero, for anyone who has neither died nor been observed for the full follow-up window.",
     "analysis_strategy": "Intention-to-treat analog: treatment status is fixed by exposure within the 24-hour exposure-eligibility window and not updated afterward; a later crossover between arms is not accounted for.",
     "effect_measure": "risk_difference",
@@ -36,9 +36,9 @@
     "Align eligibility, treatment assignment, and start of follow-up to prevent immortal-time bias",
     "Use only covariates measured before or during the predefined baseline window",
     "Do not promote text-matched concepts to executable concept sets without human validation",
-    "target_trial.grace_period_hours (24) is the exposure-eligibility / ascertainment window: albumin must start within 24 h of time zero AND after the first crystalloid dose. It is not a grace period for outcome-free survival in the usual target-trial sense. The reference authors argue 24 h is short enough that the induced immortal time is negligible and test that claim by re-running the exposure window at 6 h / 24 h / 72 h (reference_paper_extraction.md sections 3 and 7a).",
+    "target_trial.grace_period_hours (24) is the exposure-eligibility / ascertainment window: both the first crystalloid dose and the first albumin dose must fall within the first 24 h of the ICU stay, and albumin must come after the first crystalloid (i.e. after time zero). It is not a grace period for outcome-free survival in the usual target-trial sense. The reference authors argue 24 h is short enough that the induced immortal time is negligible and test that claim by re-running the exposure-eligibility window at 6 h / 24 h / 72 h of the ICU stay (reference_paper_extraction.md sections 3 and 7a).",
     "time_zero / follow-up clock: the reference study starts follow-up and all effect estimates at the first crystalloid administration within the first 24 h of the ICU stay (inclusion_start), not at ICU admission. icu_time_zero.json still anchors on ICU admission because ICU infusions (inputevents) are outside the current OMOP ETL scope (reference_paper_extraction.md section 9a); realign to first-crystalloid once infusion data is available.",
-    "secondary_estimands: the age effect modifier is dichotomised >=60 vs <60 for subgroup display, with continuous admission_age also fed to the CATE model; 'septic shock' is a derived pre-treatment clinical state (Sepsis-3 shock criteria), not condition concept 196236 (reference_paper_extraction.md section 8).",
+    "secondary_estimands: the age effect modifier is dichotomised >=60 vs <60 for subgroup display, with continuous admission_age also fed to the CATE model; 'septic shock' is a derived pre-treatment clinical state (vasopressor + lactate >= 2; see concept_sets.septic_shock.note), not condition concept 196236 (reference_paper_extraction.md section 8).",
     "eligibility_criteria/assignment_procedure/censoring_strategy/analysis_strategy/effect_measure/treatment_value/comparator_value (added 2026-08-07, corrected 2026-08-29 against reference_paper_extraction.md) are aligned to the reference paper and the authors' analysis code (soda-inria/causal_ehr_mimic); the paper itself under-specifies several of them, so the code is the authoritative source -- verify against both before treating them as an exact restatement of the published protocol."
   ],
   "concept_sets": {
@@ -50,7 +50,7 @@
     "septic_shock": {
       "role": "effect_modifier", "domain": "condition",
       "status": "placeholder_derived_state_not_a_condition_code", "concept_ids": [196236],
-      "note": "196236 is the standard SNOMED 'Septic shock' concept (a valid concept-mapping benchmark target), but this effect modifier is a derived pre-treatment clinical state (Sepsis-3 shock criteria: vasopressor requirement plus lactate > 2 mmol/L), not a diagnosis code -- see design_constraints and reference_paper_extraction.md section 8."
+      "note": "196236 is the standard SNOMED 'Septic shock' concept (a valid concept-mapping benchmark target), but this effect modifier is a derived pre-treatment clinical state, not a diagnosis code. Per the authors' code (caumim.variables.selection.get_septic_shock_from_features): Sepsis-3 positive AND on a vasopressor (dopamine / epinephrine / norepinephrine / phenylephrine / vasopressin / dobutamine / milrinone) AND serum lactate >= 2 mmol/L -- the code filters >= 2, the Sepsis-3 text says > 2. See design_constraints and reference_paper_extraction.md section 8."
     },
     "albumin": {
       "role": "treatment", "domain": "drug",
