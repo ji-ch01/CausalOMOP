@@ -188,10 +188,12 @@ streamlit run causal/ui/streamlit_app.py
 ```
 
 The natural-language entry point includes a causal-question classifier before
-target-trial drafting. It refuses descriptive questions with a FastOMOP
-redirect and requests clarification when the intervention or outcome is too
-ambiguous. The gate is LLM-based and may be skipped explicitly for controlled
-testing; it is not a replacement for human protocol review.
+target-trial drafting. A descriptive question is routed to FastOMOP
+(`causal.fastomop_bridge`) and its answer returned inline instead of drafting
+a causal study; a question whose intervention or outcome is too ambiguous
+returns a clarification request. The gate is LLM-based and may be skipped
+explicitly for controlled testing; it is not a replacement for human protocol
+review.
 
 ## Important implementation boundary
 

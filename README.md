@@ -242,6 +242,7 @@ pip install -r requirements-llm.txt
 pip install -r requirements-ui.txt
 pip install -r requirements-knowledge-graph.txt
 pip install -r requirements-causal-discovery.txt
+pip install -r requirements-estimation.txt   # g-computation, TMLE, CATE, SuperLearner
 ```
 
 Copy `sample.env` to `.env` and replace placeholders locally:
