@@ -19,7 +19,12 @@ Reference artifacts in this directory:
 - `reference_dag.json`: published/reference DAG used for structural metrics;
 - `reference_concept_mappings.json`: reference mapping benchmark;
 - `icu_time_zero.json`: time-zero audit notes;
-- `concept_audit.md`: dated feasibility snapshot, not a current causal result.
+- `concept_audit.md`: dated feasibility snapshot, not a current causal result;
+- `reference_paper_extraction.md`: source-tagged extraction of the published
+  design, confounder sets, estimator config, and results to compare against
+  (compiled from the paper, the S6 supplement, and the authors' analysis
+  code); also lists the supplementary figures still needed and the
+  corrections it implies for `protocol.json` / `icu_time_zero.json`.
 
 The active blockers are a reproducible Sepsis-3 population, validated ICU time
 zero, approved albumin/crystalloid phenotypes, baseline covariate coverage,
