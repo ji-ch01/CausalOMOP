@@ -14,6 +14,12 @@
       "Node labels are taken verbatim from the figure and do not necessarily match this study's own protocol.json wording (e.g. figure 'Albumin + crystalloids' vs protocol.json's longer target_trial.treatment string) -- structural_hamming_distance/structural_intervention_distance compare graphs at the node-label level (see causal.agents.dag_metrics), so any future generated candidate_dag must use labels that at least approximately match these for a comparison to be meaningful."
     ]
   },
+  "analysis_feature_reconciliation": {
+    "note": "This DAG has 20 observed nodes; the reference study's estimation code (soda-inria/causal_ehr_mimic, FEATURE_SETS) uses 24 features. The difference: the single 'Antibiotics' node fans out to 4 features (Carbapenems, Aminoglycosides, Beta-lactams, Glycopeptide), and 'suspected_infection_blood' is an extra feature with no explicit DAG node. The 3 unobserved nodes (Socio-economical factor, Comorbidity, lifestyle) have no feature. Full node-to-feature table: reference_paper_extraction.md section 4.",
+    "observed_nodes": 20,
+    "unobserved_nodes": 3,
+    "analysis_features_all_confounders": 24
+  },
   "variables": [
     {"label": "Age at admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig, DOI 10.1371/journal.pdig.0000721): common cause of the albumin/crystalloids treatment decision and 28-day mortality.", "pmid": "", "observed": true},
     {"label": "Gender", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Expert DAG (S6 Fig): common cause of treatment decision and mortality.", "pmid": "", "observed": true},
