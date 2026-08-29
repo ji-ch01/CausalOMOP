@@ -12,6 +12,7 @@ import pandas as pd
 
 from causal.config import BigQueryDatasets
 from causal.mcp_client import MCPToolResponse
+from causal.companion.companion import CompanionMessage
 from causal.orchestrator import WorkflowManager
 from causal.provenance import artifact_metadata
 from causal.orchestrator.workflow import (
@@ -995,6 +996,70 @@ class WorkflowMapConceptSetTests(unittest.TestCase):
             self.manager.map_concept_set(
                 self.state.run_id, "population", "death", [], "Dr. Chen",
             )
+
+
+class WorkflowSetConceptSetLookupTermsTests(unittest.TestCase):
+    """`set_concept_set_lookup_terms` only seeds the UI concept-search box; it
+    writes `protocol.json` but touches no mapping decision and no gate."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        protocol = root / "protocol.json"
+        protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE",
+            },
+            "concept_sets": {
+                "population": {"role": "population", "status": "pending_omop_mapping", "concept_ids": [], "domain": ""},
+                "outcome": {"role": "outcome", "status": "pending_omop_mapping", "concept_ids": [], "domain": ""},
+            },
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        self.state = self.manager.run_hypothesis_agent(self.manager.start(protocol).run_id)
+        self.run_dir = root / "runs" / self.state.run_id
+
+    def _protocol(self) -> dict:
+        return json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+
+    def test_updates_lookup_term_without_touching_other_fields(self):
+        self.manager.map_concept_set(self.state.run_id, "population", "condition", [132797], "Dr. Chen")
+        self.manager.set_concept_set_lookup_terms(
+            self.state.run_id, {"population": "  sepsis ", "outcome": "in-hospital death"}
+        )
+        concept_sets = self._protocol()["concept_sets"]
+        self.assertEqual(concept_sets["population"]["lookup_term"], "sepsis")
+        self.assertEqual(concept_sets["outcome"]["lookup_term"], "in-hospital death")
+        # The mapping approved above is untouched.
+        self.assertEqual(concept_sets["population"]["concept_ids"], [132797])
+        self.assertEqual(concept_sets["population"]["status"], "approved")
+
+    def test_records_an_event_and_no_gate_is_invalidated(self):
+        self.manager.decide_gate(self.state.run_id, "clinical_mapping", "approved", "Dr. Lee")
+        state = self.manager.set_concept_set_lookup_terms(self.state.run_id, {"population": "sepsis"})
+        self.assertEqual(state.gates["clinical_mapping"].status, "approved")
+        self.assertTrue(any(e["event"] == "concept_set_lookup_terms_set" for e in state.history))
+
+    def test_unknown_names_are_ignored_when_at_least_one_matches(self):
+        self.manager.set_concept_set_lookup_terms(
+            self.state.run_id, {"population": "sepsis", "not_a_set": "x"}
+        )
+        self.assertEqual(self._protocol()["concept_sets"]["population"]["lookup_term"], "sepsis")
+
+    def test_raises_when_no_name_matches(self):
+        with self.assertRaises(RuntimeError):
+            self.manager.set_concept_set_lookup_terms(self.state.run_id, {"not_a_set": "x"})
+
+    def test_rejects_empty_or_non_string_input(self):
+        for bad in ({}, {"population": "   "}, {"population": 5}, "not a dict"):
+            with self.assertRaises(ValueError):
+                self.manager.set_concept_set_lookup_terms(self.state.run_id, bad)
 
 
 class WorkflowGateInvalidationTests(unittest.TestCase):
@@ -2624,85 +2689,93 @@ def _never_call_estimation_procedure_llm(prompt: str) -> str:
     raise AssertionError("llm() must not be called when population_summary == 'CATE'")
 
 
-class WorkflowProposeEstimationProcedureTests(unittest.TestCase):
-    """`propose_estimation_procedure` sits at the same `estimand_review`
-    gate as `set_statistical_estimand_strategy` (`WorkflowMaterializeAnalyticDatasetTests.
-    setUp` above), but this fixture stops right after `build_cohort_plan`
-    -- before the human strategy/gate/advance calls -- since proposing a
-    suggestion is meant to happen *before* the reviewer has decided
-    anything, not after.
+def _bring_run_to_estimand_review(root: Path, datasets) -> tuple[WorkflowManager, str, Path]:
+    """Advance a fresh single-covariate (SOFA) run through every gate to the
+    `estimand_review` phase, with `study_specification.json` and
+    `cohort_manifest.json` on disk. Stops right after `build_cohort_plan` --
+    before the human strategy/gate/advance calls -- since both the
+    estimation-procedure suggestion and the companion dialogue are meant to
+    run *before* the reviewer has decided anything.
     """
+    protocol = root / "protocol.json"
+    protocol.write_text(json.dumps({
+        "study_id": "test_study",
+        "source_question": "Does treatment affect outcome?",
+        "target_trial": {
+            "population": "population", "treatment": "treatment",
+            "comparator": "comparator", "time_zero": "index",
+            "grace_period_hours": 24, "outcome": "outcome",
+            "follow_up_days": 28, "primary_estimand": "ATE",
+            **_FULL_TARGET_TRIAL_FIELDS,
+        },
+        "data_source": "project.dataset",
+        "first_pass_covariates": ["SOFA score"],
+        "concept_sets": {
+            "population": {
+                "role": "population", "status": "approved",
+                "domain": "condition", "concept_ids": [132797],
+            },
+            "treatment": {
+                "role": "treatment", "status": "approved",
+                "domain": "drug", "concept_ids": [1],
+            },
+            "comparator": {
+                "role": "comparator", "status": "approved",
+                "domain": "drug", "concept_ids": [2],
+            },
+            "outcome": {
+                "role": "outcome", "status": "approved",
+                "domain": "condition", "concept_ids": [316866],
+            },
+        },
+    }), encoding="utf-8")
+    manager = WorkflowManager(root / "runs")
+    state = manager.start(protocol)
+    state = manager.run_hypothesis_agent(state.run_id)
+    run_id = state.run_id
+    run_dir = root / "runs" / run_id
+
+    manager.review_covariate(
+        run_id, "SOFA score", "accept", "Dr. Chen",
+        "Higher SOFA is associated with treatment choice and outcome.",
+        role="confounder", temporal_classification="pre_treatment",
+        domain="measurement",
+    )
+    manager.map_covariate_concepts(run_id, "SOFA score", [4301868], "Dr. Lee")
+    manager.review_covariate_aggregation(
+        run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
+    )
+    _approve_pre_mapping_gates(manager, run_id)
+    for _ in range(3):
+        manager.advance(run_id)
+    manager.decide_gate(run_id, "clinical_mapping", "approved", "Dr. Lee")
+    manager.advance(run_id)
+    manager.run_data_science_agent(run_id)
+    manager.advance(run_id)
+    plan_path = run_dir / "analysis_plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["exploratory_execution_allowed"] = True
+    plan["unresolved_issues"] = []
+    for phenotype in plan["phenotypes"]:
+        phenotype["status"] = "approved"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    manager.decide_gate(run_id, "analysis_plan", "approved", "Dr. Lee")
+    state = manager.advance(run_id)
+    assert state.phase == "estimand_review", state.phase
+    manager.build_cohort_plan(run_id, datasets)
+    return manager, run_id, run_dir
+
+
+class WorkflowProposeEstimationProcedureTests(unittest.TestCase):
+    """`propose_estimation_procedure` sits at the `estimand_review` gate; see
+    `_bring_run_to_estimand_review` for the shared fixture."""
 
     def setUp(self):
         self.datasets = BigQueryDatasets()
         self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
-        self.protocol = root / "protocol.json"
-        self.protocol.write_text(json.dumps({
-            "study_id": "test_study",
-            "source_question": "Does treatment affect outcome?",
-            "target_trial": {
-                "population": "population", "treatment": "treatment",
-                "comparator": "comparator", "time_zero": "index",
-                "grace_period_hours": 24, "outcome": "outcome",
-                "follow_up_days": 28, "primary_estimand": "ATE",
-                **_FULL_TARGET_TRIAL_FIELDS,
-            },
-            "data_source": "project.dataset",
-            "first_pass_covariates": ["SOFA score"],
-            "concept_sets": {
-                "population": {
-                    "role": "population", "status": "approved",
-                    "domain": "condition", "concept_ids": [132797],
-                },
-                "treatment": {
-                    "role": "treatment", "status": "approved",
-                    "domain": "drug", "concept_ids": [1],
-                },
-                "comparator": {
-                    "role": "comparator", "status": "approved",
-                    "domain": "drug", "concept_ids": [2],
-                },
-                "outcome": {
-                    "role": "outcome", "status": "approved",
-                    "domain": "condition", "concept_ids": [316866],
-                },
-            },
-        }), encoding="utf-8")
-        self.manager = WorkflowManager(root / "runs")
-        state = self.manager.start(self.protocol)
-        state = self.manager.run_hypothesis_agent(state.run_id)
-        self.run_id = state.run_id
-        self.run_dir = root / "runs" / self.run_id
-
-        self.manager.review_covariate(
-            self.run_id, "SOFA score", "accept", "Dr. Chen",
-            "Higher SOFA is associated with treatment choice and outcome.",
-            role="confounder", temporal_classification="pre_treatment",
-            domain="measurement",
+        self.manager, self.run_id, self.run_dir = _bring_run_to_estimand_review(
+            Path(self.temp.name), self.datasets
         )
-        self.manager.map_covariate_concepts(self.run_id, "SOFA score", [4301868], "Dr. Lee")
-        self.manager.review_covariate_aggregation(
-            self.run_id, "SOFA score", "last_value_before_index", "Dr. Lee",
-        )
-        _approve_pre_mapping_gates(self.manager, self.run_id)
-        for _ in range(3):
-            state = self.manager.advance(self.run_id)
-        self.manager.decide_gate(self.run_id, "clinical_mapping", "approved", "Dr. Lee")
-        self.manager.advance(self.run_id)
-        self.manager.run_data_science_agent(self.run_id)
-        self.manager.advance(self.run_id)
-        plan_path = self.run_dir / "analysis_plan.json"
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        plan["exploratory_execution_allowed"] = True
-        plan["unresolved_issues"] = []
-        for phenotype in plan["phenotypes"]:
-            phenotype["status"] = "approved"
-        plan_path.write_text(json.dumps(plan), encoding="utf-8")
-        self.manager.decide_gate(self.run_id, "analysis_plan", "approved", "Dr. Lee")
-        state = self.manager.advance(self.run_id)
-        self.assertEqual(state.phase, "estimand_review")
-        self.manager.build_cohort_plan(self.run_id, self.datasets)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -2763,6 +2836,231 @@ class WorkflowProposeEstimationProcedureTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.manager.propose_estimation_procedure(self.run_id, _fake_llm)
+
+
+class _CapturingLLM:
+    def __init__(self, response: str):
+        self.response = response
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.response
+
+
+_COMPANION_REPLY_ONLY = json.dumps({"reply": "Let's start with the censoring strategy."})
+_COMPANION_WITH_ACTION = json.dumps({
+    "reply": "Recording IPCW plus TMLE, as we discussed.",
+    "proposed_action": {
+        "action": "set_statistical_estimand_strategy",
+        "args": {
+            "missing_data_strategy": "complete_case_analysis",
+            "censoring_strategy": "ipcw_administrative_censoring",
+            "estimation_procedure": "targeted_minimum_loss_based_estimation",
+            "censoring_rationale": "Follow-up audit shows non-trivial administrative censoring; reweight rather than drop.",
+        },
+    },
+})
+
+
+class WorkflowRunCompanionTurnTests(unittest.TestCase):
+    """`run_companion_turn` is the LLM-owning half of the estimand dialogue;
+    the pure prompt-build/parse is covered by `test_companion_agent.py`."""
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        self.manager, self.run_id, self.run_dir = _bring_run_to_estimand_review(
+            Path(self.temp.name), self.datasets
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_returns_a_parsed_reply_only_turn(self):
+        turn = self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_REPLY_ONLY), [])
+        self.assertEqual(turn.reply, "Let's start with the censoring strategy.")
+        self.assertIsNone(turn.proposed_action)
+
+    def test_returns_a_validated_proposed_action(self):
+        turn = self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_WITH_ACTION), [])
+        self.assertIsNotNone(turn.proposed_action)
+        self.assertEqual(turn.proposed_action.action, "set_statistical_estimand_strategy")
+        self.assertEqual(
+            turn.proposed_action.args["censoring_strategy"], "ipcw_administrative_censoring"
+        )
+
+    def test_prompt_is_grounded_in_the_run_artifacts_and_history(self):
+        manifest = json.loads((self.run_dir / "cohort_manifest.json").read_text(encoding="utf-8"))
+        covariate = next(
+            column["name"] for column in manifest["columns"]
+            if column["role"] == "baseline_covariate"
+        )
+        llm = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(
+            self.run_id, llm, [CompanionMessage("user", "what does IPCW change?")]
+        )
+        prompt = llm.prompts[0]
+        self.assertIn(covariate, prompt)
+        self.assertIn("Reviewer: what does IPCW change?", prompt)
+
+    def test_does_not_mutate_run_state(self):
+        before = self.manager.load(self.run_id)
+        self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_WITH_ACTION), [])
+        after = self.manager.load(self.run_id)
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertEqual(after.updated_at, before.updated_at)
+        self.assertNotIn(
+            "statistical_estimand_settings",
+            json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8")),
+        )
+
+    def test_prompt_carries_the_decision_memory(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {
+                "label": "baseline_lactate",
+                "reviewer": "Dr. Chen",
+                "comment": "measured after the exposure; post-treatment",
+                "decided_at": "2026-08-20T09:00:00+00:00",
+            }
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+
+        llm = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(self.run_id, llm, [])
+        prompt = llm.prompts[0]
+        self.assertIn("PRIOR DECISIONS", prompt)
+        self.assertIn("baseline_lactate", prompt)
+        # a covariate review the fixture recorded on the way to estimand_review
+        self.assertIn("SOFA score", prompt)
+
+    def test_decision_memory_read_helper_is_pure(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "baseline_lactate", "reviewer": "Dr. Chen", "comment": "post-treatment",
+             "decided_at": "2026-08-20T09:00:00+00:00"}
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+
+        before = self.manager.load(self.run_id)
+        memory = self.manager.decision_memory(self.run_id)
+        after = self.manager.load(self.run_id)
+
+        self.assertEqual([item.label for item in memory.rejected_covariates], ["baseline_lactate"])
+        self.assertTrue(memory.decisions)  # covariate reviews from the fixture
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertFalse((self.run_dir / "decision_memory.json").exists())
+
+    def test_reviewer_memory_reaches_the_prompt_only_when_a_reviewer_is_given(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "old_covariate", "reviewer": "Dr. Chen", "comment": "post-treatment",
+             "decided_at": "2026-07-01T00:00:00+00:00"}
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+        self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+
+        without = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(self.run_id, without, [])
+        self.assertIn("No cross-study conventions recorded", without.prompts[0])
+
+        with_reviewer = _CapturingLLM(_COMPANION_REPLY_ONLY)
+        self.manager.run_companion_turn(self.run_id, with_reviewer, [], reviewer="Dr. Chen")
+        prompt = with_reviewer.prompts[0]
+        self.assertIn("REVIEWER CONVENTIONS", prompt)
+        self.assertIn("excluded in earlier studies", prompt)
+        self.assertIn("old_covariate", prompt)
+
+    def test_rejects_the_wrong_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "execution"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_REPLY_ONLY), [])
+
+    def test_requires_study_specification(self):
+        (self.run_dir / "study_specification.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM(_COMPANION_REPLY_ONLY), [])
+
+    def test_malformed_llm_response_raises(self):
+        with self.assertRaises(ValueError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM("not json"), [])
+
+    def test_smuggled_reviewer_in_action_fails_the_turn(self):
+        smuggled = json.dumps({
+            "reply": "recording",
+            "proposed_action": {
+                "action": "set_statistical_estimand_strategy",
+                "args": {
+                    "missing_data_strategy": "complete_case_analysis",
+                    "censoring_strategy": "ignore_censoring_administrative_waiver",
+                    "estimation_procedure": "plug_in_standardization",
+                    "censoring_rationale": "waiver",
+                    "reviewer": "not_a_real_person",
+                },
+            },
+        })
+        with self.assertRaises(ValueError):
+            self.manager.run_companion_turn(self.run_id, _CapturingLLM(smuggled), [])
+
+
+class WorkflowReviewerMemoryTests(unittest.TestCase):
+    """`remember_run_for_reviewer` / `reviewer_memory` -- the opt-in
+    cross-study memory (`causal.companion.reviewer_memory`)."""
+
+    def setUp(self):
+        self.datasets = BigQueryDatasets()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.manager, self.run_id, self.run_dir = _bring_run_to_estimand_review(
+            Path(self.temp.name), self.datasets
+        )
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "baseline_lactate", "reviewer": "Dr. Chen",
+             "comment": "post-treatment", "decided_at": "2026-08-01T00:00:00+00:00"}
+        ]
+        protocol["statistical_estimand_settings"] = {
+            "missing_data_strategy": "complete_case_analysis",
+            "censoring_strategy": "ignore_censoring_administrative_waiver",
+            "estimation_procedure": "plug_in_standardization",
+        }
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+
+    def test_unknown_reviewer_has_empty_memory(self):
+        self.assertTrue(self.manager.reviewer_memory("Nobody New").is_empty())
+
+    def test_remember_folds_the_run_and_persists_under_a_slug(self):
+        merged = self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        self.assertEqual([e.label for e in merged.exclusions], ["baseline_lactate"])
+        self.assertEqual(len(merged.estimand_choices), 1)
+
+        path = Path(self.temp.name) / "reviewers" / "dr_chen" / "memory.json"
+        self.assertTrue(path.is_file())
+        self.assertEqual(self.manager.reviewer_memory("Dr. Chen"), merged)
+
+    def test_remember_is_idempotent_for_the_same_study(self):
+        self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        second = self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        self.assertEqual([e.label for e in second.exclusions], ["baseline_lactate"])
+        self.assertEqual(len(second.estimand_choices), 1)
+
+    def test_remember_does_not_touch_the_run(self):
+        before = self.manager.load(self.run_id)
+        self.manager.remember_run_for_reviewer(self.run_id, "Dr. Chen")
+        after = self.manager.load(self.run_id)
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertFalse((self.run_dir / "decision_memory.json").exists())
+
+    def test_empty_reviewer_name_raises(self):
+        with self.assertRaises(ValueError):
+            self.manager.remember_run_for_reviewer(self.run_id, "   ")
 
 
 def _synthetic_cohort_csv(n: int = 300, seed: int = 11) -> str:
@@ -3292,6 +3590,33 @@ class WorkflowCausalReportTests(WorkflowRunEstimationTests):
         self.assertIn("| sensitivity_analysis.json | sensitivity_agent |", text)
         self.assertIn("| cate.json | cate_agent |", text)
 
+    def test_report_snapshots_the_decision_memory(self):
+        protocol_path = self.run_dir / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["rejected_covariates"] = [
+            {"label": "baseline_lactate", "reviewer": "Dr. Chen",
+             "comment": "post-treatment", "decided_at": "2026-08-20T09:00:00+00:00"}
+        ]
+        protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+        self.manager.advance(self.run_id)
+        self.manager.advance(self.run_id)
+
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("## Reviewer decisions", text)
+        self.assertIn("baseline_lactate", text)
+
+        snapshot_path = self.run_dir / "decision_memory.json"
+        self.assertTrue(snapshot_path.is_file())
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [item["label"] for item in snapshot["rejected_covariates"]], ["baseline_lactate"]
+        )
+        self.assertEqual(snapshot["metadata"]["agent_name"], "decision_memory")
+        state = self.manager.load(self.run_id)
+        self.assertIn("decision_memory.json", state.artifacts)
+        self.assertIn("| decision_memory.json | decision_memory |", text)
+
 
 class WorkflowCausalReportWithoutEstimateTests(WorkflowMaterializeAnalyticDatasetTests):
     """A report built before `run_estimation` ever runs (e.g. a legacy run,
@@ -3685,6 +4010,95 @@ class WorkflowResultsNarrativeReviewTests(_ResultsNarrativeFixture, unittest.Tes
         self.manager.save(state)
         with self.assertRaises(RuntimeError):
             self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee")
+
+
+class WorkflowResultsCompanionTurnTests(_ResultsNarrativeFixture, unittest.TestCase):
+    """`run_results_companion_turn` is the LLM-owning half of the
+    results-interpretation dialogue; the pure prompt-build/parse is covered
+    by `test_companion_agent.py`. `save_results_narrative_draft` persists a
+    drafted narrative through the same path as the one-shot step."""
+
+    def _draft_payload(self) -> dict:
+        """A structurally valid, faithful draft built from the run's own
+        estimation.json -- reuses `_faithful_llm`'s response body."""
+        return json.loads(self._faithful_llm()(""))
+
+    def test_returns_a_parsed_reply_only_turn(self):
+        llm = _CapturingLLM(json.dumps({"reply": "Let's start with the direction of the effect."}))
+        turn = self.manager.run_results_companion_turn(self.run_id, llm, [])
+        self.assertEqual(turn.reply, "Let's start with the direction of the effect.")
+        self.assertIsNone(turn.drafted_narrative)
+
+    def test_prompt_is_grounded_in_the_estimate_and_history(self):
+        estimation = json.loads((self.run_dir / "estimation.json").read_text(encoding="utf-8"))
+        n_total = str(estimation["estimand"]["n_total"])
+        llm = _CapturingLLM(json.dumps({"reply": "ok"}))
+        self.manager.run_results_companion_turn(
+            self.run_id, llm, [CompanionMessage("user", "which way does it point?")]
+        )
+        prompt = llm.prompts[0]
+        self.assertIn(n_total, prompt)
+        self.assertIn("Reviewer: which way does it point?", prompt)
+        self.assertNotIn("analytic_dataset.parquet", prompt)
+
+    def test_turn_can_carry_a_validated_draft(self):
+        llm = _CapturingLLM(json.dumps({"reply": "Drafted it.", "drafted_narrative": self._draft_payload()}))
+        turn = self.manager.run_results_companion_turn(self.run_id, llm, [])
+        self.assertIsNotNone(turn.drafted_narrative)
+        self.assertGreaterEqual(len(turn.drafted_narrative.claims), 3)
+
+    def test_a_turn_does_not_mutate_run_state_or_write_an_artifact(self):
+        before = self.manager.load(self.run_id)
+        llm = _CapturingLLM(json.dumps({"reply": "Drafted it.", "drafted_narrative": self._draft_payload()}))
+        self.manager.run_results_companion_turn(self.run_id, llm, [])
+        after = self.manager.load(self.run_id)
+        self.assertEqual(len(after.history), len(before.history))
+        self.assertFalse((self.run_dir / "results_narrative.json").is_file())
+
+    def test_rejects_the_wrong_phase(self):
+        state = self.manager.load(self.run_id)
+        state.phase = "analysis_plan"
+        self.manager.save(state)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_results_companion_turn(self.run_id, _CapturingLLM("{}"), [])
+
+    def test_rejects_a_missing_estimation_artifact(self):
+        (self.run_dir / "estimation.json").unlink()
+        with self.assertRaises(RuntimeError):
+            self.manager.run_results_companion_turn(self.run_id, _CapturingLLM("{}"), [])
+
+    def test_save_draft_writes_a_pending_artifact_tagged_dialogue(self):
+        state = self.manager.save_results_narrative_draft(
+            self.run_id, self._draft_payload(), [CompanionMessage("user", "go ahead")],
+            model="test-model", provider="test-provider",
+        )
+        artifact = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["source"], "dialogue")
+        self.assertEqual(artifact["review_status"], "pending")
+        self.assertEqual(artifact["model"], "test-model")
+        self.assertIn(artifact["verification"]["status"], {"passed", "warning", "failed"})
+        self.assertIn("results_narrative.json", state.artifacts)
+        self.assertTrue(any(
+            e["event"] == "results_narrative_generated" and "source=dialogue" in e["detail"]
+            for e in state.history
+        ))
+
+    def test_a_saved_draft_goes_through_the_normal_human_review(self):
+        self.manager.save_results_narrative_draft(
+            self.run_id, self._draft_payload(), [], model="m", provider="p"
+        )
+        self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee", "Faithful to the estimate.")
+        artifact = json.loads((self.run_dir / "results_narrative.json").read_text(encoding="utf-8"))
+        self.assertEqual(artifact["review_status"], "approved")
+        report = self.manager.build_causal_report(self.run_id).read_text(encoding="utf-8")
+        self.assertIn("Approved by Dr. Lee", report)
+
+    def test_save_draft_rejects_a_malformed_payload(self):
+        with self.assertRaises(ValueError):
+            self.manager.save_results_narrative_draft(
+                self.run_id, {"narrative": "text", "claims": []}, [], model="m", provider="p"
+            )
+        self.assertFalse((self.run_dir / "results_narrative.json").is_file())
 
 
 class WorkflowVariableRegistryTests(unittest.TestCase):

@@ -59,7 +59,7 @@ the full literature grounding, including a second candidate comparison case.
 | 5. Identification | Implemented for backdoor adjustment: cycle/temporal checks, d-separation, minimum adjustment sets, explicit failure. |
 | 6. OMOP operationalization | Implemented as a first governed version: concept-set and covariate review actions, `OMOPVariableRegistry`, windows, aggregations, and deterministic SQL adapters. |
 | 7. Data support | Extended: aggregate feasibility, mapping audits, cohort profile, and follow-up observability, plus univariate treatment-arm overlap (`positivity_audit_sql` -- one covariate at a time, not full joint-adjustment-set stratification), per-covariate missingness (`covariate_missingness_sql`, generalized beyond the three hardcoded demographics), and a reviewer-approvable per-row administrative censoring definition (`WorkflowManager.approve_censoring_definition`, reusing `followup_audit_sql`'s own aggregate logic per person). None of these is a full positivity/missing-data-mechanism/censoring-model validation in the statistical sense -- see each function's own docstring for what it does and does not claim. |
-| 8. Statistical estimand | Implemented: `roadmap.StatisticalEstimand` is a separate, persisted contract from the counterfactual estimand (`CausalEstimand`) -- identifying functional, outcome-model specification, the adjustment set as actually built into `cohort.sql` (`cohort_manifest.json`'s `baseline_covariate` columns, not re-derived), and an explicit, reviewer-set missing-data and censoring strategy (`WorkflowManager.set_statistical_estimand_strategy`), persisted as `statistical_estimand.json` when the `statistical_estimand` gate is approved (`estimand_review` phase, between `analysis_plan` and `execution`). The analytic cohort's per-row `censored` column, previously unused by anything, is now read by `EstimationAgent` when `censoring_strategy="exclude_censored_before_analysis"`; `"ignore_censoring_administrative_waiver"` is the explicit, reviewed alternative when a reviewer judges it unused. Neither strategy is IPCW or another censoring-weighting method -- see milestone 3 below for what remains open. |
+| 8. Statistical estimand | Implemented: `roadmap.StatisticalEstimand` is a separate, persisted contract from the counterfactual estimand (`CausalEstimand`) -- identifying functional, outcome-model specification, the adjustment set as actually built into `cohort.sql` (`cohort_manifest.json`'s `baseline_covariate` columns, not re-derived), and an explicit, reviewer-set missing-data and censoring strategy (`WorkflowManager.set_statistical_estimand_strategy`), persisted as `statistical_estimand.json` when the `statistical_estimand` gate is approved (`estimand_review` phase, between `analysis_plan` and `execution`). The analytic cohort's per-row `censored` column, previously unused by anything, is now read by `EstimationAgent` when `censoring_strategy="exclude_censored_before_analysis"`; `"ignore_censoring_administrative_waiver"` is the explicit, reviewed alternative when a reviewer judges it unused. Neither strategy is IPCW or another censoring-weighting method -- see milestone 3 below for what remains open. In the Streamlit UI the three choices are settled through the estimand-dialogue companion (`causal.companion.companion`), which proposes `set_statistical_estimand_strategy` as a human-confirmed card; the CLI `estimand-strategy` command and the UI's "Fill the form directly" fallback are the same call. |
 | 9. Estimation | Implemented for the ATE, risk-difference scale, binary outcome, via a reviewer's choice of estimator: `causal.agents.estimation.EstimationAgent` (transparent g-computation/standardization, an unpenalized logistic outcome-regression model, nonparametric bootstrap CI, cited to Hernan & Robins *Causal Inference: What If* ch. 13) or `causal.agents.tmle.TMLEAgent` (TMLE, `SuperLearner`-ensembled nuisance models, doubly robust). Also implemented: `causal.agents.cate.CATEAgent` for the CATE, a prespecified effect-modifier subgroup family via a causal forest. `WorkflowManager.materialize_analytic_dataset` is the one code path that pulls patient-level rows into memory (via OMCP's already-existing, previously-unused `cohort_build` governed operation) to fit any of them. See milestone 4 for full detail and what remains (an LLM narrative for CATE subgroup results). |
 | 10. Diagnostics and sensitivity | Extended beyond pre-estimation data diagnostics: standardized mean difference (SMD) covariate balance per arm (`causal.agents.diagnostics.DiagnosticsAgent`, Austin 2009, `\|SMD\| > 0.1` flag), in-sample outcome-model AUC/Brier calibration, E-value quantitative sensitivity analysis (`causal.sensitivity.e_value`, VanderWeele & Ding 2017), and negative controls (`causal.queries.negative_controls`) are implemented. Joint/multivariate covariate balance is not (see milestone 6). |
 | 11. Causal report | Implemented: `WorkflowManager.build_causal_report` writes `causal_report.md`, linking the estimate, diagnostics, assumptions/limitations, approval-gate history, and per-artifact provenance -- the `results` gate (`REQUIRED_GATES["results_review"]`, previously defined but never reached by any run) is now the human sign-off before it, entirely independent of the optional narrative below. An optional, gracefully-degrading LLM narrative section (`causal.agents.results_narrative`) may interpret the already-computed numbers for a clinical reviewer; it is fed only JSON-safe artifacts, never the patient-level dataset, must return structured `claims` alongside its prose, and is deterministically fact-checked by `causal.agents.results_faithfulness.verify_narrative` (no second LLM) before a human reviewer (`WorkflowManager.review_results_narrative`) can approve or exclude it -- only an `approved` narrative with no `failed` check is ever included in `causal_report.md`; everything else renders as "not requested" or "excluded". `demo_report.md` (`build_demo_report`) is unchanged and remains the earlier pre-estimation feasibility snapshot. |
@@ -91,8 +91,32 @@ reviewable graphs.
 
 ## Evidence and LLM boundary
 
-- The question gate and drafting agents are advisory LLM steps. They cannot
-  approve a protocol, a DAG, an OMOP mapping, or execution.
+- The question gate, the drafting agents, the estimand-dialogue companion
+  (`causal.companion.companion`, at the `statistical_estimand` gate), and the
+  results-interpretation dialogue companion (same module, at
+  `results_review` / `report`) are advisory LLM steps. They cannot approve a
+  protocol, a DAG, an OMOP mapping, a statistical estimand, execution, or the
+  `results` gate. The estimand companion's one possible write,
+  `set_statistical_estimand_strategy`, is an explicitly human-confirmed card
+  gated by a code-level allow-list (`causal.companion.actions`); approving
+  the gate itself stays manual. The results companion's only outcome is a
+  drafted narrative the reviewer explicitly saves
+  (`save_results_narrative_draft`), which then goes through the same
+  deterministic `verify_narrative` and the same human
+  `review_results_narrative` approval as a one-shot narrative.
+- The estimand companion is additionally fed a **decision memory**
+  (`causal.companion.decision_memory`): a deterministic, no-LLM digest of the
+  reviewer's already-recorded exclusions (`protocol.json`'s
+  `rejected_covariates`) and decisions (`state.history` entries, gate
+  invalidations, and any rejected gate with its comment), so it will not
+  re-propose a covariate the reviewer threw out or re-open a settled choice.
+  It changes what the companion is told, never what it can do.
+  `build_causal_report` freezes it as a `decision_memory.json` snapshot and
+  lists it in the report's Provenance table. An opt-in **reviewer memory**
+  (`causal.companion.reviewer_memory`, `artifacts/reviewers/<slug>/`)
+  carries the same class of decisions *across* studies when a human asks;
+  it is rendered as `REVIEWER CONVENTIONS`, still advisory, still no
+  patient data.
 - PubMed and OpenAlex provide literature records; OptimusKG is an optional
   relation source. Retrieved identifiers form a deterministic allow-list for
   citations emitted by the model.
@@ -120,7 +144,12 @@ reviewable graphs.
   otherwise influence. `causal_report.md` includes the narrative's text
   only once it is `approved` with a clean verification -- an unrequested,
   still-`pending`, or `excluded` narrative renders as a plain status line
-  instead.
+  instead. In the Streamlit UI this narrative is normally drafted through
+  the results-interpretation dialogue (the companion walks the reviewer
+  through the estimate one topic at a time, then drafts the
+  `{ narrative, claims }`); the one-shot `run_results_narrative` remains the
+  no-conversation fallback and `results_narrative.json` records which path
+  produced it (`source`).
 
 See [llm_hypothesis_integration.md](llm_hypothesis_integration.md) and the
 [DAG generation reference](dag_generation_audit.md).

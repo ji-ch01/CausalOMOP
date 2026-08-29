@@ -1,7 +1,7 @@
 """Coverage for `causal.ui.streamlit_app`'s pure helper functions.
 
 The module is a Streamlit script (`st.*` calls throughout its `_render_*`
-functions), so most of it needs a real app run to exercise. This file only
+functions), so most of it needs a real app run to exercise. This file mostly
 targets the helpers that don't touch `st.*` -- JSON/CSV parsing, dataclass
 construction from a dict, DOT generation, sorting/labeling -- which is where
 plain data bugs (a missing `.get()` default, a wrong sort key) would actually
@@ -9,6 +9,10 @@ show up. Importing the module itself is also useful signal: it fails fast if
 a rename in `causal.agents.hypothesis`/`causal.roadmap`/etc. breaks the app's
 imports, something `python -c "import ..."` isn't otherwise checked for by
 this test suite.
+
+`MainLayoutSmokeTests` is the one exception -- it drives `main()` through
+`streamlit.testing.v1.AppTest` to guard the two-column conversation/workspace
+layout against a load-time crash.
 """
 
 import inspect
@@ -20,9 +24,12 @@ from pathlib import Path
 from unittest import mock
 
 import streamlit as st
+from streamlit.testing.v1 import AppTest
 
 from causal.roadmap import CausalDAG, CausalEdge, CausalNode
 from causal.ui import streamlit_app as app
+
+_APP_PATH = Path(app.__file__)
 
 
 class ReadJsonTests(unittest.TestCase):
@@ -450,6 +457,283 @@ class ReviewerFieldSyncTests(unittest.TestCase):
         finally:
             for key in ("reviewer_name", "some_other_widget"):
                 st.session_state.pop(key, None)
+
+
+class MainLayoutSmokeTests(unittest.TestCase):
+    """Drives `main()` end to end via AppTest. Scoped to an empty runs dir so
+    it exercises the "no run selected" branch -- the new code path (two-column
+    split, conversation panel, sidebar "New study" button) -- without needing
+    a materialized run on disk."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self._patch = mock.patch.object(app, "RUNS_DIR", Path(self._temp.name))
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _run(self) -> AppTest:
+        harness = AppTest.from_file(str(_APP_PATH), default_timeout=30)
+        harness.run()
+        return harness
+
+    def test_main_renders_without_exception_when_no_run_is_selected(self):
+        harness = self._run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertIn("Conversation", [block.value for block in harness.subheader])
+        self.assertEqual(len(harness.chat_input), 1)
+
+    def test_sidebar_exposes_a_new_study_button(self):
+        harness = self._run()
+        self.assertIn("New study", [button.label for button in harness.button])
+
+    def test_new_study_button_click_reruns_cleanly(self):
+        harness = self._run()
+        new_study = next(button for button in harness.button if button.label == "New study")
+        new_study.click().run()
+        self.assertEqual(list(harness.exception), [])
+
+
+def _estimand_review_form_script(run_dir: str) -> None:
+    """AppTest script: render `_render_statistical_estimand_review` for a
+    minimal seeded run so the flattened layout + the nested "Fill the form
+    directly" expander are exercised for a nesting error."""
+    import json
+    from pathlib import Path
+
+    from causal.orchestrator.state import RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_statistical_estimand_review
+
+    path = Path(run_dir)
+    (path / "protocol.json").write_text(json.dumps({"study_id": "s", "query_settings": {}}), encoding="utf-8")
+    (path / "study_specification.json").write_text(
+        json.dumps({"estimand": {"population_summary": "ATE", "effect_measure": "risk_difference"}}),
+        encoding="utf-8",
+    )
+    (path / "cohort_manifest.json").write_text(
+        json.dumps({"columns": [{"name": "age", "role": "baseline_covariate"}]}), encoding="utf-8"
+    )
+    state = RunState(
+        run_id="run1", study_id="s", protocol_path=str(path / "protocol.json"), phase="estimand_review"
+    )
+    _render_statistical_estimand_review(WorkflowManager(path.parent), state, path)
+
+
+class EstimandReviewFormSmokeTests(unittest.TestCase):
+    def test_render_has_the_dialogue_pointer_and_a_non_nested_form_expander(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run1"
+            run_dir.mkdir()
+            harness = AppTest.from_function(
+                _estimand_review_form_script, kwargs={"run_dir": str(run_dir)}, default_timeout=30
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Fill the form directly" in block.label for block in harness.expander))
+        self.assertTrue(any("conversation on the left" in block.value for block in harness.info))
+
+
+def _decision_memory_script(runs_dir: str) -> None:
+    """AppTest script: render `_render_decision_memory` for a run that has a
+    rejected covariate and a decided gate, so the transparency surface is
+    exercised end to end (workflow read helper + dataframes + the
+    "as the companion sees it" block)."""
+    import json
+    from pathlib import Path
+
+    from causal.orchestrator.state import ApprovalGate, RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_decision_memory
+
+    root = Path(runs_dir)
+    run_dir = root / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "protocol.json").write_text(
+        json.dumps(
+            {
+                "study_id": "s",
+                "rejected_covariates": [
+                    {
+                        "label": "baseline_lactate",
+                        "reviewer": "Dr. Chen",
+                        "comment": "post-treatment",
+                        "decided_at": "2026-08-20T09:00:00+00:00",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = WorkflowManager(root)
+    state = RunState(
+        run_id="run1", study_id="s", protocol_path=str(run_dir / "protocol.json"), phase="estimand_review"
+    )
+    state.gates["dag_review"] = ApprovalGate(
+        name="dag_review", status="rejected", reviewer="Dr. Chen",
+        comment="adjustment set is missing renal function",
+        decided_at="2026-08-20T10:00:00+00:00",
+    )
+    manager.save(state)
+    _render_decision_memory(manager, "run1")
+
+
+class DecisionMemorySmokeTests(unittest.TestCase):
+    def test_render_shows_the_exclusion_and_the_rejected_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _decision_memory_script, kwargs={"runs_dir": temp}, default_timeout=30
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Decision memory" in block.value for block in harness.subheader))
+        rendered = " ".join(block.value for block in harness.code)
+        self.assertIn("baseline_lactate", rendered)
+        self.assertIn("dag_review rejected by Dr. Chen", rendered)
+
+
+def _reviewer_memory_script(root_dir: str, reviewer: str) -> None:
+    """AppTest script: render `_render_reviewer_memory` for a seeded run,
+    with `reviewer` (possibly blank) in session state."""
+    import json
+    from pathlib import Path
+
+    import streamlit as st
+
+    from causal.orchestrator.state import RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_reviewer_memory
+
+    root = Path(root_dir)
+    run_dir = root / "runs" / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "protocol.json").write_text(
+        json.dumps(
+            {
+                "study_id": "albumin_sepsis",
+                "rejected_covariates": [
+                    {"label": "baseline_lactate", "reviewer": "Dr. Chen",
+                     "comment": "post-treatment", "decided_at": "2026-08-01T00:00:00+00:00"}
+                ],
+                "statistical_estimand_settings": {
+                    "missing_data_strategy": "complete_case_analysis",
+                    "censoring_strategy": "ignore_censoring_administrative_waiver",
+                    "estimation_procedure": "plug_in_standardization",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = WorkflowManager(root / "runs")
+    manager.save(
+        RunState(
+            run_id="run1", study_id="albumin_sepsis",
+            protocol_path=str(run_dir / "protocol.json"), phase="report",
+        )
+    )
+    if reviewer:
+        st.session_state["reviewer_name"] = reviewer
+    _render_reviewer_memory(manager, "run1")
+
+
+class ReviewerMemorySmokeTests(unittest.TestCase):
+    def test_no_reviewer_name_prompts_for_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _reviewer_memory_script, kwargs={"root_dir": temp, "reviewer": ""},
+                default_timeout=30,
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Enter your name in the sidebar" in c.value for c in harness.caption))
+
+    def test_button_folds_the_run_into_the_reviewer_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _reviewer_memory_script, kwargs={"root_dir": temp, "reviewer": "Dr. Chen"},
+                default_timeout=30,
+            )
+            harness.run()
+            self.assertEqual(list(harness.exception), [])
+            button = next(
+                b for b in harness.button if "Add this run's decisions" in b.label
+            )
+            button.click().run()
+        self.assertEqual(list(harness.exception), [])
+        cells = " ".join(str(df.value.to_dict()) for df in harness.dataframe)
+        self.assertIn("baseline_lactate", cells)
+        self.assertIn("plug_in_standardization", cells)
+
+
+def _results_narrative_section_script(run_dir: str) -> None:
+    """AppTest script: render `_render_results_narrative_section` for a run
+    that has an estimate but no interpretation yet, to guard that arriving at
+    the section no longer fires a one-shot LLM call (the dialogue does that
+    now) and offers the one-step fallback instead."""
+    import json
+    from pathlib import Path
+
+    from causal.orchestrator.state import RunState
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_results_narrative_section
+
+    path = Path(run_dir)
+    (path / "estimation.json").write_text(
+        json.dumps({"estimand": {"point_estimate": 0.01, "ci_lower": -0.1, "ci_upper": 0.1, "n_total": 200}}),
+        encoding="utf-8",
+    )
+    state = RunState(
+        run_id="run1", study_id="s", protocol_path=str(path / "protocol.json"), phase="results_review"
+    )
+    _render_results_narrative_section(WorkflowManager(path.parent), state, path)
+
+
+def _concept_lookup_term_suggester_script(runs_dir: str) -> None:
+    """AppTest script: render the shared "Suggest search terms" button for a
+    minimal run so the section renders without a crash (the button itself is
+    not clicked -- that path needs a live LLM)."""
+    from pathlib import Path
+
+    from causal.orchestrator.workflow import WorkflowManager
+    from causal.ui.streamlit_app import _render_concept_lookup_term_suggester
+
+    protocol = {
+        "target_trial": {"population": "sepsis", "treatment": "albumin", "comparator": "crystalloid", "outcome": "death"},
+        "concept_sets": {
+            "population": {"role": "population", "label": "sepsis", "status": "pending_omop_mapping"},
+            "treatment": {"role": "treatment", "label": "albumin", "status": "pending_omop_mapping"},
+        },
+    }
+    _render_concept_lookup_term_suggester(
+        WorkflowManager(runs_dir), "run1", protocol, protocol["concept_sets"]
+    )
+
+
+class ConceptLookupTermSuggesterSmokeTests(unittest.TestCase):
+    def test_renders_the_shared_button(self):
+        with tempfile.TemporaryDirectory() as temp:
+            harness = AppTest.from_function(
+                _concept_lookup_term_suggester_script,
+                kwargs={"runs_dir": str(Path(temp) / "runs")},
+                default_timeout=30,
+            )
+            harness.run()
+        self.assertEqual(list(harness.exception), [])
+        self.assertTrue(any("Suggest search terms" in button.label for button in harness.button))
+
+
+class ResultsNarrativeSectionSmokeTests(unittest.TestCase):
+    def test_no_autogen_on_arrival_offers_the_one_step_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run1"
+            run_dir.mkdir()
+            harness = AppTest.from_function(
+                _results_narrative_section_script, kwargs={"run_dir": str(run_dir)}, default_timeout=30
+            )
+            harness.run()
+            self.assertEqual(list(harness.exception), [])
+            self.assertFalse((run_dir / "results_narrative.json").is_file())
+        self.assertTrue(any("Draft in one step" in button.label for button in harness.button))
 
 
 if __name__ == "__main__":

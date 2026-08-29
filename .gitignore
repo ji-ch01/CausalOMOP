@@ -37,6 +37,7 @@ notebooks/depressive_disorder_analysis.ipynb
 # ── Environment / secrets ─────────────────────────────────────────────────────
 .env
 artifacts/runs/
+artifacts/reviewers/
 # sample.env and omcp/sample.env are kept (they contain no secrets)
 *-key.json
 *-export-key.json

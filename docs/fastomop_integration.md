@@ -96,8 +96,15 @@ specification before SQL is generated.
 ## CausalOMOP -> FastOMOP Bridge
 
 `causal.fastomop_bridge.ask_fastomop` is what the CLI's `workflow
-start-question` and the Streamlit "New causal study" form call when the
-causal-question gate classifies a question as `descriptive`. It does not
+start-question` and the Streamlit conversation panel call (via
+`causal.companion.intake`) when the causal-question gate classifies a
+question as `descriptive`. In the Streamlit panel, a descriptive follow-up
+is answered in context: the last `MAX_DESCRIPTIVE_CONTEXT` answered
+`(question, answer)` pairs from the same thread are folded into the question
+(`intake.combine_descriptive_followup`) before it reaches the gate and
+`ask_fastomop`, so "and how many were women?" resolves against the prior
+count. `ask_fastomop` itself is unchanged -- it still takes one question
+string. It does not
 import `agno_fastomop.workflows.omop_workflow` in-process: `agno_fastomop/` is
 a separate Python 3.13 + `uv`-managed project with its own dependency tree
 (agno, an Ollama/Anthropic/OpenAI client, langfuse...) that is not installed

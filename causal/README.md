@@ -57,7 +57,12 @@ call it.
   `statistical_estimand` review before any patient-level row is
   materialized -- the analytic cohort's per-row `censored` column, unused by
   anything before this gate existed, is now excluded from the estimation
-  sample when the reviewed strategy says so;
+  sample when the reviewed strategy says so. In the Streamlit UI those three
+  choices are settled through the estimand-dialogue companion
+  (`causal/companion/companion.py`), which proposes
+  `set_statistical_estimand_strategy` as a human-confirmed card behind a
+  code-level allow-list (`causal/companion/actions.py`); approving the gate
+  itself stays manual;
 - aggregate-only feasibility counts, mapping-audit diagnostics, univariate
   positivity screening, and per-covariate missingness audits;
 - person-level analytic cohort SQL generation (`A`, `Y`, `index_datetime`,
@@ -123,7 +128,12 @@ call it.
   results_faithfulness` (no second LLM), and is included in the report only
   once a human reviewer approves it with no failed check
   (`WorkflowManager.review_results_narrative`) -- a decision entirely
-  separate from the mandatory `results` gate;
+  separate from the mandatory `results` gate. In the Streamlit UI that
+  narrative is normally drafted through the results-interpretation dialogue
+  companion (`WorkflowManager.run_results_companion_turn`), the
+  results-review counterpart of the estimand dialogue; "Draft in one step"
+  is the no-conversation fallback and both paths write the same verified,
+  human-approved artifact;
 - CATE (conditional average treatment effect) for a prespecified family of
   effect-modifier subgroups, cited to Athey & Imbens 2016 and Wager & Athey
   2018 (`causal.agents.cate.CATEAgent`, a causal forest via `econml.dml.
@@ -191,7 +201,23 @@ The natural-language entry point includes a causal-question classifier before
 target-trial drafting. It refuses descriptive questions with a FastOMOP
 redirect and requests clarification when the intervention or outcome is too
 ambiguous. The gate is LLM-based and may be skipped explicitly for controlled
-testing; it is not a replacement for human protocol review.
+testing; it is not a replacement for human protocol review. In the Streamlit
+UI this intake is a conversation panel (`causal/companion/`): clarification
+is answerable over multiple rounds and the exchange is persisted per run as
+`conversation.jsonl`, an advisory record with no gate authority. That same
+left panel becomes an active dialogue at the two points a run most needs
+one -- the `statistical_estimand` gate (estimand dialogue) and results
+review (results-interpretation dialogue) -- each a read-only companion turn
+whose only outcome is a human-confirmed card. The estimand dialogue also
+gets a deterministic **decision memory**
+(`causal/companion/decision_memory.py`) -- the reviewer's already-recorded
+covariate exclusions and decisions, distilled with no LLM -- so it does not
+re-propose something the reviewer already ruled out. Inspect it with
+`workflow decision-memory <run_id>`; `causal-report` freezes it as
+`decision_memory.json`. An opt-in **reviewer memory**
+(`causal/companion/reviewer_memory.py`, `artifacts/reviewers/<slug>/`)
+carries the same kind of decisions across studies when a human clicks "Add
+this run's decisions to my reviewer memory" (or `workflow remember-run`).
 
 ## Important implementation boundary
 

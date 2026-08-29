@@ -62,6 +62,14 @@ are redirected to FastOMOP; ambiguous requests return a clarification question.
 The causal path can retrieve PubMed/OpenAlex evidence, use OptimusKG when
 available, and run a bounded DAG critique/revision loop.
 
+In the Streamlit UI the same intake runs as a conversation panel: the
+clinical question, the gate verdict, any clarification rounds, the FastOMOP
+answer for a descriptive question, and the "study created" event are shown
+as a thread and written to `artifacts/runs/<run_id>/conversation.jsonl` once
+the run exists. That transcript is an advisory record only -- it carries no
+decision authority and never reaches a gate; every approval still goes
+through `WorkflowManager` explicitly.
+
 ## Show the audit trail
 
 Under `artifacts/runs/<run_id>/`, show:
@@ -99,6 +107,14 @@ OMCP lookup results are candidates only. Review mappings through
 ```powershell
 streamlit run causal/ui/streamlit_app.py
 ```
+
+In the Streamlit concept-mapping section a shared "Suggest search terms"
+button makes one LLM call (`causal.agents.concept_lookup_terms`) that
+pre-fills the OMOP-search box for every concept set from its clinical label,
+persisted as `concept_sets[name].lookup_term`
+(`WorkflowManager.set_concept_set_lookup_terms`). It is a search convenience
+only -- it invalidates no gate and chooses no concept; the reviewer still
+runs each search and approves each mapping.
 
 Never approve a mapping or gate merely to make a live demo proceed.
 
@@ -148,6 +164,39 @@ Choosing `exclude_censored_before_analysis` instead requires the per-row
 `censored` column to already be approved
 (`WorkflowManager.approve_censoring_definition`) -- the gate blocks otherwise.
 
+In the Streamlit UI this is a conversation: while the run is in
+`estimand_review` the left panel becomes the estimand dialogue
+(`causal.companion.companion` via `WorkflowManager.run_companion_turn`). The
+study companion walks the reviewer through the three choices one at a time,
+grounded in the same pre-gate diagnostic artifacts, and can end a turn by
+proposing `set_statistical_estimand_strategy` as a card. The card shows an
+editable rationale and applies nothing until the reviewer clicks Confirm; a
+strict allow-list (`causal.companion.actions`) means the companion can only
+ever propose that one write, with arguments in range, and never the reviewer
+identity. Approving the `statistical_estimand` gate itself stays a separate
+manual action, and the "Fill the form directly" expander is the same call
+without the dialogue. The companion is fed only JSON artifacts, never
+`analytic_dataset.parquet`.
+
+Each turn also carries a **decision memory**
+(`causal.companion.decision_memory`): a deterministic, no-LLM digest of the
+covariates the reviewer already excluded (`protocol.json`'s
+`rejected_covariates`) and the choices already recorded this run (decision
+entries in `state.json`'s history, gate invalidations, and any rejected
+gate with its review comment). The prompt tells the companion not to
+re-propose an excluded covariate or quietly re-open a settled choice. It is
+derived from state the turn already loads, so `run_companion_turn` still
+writes nothing; `python -m causal.cli workflow decision-memory <run_id>`
+prints the same digest, and `causal-report` freezes it as a
+`decision_memory.json` snapshot.
+
+An opt-in **reviewer memory** (`causal.companion.reviewer_memory`,
+`artifacts/reviewers/<slug>/memory.json`) extends this across studies:
+prior covariate exclusions and estimand strategies for the sidebar
+reviewer, folded in only on an explicit "Add this run's decisions to my
+reviewer memory" (or `workflow remember-run`), and shown to the dialogue as
+`REVIEWER CONVENTIONS` -- advisory context, never a decision already made.
+
 ## Estimation and the causal report
 
 Only once `clinical_mapping`, `analysis_plan`, and `statistical_estimand` are
@@ -173,6 +222,21 @@ governed by OMCP's signed `cohort_build` operation) -- it never leaves the run
 directory and is never sent to an LLM. `narrative <run_id>` is optional and
 calls the configured LLM provider to interpret the already-computed estimate
 only; skipping it never blocks `causal-report`.
+
+In the Streamlit UI this interpretation is a conversation too: while the run
+is in `results_review` / `report` the left panel becomes the
+results-interpretation dialogue (`causal.companion.companion` via
+`WorkflowManager.run_results_companion_turn`). The companion talks the
+reviewer through direction, magnitude, uncertainty, diagnostics, robustness,
+and limitations one topic at a time -- grounded in the same JSON-safe
+`NarrativeInput` the one-shot step uses, never `analytic_dataset.parquet` --
+then ends a turn with a drafted `{ narrative, claims[] }`. "Save for review"
+(`save_results_narrative_draft`) runs the same deterministic
+`verify_narrative` and writes `results_narrative.json`; the reviewer still
+approves or excludes it under **Estimation & report**
+(`review_results_narrative`), and only an approved, clean narrative reaches
+`causal_report.md`. The "Draft in one step" button is the same outcome
+without the conversation.
 
 ## Safe claims
 

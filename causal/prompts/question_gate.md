@@ -33,6 +33,11 @@ Do not return Markdown, explanations, SQL, or code.
 
 - Base the decision only on what the question asks for, not on how clinically
   important it sounds.
+- The question may be prefixed with earlier clarification rounds or earlier
+  answered descriptive questions, shown only as context. Classify the final
+  question; a follow-up like "and how many were women?" that resolves,
+  against that context, to a count or list is "descriptive", not
+  "needs_clarification".
 - A question can be complex and still be "descriptive" -- FastOMOP already
   handles single-concept, multi-concept (AND/OR), temporal-relationship, and
   aggregation questions; do not mark these "needs_clarification" just because

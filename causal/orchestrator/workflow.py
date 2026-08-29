@@ -11,6 +11,7 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,11 +42,31 @@ from causal.agents.results_narrative import (
     DEFAULT_NARRATIVE_PROMPT_PATH,
     NARRATIVE_BOUNDARY_STATEMENT,
     NarrativeInput,
+    NarrativeResult,
     build_narrative_prompt,
+    narrative_result_from_payload,
     normalize_narrative_artifact,
     parse_narrative_response,
 )
 from causal.agents.user_question import GeneratedHypothesis
+from causal.companion.companion import (
+    DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
+    DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
+    CompanionMessage,
+    CompanionTurn,
+    EstimandDialogueContext,
+    ResultsCompanionTurn,
+    build_estimand_dialogue_prompt,
+    build_results_dialogue_prompt,
+    parse_companion_turn,
+    parse_results_companion_turn,
+)
+from causal.companion.decision_memory import DecisionMemory, distill_decision_memory
+from causal.companion.reviewer_memory import (
+    ReviewerMemory,
+    merge_run_into_memory,
+    slugify_reviewer,
+)
 from causal.llm.base import LLMCallable
 from causal.bigquery import BigQueryOMOPGateway
 from causal.config import BigQueryDatasets
@@ -1230,6 +1251,56 @@ class WorkflowManager:
         )
         self._invalidate_gate(state, "clinical_mapping", f"concept_sets['{name}'] changed")
         self._invalidate_gate(state, "analysis_plan", f"concept_sets['{name}'] changed")
+        self.save(state)
+        return state
+
+    def set_concept_set_lookup_terms(self, run_id: str, terms: dict[str, str]) -> RunState:
+        """Update `concept_sets[name].lookup_term` for one or more entries.
+
+        `lookup_term` is only a search hint: it seeds the default value of the
+        OMOP concept-search box in the UI (and the term
+        `causal.agents.data_science.DataScienceAgent` uses to pre-fetch
+        candidate concepts). It is not part of any mapping decision -- it does
+        not feed `_load_concept_specs`, cohort/feasibility SQL, or any gate --
+        so this writes `protocol.json` under the lock and records the change,
+        but invalidates no gate and does not regenerate `hypothesis.json`.
+
+        Backs the "Suggest search terms" button in the Streamlit
+        concept-mapping section (`causal.agents.concept_lookup_terms`); a name
+        not present in `concept_sets` is ignored rather than raising, since
+        the set can change between the suggestion and the save.
+        """
+        if not isinstance(terms, dict) or not all(
+            isinstance(name, str) and isinstance(value, str) for name, value in terms.items()
+        ):
+            raise ValueError("terms must be a {concept_set_name: search_term} mapping of strings")
+        cleaned = {name: value.strip() for name, value in terms.items() if value.strip()}
+        if not cleaned:
+            raise ValueError("terms contains no non-empty search term")
+
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            concept_sets = protocol.get("concept_sets", {})
+            applied = {
+                name: value for name, value in cleaned.items()
+                if isinstance(concept_sets.get(name), dict)
+            }
+            if not applied:
+                raise RuntimeError("none of the given names match a concept set on this run")
+            protocol["concept_sets"] = {
+                name: ({**entry, "lookup_term": applied[name]} if name in applied else entry)
+                for name, entry in concept_sets.items()
+            }
+            temporary = protocol_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+            temporary.replace(protocol_path)
+        state.record(
+            "concept_set_lookup_terms_set",
+            "; ".join(f"{name}={value!r}" for name, value in sorted(applied.items())),
+        )
         self.save(state)
         return state
 
@@ -3063,9 +3134,27 @@ class WorkflowManager:
         (see its own docstring), it never calls an LLM itself.
         """
         state = self.load(run_id)
+        narrative_input = self._results_narrative_input(state)
+        prompt = build_narrative_prompt(prompt_path, narrative_input)
+        result = parse_narrative_response(llm(prompt))
+        return self._write_results_narrative(
+            run_id, narrative_input, result,
+            prompt=prompt, model=model, provider=provider, source="one_shot",
+        )
+
+    def _results_narrative_input(self, state: RunState) -> NarrativeInput:
+        """Build the JSON-safe `NarrativeInput` for a run from its on-disk
+        artifacts. Shared by `run_results_narrative` (one-shot),
+        `run_results_companion_turn` (a dialogue turn), and
+        `save_results_narrative_draft` (persisting a dialogue draft) so all
+        three interpret -- and `verify_narrative` checks -- against the
+        identical bundle. Raises if the phase is not `results_review` /
+        `report` or `estimation.json` is missing.
+        `analytic_dataset.parquet` is never read here.
+        """
         if state.phase not in {"results_review", "report"}:
             raise RuntimeError("Results narrative requires the results_review or report phase")
-        run_dir = self.runs_dir / run_id
+        run_dir = self.runs_dir / state.run_id
         estimation_path = run_dir / "estimation.json"
         if not estimation_path.is_file():
             raise RuntimeError("Run run_estimation first")
@@ -3080,7 +3169,7 @@ class WorkflowManager:
             study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics,
             estimation.get("estimand", {}), cate,
         )
-        narrative_input = NarrativeInput(
+        return NarrativeInput(
             study_id=state.study_id,
             question=study_spec.get("question", {}),
             estimand=study_spec.get("estimand", {}),
@@ -3099,9 +3188,27 @@ class WorkflowManager:
             ),
             assumptions_and_limitations=tuple(assumptions),
         )
-        prompt = build_narrative_prompt(prompt_path, narrative_input)
-        result = parse_narrative_response(llm(prompt))
+
+    def _write_results_narrative(
+        self,
+        run_id: str,
+        narrative_input: NarrativeInput,
+        result: NarrativeResult,
+        *,
+        prompt: str,
+        model: str,
+        provider: str,
+        source: str,
+    ) -> RunState:
+        """Run the deterministic `verify_narrative` and persist a parsed
+        narrative as `results_narrative.json` (`review_status: pending`).
+        `source` is `one_shot` (`run_results_narrative`) or `dialogue`
+        (`save_results_narrative_draft`) -- the artifacts are identical in
+        shape and both still require `review_results_narrative` before the
+        report.
+        """
         verification = verify_narrative(result, narrative_input)
+        run_dir = self.runs_dir / run_id
         artifact = {
             "schema_version": "2.0",
             "narrative": result.narrative_text,
@@ -3114,10 +3221,11 @@ class WorkflowManager:
             "boundary_statement": NARRATIVE_BOUNDARY_STATEMENT,
             "model": model,
             "provider": provider,
+            "source": source,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "metadata": artifact_metadata(
                 "results_narrative_agent", "0.2.0",
-                {"study_id": state.study_id, "model": model, "provider": provider},
+                {"study_id": narrative_input.study_id, "model": model, "provider": provider},
             ),
         }
         with _RunLock(run_dir):
@@ -3129,11 +3237,74 @@ class WorkflowManager:
                 state.artifacts.append("results_narrative.json")
             state.record(
                 "results_narrative_generated",
-                f"results_narrative.json; model={provider}:{model}; "
+                f"results_narrative.json; source={source}; model={provider}:{model}; "
                 f"verification={verification.status}; claims={len(result.claims)}",
             )
             self.save(state)
         return state
+
+    def run_results_companion_turn(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        history: Sequence[CompanionMessage],
+        *,
+        prompt_path: Path = DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
+    ) -> ResultsCompanionTurn:
+        """One turn of the conversational assist for interpreting the
+        finished estimate (`causal.companion.companion`) -- the
+        results-review counterpart of `run_companion_turn`. Owns the
+        `llm(prompt)` call and the JSON-artifact reads; the pure
+        prompt-build/parse lives in the companion module.
+
+        Read-only with respect to run state: no `_RunLock`, nothing recorded
+        in `state.history`, no file written. A turn may end with a
+        `drafted_narrative`; the caller persists it with
+        `save_results_narrative_draft` on an explicit reviewer confirm, and
+        `review_results_narrative` is still the only way a narrative reaches
+        `build_causal_report`.
+
+        Same grounding as `run_results_narrative`: `NarrativeInput` from
+        on-disk JSON only, so `analytic_dataset.parquet` never reaches `llm`.
+        """
+        state = self.load(run_id)
+        narrative_input = self._results_narrative_input(state)
+        prompt = build_results_dialogue_prompt(
+            prompt_path, history=history, narrative_input=narrative_input
+        )
+        return parse_results_companion_turn(llm(prompt))
+
+    def save_results_narrative_draft(
+        self,
+        run_id: str,
+        drafted_narrative: dict[str, Any],
+        history: Sequence[CompanionMessage],
+        *,
+        model: str = "unknown",
+        provider: str = "unknown",
+        prompt_path: Path = DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
+    ) -> RunState:
+        """Persist a results-dialogue-drafted narrative as
+        `results_narrative.json` (`review_status: pending`).
+
+        `drafted_narrative` is the `{narrative, claims}` object a
+        `run_results_companion_turn` turn carried; it is re-validated here
+        (`narrative_result_from_payload`) and run through the same
+        deterministic `verify_narrative` as a one-shot narrative. The
+        reviewer still has to approve it with `review_results_narrative`
+        before it enters the report. `prompt_sha256` records the dialogue
+        prompt the draft was produced against, rebuilt from `history`.
+        """
+        state = self.load(run_id)
+        narrative_input = self._results_narrative_input(state)
+        result = narrative_result_from_payload(drafted_narrative, context="drafted_narrative")
+        prompt = build_results_dialogue_prompt(
+            prompt_path, history=history, narrative_input=narrative_input
+        )
+        return self._write_results_narrative(
+            run_id, narrative_input, result,
+            prompt=prompt, model=model, provider=provider, source="dialogue",
+        )
 
     def review_results_narrative(
         self,
@@ -3745,6 +3916,7 @@ class WorkflowManager:
         if state.phase not in {"results_review", "report"}:
             raise RuntimeError("Causal report requires the results_review or report phase")
         run_dir = self.runs_dir / run_id
+        protocol = self._read_optional_json(run_dir / "protocol.json")
         study_spec = self._read_optional_json(run_dir / "study_specification.json")
         statistical_estimand = self._read_optional_json(run_dir / "statistical_estimand.json")
         dataset_manifest = self._read_optional_json(run_dir / "dataset_manifest.json")
@@ -4000,6 +4172,29 @@ class WorkflowManager:
                 f"| {gate.name} | {gate.status} | {gate.reviewer or '-'} | {gate.decided_at or '-'} |"
             )
 
+        decision_memory = self._decision_memory(state, protocol or {})
+        (run_dir / "decision_memory.json").write_text(
+            json.dumps(
+                {
+                    **decision_memory.to_dict(),
+                    "metadata": artifact_metadata(
+                        "decision_memory", "1.0", {"study_id": state.study_id}
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        lines.extend([
+            "", "## Reviewer decisions", "",
+            "> A deterministic digest (no LLM) of the covariate exclusions and settled choices "
+            "distilled from the audit trail and the rejected gates -- the context the estimand-"
+            "dialogue companion is given so it does not re-propose a ruled-out option. Snapshot "
+            "written as `decision_memory.json`.",
+            "",
+            decision_memory.format_for_prompt(),
+        ])
+
         lines.extend(["", "## Audit trail", "", "| At | Event | Detail |", "|---|---|---|"])
         for entry in state.history:
             lines.append(f"| {entry['at']} | {entry['event']} | {entry['detail']} |")
@@ -4008,7 +4203,7 @@ class WorkflowManager:
         for name in (
             "hypothesis.json", "study_specification.json", "statistical_estimand.json",
             "cohort_manifest.json", "dataset_manifest.json", "estimation.json", "diagnostics.json",
-            "sensitivity_analysis.json", "cate.json", "results_narrative.json",
+            "sensitivity_analysis.json", "cate.json", "results_narrative.json", "decision_memory.json",
         ):
             payload = self._read_optional_json(run_dir / name)
             metadata = payload.get("metadata") if payload else None
@@ -4046,8 +4241,9 @@ class WorkflowManager:
         report_path.write_text("\n".join(lines), encoding="utf-8")
         with _RunLock(run_dir):
             state = self.load(run_id)
-            if "causal_report.md" not in state.artifacts:
-                state.artifacts.append("causal_report.md")
+            for artifact_name in ("causal_report.md", "decision_memory.json"):
+                if artifact_name not in state.artifacts:
+                    state.artifacts.append(artifact_name)
             state.record("causal_report_generated", "causal_report.md")
             self.save(state)
         return report_path
@@ -4325,6 +4521,157 @@ class WorkflowManager:
             )
             self.save(state)
         return state
+
+    def run_companion_turn(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        history: Sequence[CompanionMessage],
+        *,
+        reviewer: str | None = None,
+        prompt_path: Path = DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
+    ) -> CompanionTurn:
+        """One turn of the conversational assist at the `statistical_estimand`
+        gate (`causal.companion.companion`). Owns the `llm(prompt)` call and
+        the JSON-artifact reads; the pure prompt-build/parse lives in the
+        companion module, matching `propose_estimation_procedure` above.
+
+        When `reviewer` is given, that reviewer's cross-study memory
+        (`causal.companion.reviewer_memory`) is loaded read-only and added to
+        the prompt as advisory context -- their prior exclusions and estimand
+        choices, never a decision already made here.
+
+        Read-only with respect to run state: it takes no `_RunLock`, records
+        nothing in `state.history`, and writes no file. The conversation
+        transcript is the caller's to persist (`causal.companion.conversation`),
+        and the one write this dialogue can lead to --
+        `set_statistical_estimand_strategy` -- is a separate, explicitly
+        confirmed call. The returned `CompanionTurn.proposed_action` has
+        already been through `causal.companion.actions.validate_proposed_action`
+        (inside `parse_companion_turn`), so it can only ever name that one
+        allow-listed write with in-range arguments.
+
+        `analytic_dataset.parquet` is never read here; the companion is fed
+        the same class of on-disk JSON artifacts as
+        `causal.agents.results_narrative`.
+        """
+        state = self.load(run_id)
+        if state.phase != "estimand_review":
+            raise RuntimeError("The estimand dialogue requires the estimand_review phase")
+        run_dir = self.runs_dir / run_id
+        study_spec_path = run_dir / "study_specification.json"
+        if not study_spec_path.is_file():
+            raise RuntimeError(
+                "Cannot run the estimand dialogue: study_specification.json is missing "
+                "-- approve the identification_estimand gate first"
+            )
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        query_settings = protocol.get("query_settings")
+        context = EstimandDialogueContext(
+            study_specification=json.loads(study_spec_path.read_text(encoding="utf-8")),
+            current_settings=protocol.get("statistical_estimand_settings") or {},
+            cohort_manifest=self._read_optional_json(run_dir / "cohort_manifest.json"),
+            feasibility=self._read_optional_json(run_dir / "feasibility.json"),
+            followup_audit=self._read_optional_json(run_dir / "followup_audit.json"),
+            positivity_audit=self._read_optional_json(run_dir / "positivity_audit.json"),
+            covariate_missingness=self._read_optional_json(run_dir / "covariate_missingness.json"),
+            censoring_definition_approved=bool(
+                (query_settings or {}).get("censoring_definition_approved", False)
+            ),
+            decision_memory=self._decision_memory(state, protocol),
+            reviewer_memory=self.reviewer_memory(reviewer) if reviewer else ReviewerMemory(),
+        )
+        prompt = build_estimand_dialogue_prompt(prompt_path, history=history, context=context)
+        return parse_companion_turn(llm(prompt))
+
+    def decision_memory(self, run_id: str) -> DecisionMemory:
+        """The reviewer-decision digest for a run
+        (`causal.companion.decision_memory`) -- what the estimand dialogue is
+        told the reviewer has already ruled on. Recomputed from `state.json`
+        and `protocol.json` on every call; never cached and never written, so
+        it is safe to call from a render path.
+        """
+        state = self.load(run_id)
+        protocol_path = self.runs_dir / run_id / "protocol.json"
+        protocol = (
+            json.loads(protocol_path.read_text(encoding="utf-8"))
+            if protocol_path.is_file()
+            else {}
+        )
+        return self._decision_memory(state, protocol)
+
+    def _decision_memory(self, state: RunState, protocol: dict[str, Any]) -> DecisionMemory:
+        """Distil what the reviewer has already ruled on for this run
+        (`causal.companion.decision_memory`) so a companion turn can be told
+        not to re-propose an excluded covariate or re-open a settled choice.
+
+        Pure derivation from `state.history`, the decided gates, and
+        `protocol.json`'s `rejected_covariates` -- reads nothing new from
+        disk and writes nothing, so a companion turn stays read-only.
+        """
+        return distill_decision_memory(
+            history=state.history,
+            gates={
+                name: {
+                    "status": gate.status,
+                    "reviewer": gate.reviewer,
+                    "comment": gate.comment,
+                    "decided_at": gate.decided_at,
+                }
+                for name, gate in state.gates.items()
+            },
+            rejected_covariates=protocol.get("rejected_covariates") or [],
+        )
+
+    @property
+    def _reviewers_dir(self) -> Path:
+        return self.runs_dir.parent / "reviewers"
+
+    def reviewer_memory(self, reviewer: str) -> ReviewerMemory:
+        """This reviewer's cross-study memory
+        (`causal.companion.reviewer_memory`), or an empty one if they have
+        never saved anything. Read-only; safe from a render path."""
+        path = self._reviewers_dir / slugify_reviewer(reviewer) / "memory.json"
+        if not path.is_file():
+            return ReviewerMemory(reviewer_id=slugify_reviewer(reviewer))
+        return ReviewerMemory.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def remember_run_for_reviewer(self, run_id: str, reviewer: str) -> ReviewerMemory:
+        """Fold this run's decisions (excluded covariates, the settled
+        statistical-estimand strategy) into `reviewer`'s cross-study memory.
+
+        Opt-in: nothing calls this automatically. Idempotent -- re-running it
+        for the same study replaces that study's entries rather than
+        appending (`merge_run_into_memory`). Writes only
+        `artifacts/reviewers/<slug>/memory.json`; the run itself is untouched
+        (no lock on the run, no `state.history` entry).
+        """
+        slug = slugify_reviewer(reviewer)
+        state = self.load(run_id)
+        run_dir = self.runs_dir / run_id
+        protocol = self._read_optional_json(run_dir / "protocol.json")
+        decision_memory = self._decision_memory(state, protocol)
+
+        reviewer_dir = self._reviewers_dir / slug
+        reviewer_dir.mkdir(parents=True, exist_ok=True)
+        with _RunLock(reviewer_dir):
+            current = self.reviewer_memory(reviewer)
+            merged = merge_run_into_memory(
+                current,
+                study_id=state.study_id,
+                decision_memory=decision_memory,
+                estimand_settings=protocol.get("statistical_estimand_settings") or {},
+            )
+            merged = ReviewerMemory(
+                reviewer_id=slug,
+                exclusions=merged.exclusions,
+                estimand_choices=merged.estimand_choices,
+                updated_at=merged.updated_at,
+            )
+            temporary = (reviewer_dir / "memory.json").with_suffix(".tmp")
+            temporary.write_text(json.dumps(merged.to_dict(), indent=2), encoding="utf-8")
+            temporary.replace(reviewer_dir / "memory.json")
+        return merged
 
     def set_cate_cutpoint(self, run_id: str, covariate_name: str, cutpoint: float, reviewer: str) -> RunState:
         """Record a reviewer-entered cutpoint for splitting a continuous

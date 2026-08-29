@@ -25,6 +25,22 @@ The initial question gate is itself LLM-based. It classifies a question as
 before drafting for the latter two categories. `--skip-question-gate` exists
 for controlled tests and already-reviewed inputs.
 
+The Streamlit UI runs this intake as a conversation panel
+(`causal.ui.conversation` over `causal.companion.intake`): a
+`needs_clarification` verdict is answerable in-thread over multiple rounds
+(each round re-runs the gate on the accumulated question, capped at
+`MAX_CLARIFICATION_ROUNDS`), and the whole exchange is persisted to the run's
+`conversation.jsonl` -- a record, not an approval path.
+
+Descriptive follow-ups also carry context. When earlier FastOMOP exchanges
+are in the thread, the last `MAX_DESCRIPTIVE_CONTEXT` `(question, answer)`
+pairs are folded in (`combine_descriptive_followup`) so a terse follow-up
+like "and how many were women?" is self-contained -- the gate classifies it,
+and FastOMOP answers it, against that context. The context reaches only the
+gate and the FastOMOP call, never the causal drafting step (a target trial
+is always drafted from the clean question). This is a bounded in-session
+window, not a persisted store.
+
 ## Evidence retrieval and citation checks
 
 The first draft supplies short clinical search terms. Deterministic code builds
@@ -99,6 +115,87 @@ Useful controls:
 - `--max-critique-rounds` to bound critique rounds;
 - `--tournament-size` to draft multiple candidates.
 
+## Estimand dialogue (statistical_estimand gate)
+
+While a run is in the `estimand_review` phase, the Streamlit left panel runs
+the study companion (`causal.companion.companion` via
+`WorkflowManager.run_companion_turn`). It is the same advisory-LLM posture as
+the question gate and the results narrative:
+
+```text
+conversation so far + JSON-safe run artifacts (study_specification.json,
+  cohort_manifest.json adjustment set, feasibility / follow-up / positivity /
+  covariate-missingness counts, whether the per-row censored column is
+  approved) + the decision memory (see below) -- never analytic_dataset.parquet
+  -> estimand_dialogue prompt
+  -> strict-JSON response: { reply, proposed_action | null }
+  -> causal.companion.actions.validate_proposed_action
+     (allow-list: set_statistical_estimand_strategy only; every arg checked
+      against MISSING_DATA_STRATEGIES / CENSORING_STRATEGIES /
+      ESTIMATION_PROCEDURES; reviewer / run_id can never appear)
+  -> the reviewer clicks Confirm on the card
+     -> WorkflowManager.set_statistical_estimand_strategy(reviewer=<sidebar>)
+```
+
+`run_companion_turn` is read-only with respect to run state: it takes no
+lock, records nothing, writes no file. The one write the dialogue can lead
+to is the explicitly confirmed `set_statistical_estimand_strategy`;
+approving the `statistical_estimand` gate itself is a separate manual
+action. The transcript (`conversation.jsonl`) records every turn, including
+which card was confirmed or dismissed. If the companion LLM is unavailable
+the panel degrades to a warning and the "Fill the form directly" fallback.
+
+To exercise this panel without a working OMCP/BigQuery stack,
+`python scripts/stage_demo_run.py --to estimand_review` stages a fully
+synthetic run (auto-approved gates, fabricated cohort) straight into the
+phase and prints its run id for the Streamlit sidebar.
+
+### Decision memory
+
+A dialogue turn only replays the natural-language transcript, so on its own
+the companion has no memory of what the reviewer already *decided* and will
+re-propose a covariate they excluded. `causal.companion.decision_memory`
+closes that gap. `distill_decision_memory` is a pure, deterministic digest
+(no LLM, same spirit as `verify_narrative`) of:
+
+- `protocol.json`'s `rejected_covariates` -- the audited covariate exclusions
+  (this field already existed; nothing read it back before), and
+- the decision-shaped entries of `RunState.history` plus the decided
+  `ApprovalGate`s with their review comments,
+
+merged into one timeline and rendered into the prompt under `PRIOR
+DECISIONS`. The prompt instructs the companion not to re-propose an excluded
+covariate or silently re-open a settled choice. `WorkflowManager.
+_decision_memory` builds it from the `RunState`/`protocol.json` it already
+loads for the turn, so `run_companion_turn` stays read-only.
+
+From the gate objects only a `rejected` gate is replayed (a routine
+approval does not change how the companion should behave); gate
+*invalidations* come through the history stream. It is inspectable three
+ways: live in the Streamlit **Report & audit** tab, via `python -m
+causal.cli workflow decision-memory <run_id>` (`--json` for the raw
+object), and as a frozen `decision_memory.json` snapshot that
+`build_causal_report` writes and lists in the report's Provenance table.
+
+### Reviewer memory (cross-study)
+
+`causal.companion.reviewer_memory` is the outermost, opt-in memory layer:
+one file per reviewer at `artifacts/reviewers/<slug>/memory.json`, carrying
+their conventions *across* studies -- covariates they have excluded before
+(with the study and rationale) and the statistical-estimand strategies they
+have settled on. It is populated only when a human asks
+(`WorkflowManager.remember_run_for_reviewer` -- the "Add this run's
+decisions to my reviewer memory" button, or `workflow remember-run
+<run_id> --reviewer <name>`); `merge_run_into_memory` is the pure,
+idempotent fold (re-running for the same study replaces that study's
+entries). When `run_companion_turn` is given a `reviewer`, that memory is
+loaded read-only and rendered into the prompt under `REVIEWER CONVENTIONS`,
+with an instruction to use it for consistency but never to treat a past
+choice as one already made for this study. Same boundary as the per-run
+decision memory: decision-level text only, feeds a prompt, never a gate.
+Inspect with `workflow reviewer-memory <name>` or the **Report & audit**
+tab.
+
 ## Results narrative (post-estimation interpretation)
 
 After `causal.agents.estimation`/`causal.agents.diagnostics` compute the
@@ -117,6 +214,40 @@ estimation.json + diagnostics.json
   -> build_causal_report includes the narrative text only if
      review_status == "approved" and verification has no `failed` check
 ```
+
+### Results dialogue (drafting the narrative conversationally)
+
+While a run is in `results_review` / `report` the Streamlit left panel runs
+the results-interpretation dialogue -- the results-review counterpart of the
+estimand dialogue, `causal.companion.companion.build_results_dialogue_prompt`
+/ `parse_results_companion_turn` via `WorkflowManager.
+run_results_companion_turn`. The companion walks the reviewer through the
+direction, magnitude, uncertainty, diagnostics, robustness, and limitations
+one topic at a time, then ends a turn with a `drafted_narrative` in exactly
+the `{ narrative, claims[] }` shape above:
+
+```text
+conversation so far + the same NarrativeInput the one-shot step is fed
+  -> results_dialogue prompt (JSON-safe artifacts only)
+  -> strict-JSON response: { reply, drafted_narrative | null }
+     (drafted_narrative validated by
+      causal.agents.results_narrative.narrative_result_from_payload)
+  -> the reviewer clicks "Save for review" on the card
+     -> WorkflowManager.save_results_narrative_draft
+        -> verify_narrative + results_narrative.json (source="dialogue",
+           review_status="pending")
+  -> WorkflowManager.review_results_narrative (unchanged human approve/exclude)
+```
+
+`run_results_companion_turn` is read-only with respect to run state (no
+lock, no history entry, no file write), matching `run_companion_turn`. The
+one-step `run_results_narrative` path stays as the no-conversation fallback;
+both write the identical artifact and both go through the same faithfulness
+verification and human approval. The `source` field on
+`results_narrative.json` records which path produced it.
+`python scripts/stage_demo_run.py --to results_review` stages a synthetic
+run (fabricated cohort, `estimation.json` / `diagnostics.json` written) for
+testing this panel offline.
 
 Every claim in `claims` is typed (`effect_direction`, `effect_magnitude`,
 `uncertainty`, `sample_size`, `diagnostic_warning`,
