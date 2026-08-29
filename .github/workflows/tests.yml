@@ -29,10 +29,37 @@ jobs:
           pip install -r requirements-causal-discovery.txt
           pip install -r requirements-knowledge-graph.txt
           pip install -r requirements-estimation.txt
-          pip install pytest
+          pip install pytest pytest-timeout
 
       - name: Run tests
-        run: python -m pytest tests/ -q
+        # `slow` (the maintainer-only simulation replicates) is deselected by
+        # pytest.ini's addopts; the slow-tests job below runs it separately.
+        run: python -m pytest tests/ -q --timeout=300
+
+  # The `slow` simulation suite (tests/test_simulation.py -- real estimators
+  # fit over many replicates) is deselected from the main job so a local
+  # `pytest` stays fast; run it here so a bias/coverage regression still has
+  # CI. Longer timeout: a single replicate set is minutes, not seconds.
+  slow-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-estimation.txt
+          pip install pytest pytest-timeout
+
+      - name: Run slow tests
+        run: python -m pytest tests/ -q -m slow --timeout=1800
 
   # `omcp` and `agno_fastomop` are separate repos (git submodules, see
   # .gitmodules) that each declare `requires-python = ">=3.13"` and manage
