@@ -300,6 +300,17 @@ def _make_run_id(study_id: str) -> str:
     return f"{timestamp}_{study_id}-{uuid.uuid4().hex[:8]}"
 
 
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Serialize `data` to `path` as indented JSON through a `.tmp` sidecar
+    and an atomic `replace`, so a concurrent reader holding no `_RunLock`
+    (e.g. the Streamlit UI polling a run) never observes a half-written
+    file. Every persisted run artifact is written this way.
+    """
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
 # treatment/comparator each have exactly one fallback role: `treatment_and_
 # comparator`, a single shared-backbone phenotype used by both arms of an
 # `add_on` design (e.g. "crystalloids" in
@@ -957,9 +968,7 @@ class WorkflowManager:
     def save(self, state: RunState) -> None:
         path = self._state_path(state.run_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
-        temporary.replace(path)
+        _atomic_write_json(path, state.to_dict())
 
     def decide_gate(self, run_id: str, gate: str, status: str, reviewer: str, comment: str | None = None) -> RunState:
         run_dir = self.runs_dir / run_id
@@ -1234,9 +1243,7 @@ class WorkflowManager:
                 ),
             }
             protocol["concept_sets"] = {**concept_sets, name: updated_entry}
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
         detail = f"{name}: domain={domain}, {len(concept_ids)} concept(s), status={status} by {reviewer}"
@@ -1294,9 +1301,7 @@ class WorkflowManager:
                 name: ({**entry, "lookup_term": applied[name]} if name in applied else entry)
                 for name, entry in concept_sets.items()
             }
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
         state.record(
             "concept_set_lookup_terms_set",
             "; ".join(f"{name}={value!r}" for name, value in sorted(applied.items())),
@@ -1367,9 +1372,7 @@ class WorkflowManager:
             }
             existing_additional = tuple(protocol.get("additional_population_concept_sets", ()) or ())
             protocol["additional_population_concept_sets"] = list(existing_additional) + [name]
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
         detail = f"'{name}' ({label.strip()}) added by {reviewer} as a required population concept set"
@@ -1418,9 +1421,7 @@ class WorkflowManager:
             ]
             concept_sets = protocol.get("concept_sets", {})
             protocol["concept_sets"] = {key: value for key, value in concept_sets.items() if key != name}
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             if (run_dir / "hypothesis.json").is_file():
                 self._write_hypothesis(run_id, protocol)
@@ -1496,9 +1497,7 @@ class WorkflowManager:
                     continue
                 updated[candidate["control_id"]] = candidate
             protocol["negative_controls"] = updated
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             state = self.load(run_id)
             state.record(
@@ -1593,9 +1592,7 @@ class WorkflowManager:
             except ValueError as exc:
                 raise ValueError(f"Cannot map negative control '{control_id}': {exc}") from exc
             protocol["negative_controls"] = {**negative_controls, control_id: updated_entry}
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
         detail = f"{control_id}: domain={domain}, {len(concept_ids)} concept(s), status={status} by {reviewer}"
         if comment and comment.strip():
@@ -1718,9 +1715,7 @@ class WorkflowManager:
 
             protocol["candidate_dag"] = candidate_dag
             protocol["rejected_covariates"] = rejected_covariates
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
         state.record(
@@ -1797,9 +1792,7 @@ class WorkflowManager:
             protocol["candidate_dag"] = [
                 updated_entry if item.get("label") == label else item for item in candidate_dag
             ]
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
         detail = f"{label}: domain={domain} by {reviewer}"
@@ -1941,9 +1934,7 @@ class WorkflowManager:
             protocol["candidate_dag"] = [
                 updated_entry if item.get("label") == label else item for item in candidate_dag
             ]
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
         detail = f"{label}: {len(concept_ids)} concept(s), status={mapping_status} by {reviewer}"
@@ -2022,9 +2013,7 @@ class WorkflowManager:
             protocol["candidate_dag"] = [
                 updated_entry if item.get("label") == label else item for item in candidate_dag
             ]
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
         detail = f"{label}: aggregation={aggregation} by {reviewer}"
@@ -2102,9 +2091,7 @@ class WorkflowManager:
             protocol["candidate_dag"] = [
                 updated_entry if item.get("label") == label else item for item in candidate_dag
             ]
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
         detail = f"{label}: window={window_start_hours}h..{window_end_hours}h by {reviewer}"
@@ -2229,9 +2216,7 @@ class WorkflowManager:
             }
             target["primary_estimand"] = primary_estimand
             target["secondary_estimands"] = list(secondary_estimands)
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
         state.record(
             "target_trial_estimand_corrected",
@@ -2326,9 +2311,7 @@ class WorkflowManager:
         except ValueError as exc:
             raise ValueError(f"Cannot approve the identification_estimand gate: {exc}") from exc
         spec_path = run_dir / "study_specification.json"
-        temporary = spec_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(spec.to_dict(), indent=2), encoding="utf-8")
-        temporary.replace(spec_path)
+        _atomic_write_json(spec_path, spec.to_dict())
 
     def _write_statistical_estimand(self, run_id: str) -> None:
         """Build and persist `statistical_estimand.json` (`roadmap.
@@ -2425,16 +2408,12 @@ class WorkflowManager:
         except ValueError as exc:
             raise ValueError(f"Cannot approve the statistical_estimand gate: {exc}") from exc
         estimand_path = run_dir / "statistical_estimand.json"
-        temporary = estimand_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(estimand.to_dict(), indent=2), encoding="utf-8")
-        temporary.replace(estimand_path)
+        _atomic_write_json(estimand_path, estimand.to_dict())
 
     def _write_hypothesis(self, run_id: str, protocol: dict) -> None:
         artifact = HypothesisAgent().run(protocol).to_dict()
         artifact_path = self.runs_dir / run_id / "hypothesis.json"
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
+        _atomic_write_json(artifact_path, artifact)
 
     def run_data_science_agent(
         self,
@@ -2489,9 +2468,7 @@ class WorkflowManager:
         # the agent was running isn't silently overwritten by a stale save.
         with _RunLock(run_dir):
             state = self.load(run_id)
-            temporary = artifact_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-            temporary.replace(artifact_path)
+            _atomic_write_json(artifact_path, artifact)
             if "analysis_plan.json" not in state.artifacts:
                 state.artifacts.append("analysis_plan.json")
             state.record(
@@ -2524,9 +2501,7 @@ class WorkflowManager:
         protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
         registry = OMOPVariableRegistry.from_protocol(protocol)
         artifact_path = run_dir / "registry.json"
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(registry.to_dict(), indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
+        _atomic_write_json(artifact_path, registry.to_dict())
         if "registry.json" not in state.artifacts:
             state.artifacts.append("registry.json")
         executable = sum(1 for variable in registry.variables if is_sql_executable(variable))
@@ -2574,9 +2549,7 @@ class WorkflowManager:
                 analysis_plan_status=state.gates["analysis_plan"].status,
             ).to_dict()
             artifact_path = run_dir / "execution_readiness.json"
-            temporary = artifact_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-            temporary.replace(artifact_path)
+            _atomic_write_json(artifact_path, artifact)
             mcp_context = {
                 "run_id": state.run_id,
                 "study_id": state.study_id,
@@ -2588,12 +2561,7 @@ class WorkflowManager:
                 "causal_estimation_allowed": artifact["causal_estimation_allowed"],
                 "readiness_input_sha256": artifact["metadata"]["input_sha256"],
             }
-            context_path = run_dir / "mcp_context.json"
-            context_temporary = context_path.with_suffix(".tmp")
-            context_temporary.write_text(
-                json.dumps(mcp_context, indent=2), encoding="utf-8"
-            )
-            context_temporary.replace(context_path)
+            _atomic_write_json(run_dir / "mcp_context.json", mcp_context)
             if "execution_readiness.json" not in state.artifacts:
                 state.artifacts.append("execution_readiness.json")
             if "mcp_context.json" not in state.artifacts:
@@ -3741,9 +3709,7 @@ class WorkflowManager:
             ],
         }
         artifact_path = run_dir / f"mapping_audit_{variable_id}.json"
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
+        _atomic_write_json(artifact_path, artifact)
         artifact_name = artifact_path.name
         if artifact_name not in state.artifacts:
             state.artifacts.append(artifact_name)
@@ -4285,9 +4251,7 @@ class WorkflowManager:
             before = settings.get("exposure_contrast", "add_on")
             settings["exposure_contrast"] = exposure_contrast
             protocol["query_settings"] = settings
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
         detail = f"exposure_contrast: {before} -> {exposure_contrast} by {reviewer}"
         if comment and comment.strip():
@@ -4338,9 +4302,7 @@ class WorkflowManager:
             before = bool(settings.get("censoring_definition_approved", False))
             settings["censoring_definition_approved"] = True
             protocol["query_settings"] = settings
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
         detail = f"censoring_definition_approved: {before} -> True by {reviewer}"
         if comment and comment.strip():
@@ -4408,9 +4370,7 @@ class WorkflowManager:
                 "censoring_rationale": censoring_rationale.strip(),
                 "estimation_procedure": estimation_procedure,
             }
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
         detail = (
             f"statistical_estimand_settings set by {reviewer}: "
@@ -4510,9 +4470,7 @@ class WorkflowManager:
                 "provenance": suggestion.provenance,
                 "population_summary_at_proposal": population_summary,
             }
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
 
             state = self.load(run_id)
             state.record(
@@ -4668,9 +4626,7 @@ class WorkflowManager:
                 estimand_choices=merged.estimand_choices,
                 updated_at=merged.updated_at,
             )
-            temporary = (reviewer_dir / "memory.json").with_suffix(".tmp")
-            temporary.write_text(json.dumps(merged.to_dict(), indent=2), encoding="utf-8")
-            temporary.replace(reviewer_dir / "memory.json")
+            _atomic_write_json(reviewer_dir / "memory.json", merged.to_dict())
         return merged
 
     def set_cate_cutpoint(self, run_id: str, covariate_name: str, cutpoint: float, reviewer: str) -> RunState:
@@ -4704,9 +4660,7 @@ class WorkflowManager:
             before = cutpoints.get(column_name)
             cutpoints[column_name] = float(cutpoint)
             protocol["cate_cutpoints"] = cutpoints
-            temporary = protocol_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(protocol, indent=2), encoding="utf-8")
-            temporary.replace(protocol_path)
+            _atomic_write_json(protocol_path, protocol)
         state.record(
             "cate_cutpoint_set",
             f"{covariate_name} ({column_name}): cutpoint={cutpoint} by {reviewer}",
@@ -4870,9 +4824,7 @@ class WorkflowManager:
             **settings,
         )
         artifact_path = run_dir / "feasibility.json"
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
+        _atomic_write_json(artifact_path, result)
         if "feasibility.json" not in state.artifacts:
             state.artifacts.append("feasibility.json")
         state.record("feasibility_completed", "feasibility.json; no causal effect estimated")
@@ -4968,9 +4920,7 @@ class WorkflowManager:
             ],
         }
         artifact_path = run_dir / "feasibility.json"
-        temporary = artifact_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        temporary.replace(artifact_path)
+        _atomic_write_json(artifact_path, result)
         if "feasibility.json" not in state.artifacts:
             state.artifacts.append("feasibility.json")
         state.record(
