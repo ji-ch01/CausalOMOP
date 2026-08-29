@@ -5,7 +5,7 @@
     "created_on": "2026-08-03",
     "derived_from": "studies/albumin_sepsis_28d/concept_audit.md (2026-07-15 audit) and protocol.json's concept_sets (term/domain actually searched by causal.agents.data_science.DataScienceAgent._lookup_candidates)",
     "notes": [
-      "sepsis/septic_shock: concept_audit.md verified these concept_ids exist as standard SNOMED condition concepts with real row/person counts in the audited dataset -- a manual clinical review, but not (yet) an 'approved' mapping in protocol.json (status='candidate_pending_human_approval' there). Good recall/MRR targets regardless.",
+      "sepsis/septic_shock: concept_audit.md verified these concept_ids exist as standard SNOMED condition concepts with real row/person counts in the audited dataset -- a manual clinical review. They are NOT the study's population/effect-modifier definitions (protocol.json marks both concept_sets as placeholders: the Sepsis-3 population must be reconstructed, and 'septic shock' is a derived clinical state), but they remain valid recall/MRR targets for the concept-search step itself.",
       "albumin/crystalloids ('sodium chloride', the term protocol.json's lookup_term actually searches): concept_audit.md found every audited source value maps to drug_concept_id=0 (albumin) or is dominated by non-resuscitation products (flushes, irrigation -- crystalloids), i.e. no standard OMOP concept currently identifies the exposure. expected_concept_id is null for both -- a documented upstream ETL/vocabulary gap, not something a better search algorithm can fix. See evaluate_lookup_accuracy's known_gap_case_count."
     ]
   },
