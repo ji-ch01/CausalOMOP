@@ -82,7 +82,17 @@
     "mechanical ventilation", "vasopressors", "antibiotic classes"
   ],
   "published_benchmarks": {
+    "source": "S5 Fig selection flowchart, doi:10.1371/journal.pdig.0000721. The main-text prose '18,121' (p.8) is a typo; the S5 Fig value 18,421 is internally consistent (20,288 - 1,867 = 18,421; 3,559 + 14,862 = 18,421) and is the correct figure.",
+    "selection_flowchart": {
+      "initial_population": 50920,
+      "after_adult_age_and_icu_los_ge_1_day": 40279,
+      "after_sepsis3": 20288,
+      "after_crystalloids_in_first_24h_approximately_eligible": 18421,
+      "albumin_treated": 3559,
+      "crystalloids_only_control": 14862
+    },
     "approximately_eligible": 18421,
-    "albumin_treated": 3559
+    "albumin_treated": 3559,
+    "note": "Check the cohort step stepwise against these counts, not only the final eligible total. The large drop is the Sepsis-3 step (40,279 -> 20,288); a diagnosis-code sepsis phenotype will not reproduce it."
   }
 }
