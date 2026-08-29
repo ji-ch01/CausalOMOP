@@ -1,4 +1,6 @@
-"""Command-line entry point for infrastructure and data readiness checks."""
+"""Command-line entry point for the causal workflow: infrastructure and data
+readiness checks, natural-language question intake, and the per-run
+review/mapping/feasibility/estimation/report commands under `workflow`."""
 
 from __future__ import annotations
 

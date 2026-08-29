@@ -202,16 +202,19 @@ See [docs/repo_map.md](docs/repo_map.md) for ownership and Git rules.
 
 ## External projects
 
-The integration repositories are pinned as Git submodules. Their own READMEs
-remain authoritative for installation and upstream behavior. See the
-[FastOMOP organization](https://github.com/fastomop) for the official upstream projects:
+The integration repositories are pinned as Git submodules. Each `url` in
+`.gitmodules` is a `ji-ch01` fork that carries the pinned commit and keeps
+the official repository as its `upstream` remote; the official projects'
+own READMEs remain authoritative for installation and upstream behavior.
+See the [FastOMOP organization](https://github.com/fastomop) for the
+official upstream projects:
 
-| Local path | Official repository |
-|---|---|
-| `agno_fastomop/` | [fastomop/agno_fastomop](https://github.com/fastomop/agno_fastomop) |
-| `omcp/` | [fastomop/omcp](https://github.com/fastomop/omcp) |
-| `foem/` | [fastomop/foem](https://github.com/fastomop/foem) |
-| `external/ohdsi_mimic/` | [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) |
+| Local path | Pinned fork (`.gitmodules`) | Official upstream |
+|---|---|---|
+| `agno_fastomop/` | `ji-ch01/agno_fastomop` | [fastomop/agno_fastomop](https://github.com/fastomop/agno_fastomop) |
+| `omcp/` | `ji-ch01/omcp` | [fastomop/omcp](https://github.com/fastomop/omcp) |
+| `foem/` | `ji-ch01/foem` | [fastomop/foem](https://github.com/fastomop/foem) |
+| `external/ohdsi_mimic/` | `ji-ch01/MIMIC` | [OHDSI/MIMIC](https://github.com/OHDSI/MIMIC) |
 
 Initialize them with:
 
@@ -239,6 +242,7 @@ pip install -r requirements-llm.txt
 pip install -r requirements-ui.txt
 pip install -r requirements-knowledge-graph.txt
 pip install -r requirements-causal-discovery.txt
+pip install -r requirements-estimation.txt   # g-computation, TMLE, CATE, SuperLearner
 ```
 
 Copy `sample.env` to `.env` and replace placeholders locally:

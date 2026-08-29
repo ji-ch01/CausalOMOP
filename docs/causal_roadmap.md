@@ -68,10 +68,15 @@ the full literature grounding, including a second candidate comparison case.
 
 `causal/roadmap.py` defines `CausalQuestion`, `TargetTrialProtocol`,
 `CausalEstimand`, `CausalDAG`, `CausalStudySpecification`, and
-`StatisticalEstimand`. The general DAG logic is used by the live workflow.
-The question, protocol, and estimand contracts are not yet instantiated as
-one persistent workflow object, so the current `protocol` human gate carries
-more responsibility than the target architecture intends.
+`StatisticalEstimand`. The question, target-trial, and estimand contracts
+are instantiated as one persistent workflow object:
+`causal.agents.dag_identification.build_study_specification` builds and
+validates the full `CausalStudySpecification` from `protocol.json` +
+`hypothesis.json`, the `identification_estimand` gate cannot be approved
+unless it constructs without error, and the result is persisted as
+`study_specification.json`. The single combined `protocol` gate is gone --
+scientific review is split across `target_trial`, `dag_review`, and
+`identification_estimand`.
 
 `StatisticalEstimand` is deliberately a separate contract from
 `CausalEstimand`, not a few extra fields on it: `CausalEstimand` (stage 3)
@@ -165,11 +170,14 @@ See [llm_hypothesis_integration.md](llm_hypothesis_integration.md) and the
 - concept inclusion from descendant and exclusion rules;
 - temporal windows, aggregation, missingness, provenance, and reviewer data.
 
-The workflow builds `registry.json` from `protocol.json`. Covariate SQL adapters
-consume registry-shaped definitions, while population/treatment/comparator/
-outcome query specs still resolve directly from the reviewed `concept_sets`
-store in `protocol.json`. This is one human-reviewed store, but the registry is
-not yet the sole persisted source used by every query builder.
+The workflow builds `registry.json` from `protocol.json`. Every query builder
+now resolves through the registry: covariate SQL adapters consume
+registry-shaped definitions, and population/treatment/comparator/outcome
+query specs resolve by role through `OMOPVariableRegistry.resolve_role`
+(`_load_concept_specs` is a thin wrapper over it). The `concept_sets` entry
+on `protocol.json` remains the one place a reviewer records an approval; the
+separate `query_concept_sets` store that a reviewer had to map independently,
+with nothing checking the two agreed, is gone.
 
 `workflow mapping-audit` executes aggregate-only diagnostics through OMCP and
 writes `mapping_audit_<variable_id>.json`. Audit findings do not silently
