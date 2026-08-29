@@ -9,4 +9,9 @@
 	url = https://github.com/ji-ch01/foem.git
 [submodule "external/ohdsi_mimic"]
 	path = external/ohdsi_mimic
-	url = https://github.com/OHDSI/MIMIC.git
+	# The pinned commit adds a MIMIC-IV 2.2 config profile and
+	# waveform-less/resumable outputevents scripts that are not upstream, so
+	# the submodule tracks the ji-ch01 fork (which keeps OHDSI/MIMIC as its
+	# `upstream` remote). Pointing this at OHDSI/MIMIC breaks
+	# `git submodule update --init` on a fresh clone and in CI.
+	url = https://github.com/ji-ch01/MIMIC.git
