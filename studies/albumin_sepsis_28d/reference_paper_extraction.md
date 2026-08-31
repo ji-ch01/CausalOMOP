@@ -429,9 +429,9 @@ immortal-time gradient in §7a, (c) the estimator-instability picture in §7c,
 **Status: all rows below applied 2026-08-29.** The wording/structure corrections
 are done; the concept-id work (replacing the `source_value_rule` placeholders
 with approved albumin / crystalloid concept ids, adding resuscitation-fluid
-exclusions) is *not* here — it depends on the `inputevents` ETL work
-(`docs/mimic_omop_coverage_workplan.md` workstream B) and a human concept-set
-approval gate.
+exclusions) is *not* here — it depends on the `inputevents` ETL work (ICU
+infusions are outside the current OMOP ETL scope, see §9a) and a human
+concept-set approval gate.
 
 | File | Current | Should be | Applied |
 |---|---|---|---|
