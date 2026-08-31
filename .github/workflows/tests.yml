@@ -7,6 +7,20 @@ on:
     branches: [main]
 
 jobs:
+  # Fast static-lint gate (pyflakes + a pycodestyle subset + flake8-bugbear,
+  # configured in pyproject.toml). Runs against the project's own code only --
+  # the submodules are excluded there. Pinned so a ruff release cannot change
+  # what CI enforces without a deliberate bump here.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/ruff-action@v4
+        with:
+          version: "0.16.5"
+          args: "check --output-format github"
+
   pytest:
     runs-on: ubuntu-latest
     steps:
