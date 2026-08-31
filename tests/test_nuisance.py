@@ -1,11 +1,17 @@
 import unittest
 
 import numpy as np
+import pytest
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 
 from causal.nuisance import SuperLearner, SuperLearnerClassifier, SuperLearnerRegressor, _normalize_weights, stratified_folds
+
+# Classes that fit a real SuperLearner ensemble are marked `heavy` (opt-in,
+# run in CI's heavy-tests job). The pure-logic classes below -- weight
+# normalization, fold capping, pre-fit guards -- stay in the default suite.
+_heavy = pytest.mark.heavy
 
 
 def _xor_like_dataset(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -24,6 +30,7 @@ def _xor_like_dataset(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
     return np.column_stack([x1, x2]), y
 
 
+@_heavy
 class SuperLearnerNonlinearFitTests(unittest.TestCase):
     """One expensive `SuperLearner.fit` call, shared across several cheap
     assertions on its result -- avoids refitting the same candidate library
@@ -75,6 +82,7 @@ class SuperLearnerNonlinearFitTests(unittest.TestCase):
         self.assertTrue(np.all((prediction >= 0.0) & (prediction <= 1.0)))
 
 
+@_heavy
 class SuperLearnerSampleWeightTests(unittest.TestCase):
     def test_sample_weight_shifts_predictions_toward_the_upweighted_outcome(self):
         rng = np.random.default_rng(3)
@@ -98,6 +106,7 @@ class SuperLearnerSampleWeightTests(unittest.TestCase):
         self.assertGreater(weighted_mean_pred, unweighted_mean_pred + 0.2)
 
 
+@_heavy
 class SuperLearnerReproducibilityTests(unittest.TestCase):
     def test_is_reproducible_under_a_fixed_seed(self):
         design, y = _xor_like_dataset(300, seed=11)
@@ -154,6 +163,7 @@ class StratifiedFoldsTests(unittest.TestCase):
         self.assertIn("fewer than 2", reason)
 
 
+@_heavy
 class SuperLearnerClassifierAdapterTests(unittest.TestCase):
     """`SuperLearnerClassifier` is `SuperLearner` wrapped to look like a
     real scikit-learn `Estimator` -- for `causal.agents.cate.CATEAgent`'s
@@ -190,6 +200,7 @@ class SuperLearnerClassifierAdapterTests(unittest.TestCase):
         self.assertEqual(clf.max_splits, 3)
 
 
+@_heavy
 class SuperLearnerRegressorAdapterTests(unittest.TestCase):
     """`SuperLearnerRegressor` exposes `SuperLearner`'s `P(Y=1)` prediction
     as a regressor's continuous `predict()` output -- needed for

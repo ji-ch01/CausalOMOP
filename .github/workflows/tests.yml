@@ -46,8 +46,9 @@ jobs:
           pip install pytest pytest-timeout
 
       - name: Run tests
-        # `slow` (the maintainer-only simulation replicates) is deselected by
-        # pytest.ini's addopts; the slow-tests job below runs it separately.
+        # `slow` (simulation replicates) and `heavy` (SuperLearner/TMLE/forest
+        # recovery) are deselected by pytest.ini's addopts; the slow-tests and
+        # heavy-tests jobs below run them separately.
         run: python -m pytest tests/ -q --timeout=300
 
   # The `slow` simulation suite (tests/test_simulation.py -- real estimators
@@ -74,6 +75,30 @@ jobs:
 
       - name: Run slow tests
         run: python -m pytest tests/ -q -m slow --timeout=1800
+
+  # The `heavy` tests (tests/test_tmle_agent.py + the SuperLearner-fit classes
+  # in tests/test_nuisance.py) each fit a real cross-validated ensemble and
+  # take multiple seconds; they are deselected from the main job to keep the
+  # local `pytest` loop fast, and run here so the doubly-robust estimator's
+  # recovery / positivity / EIC guarantees still gate every push.
+  heavy-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-estimation.txt
+          pip install pytest pytest-timeout
+
+      - name: Run heavy tests
+        run: python -m pytest tests/ -q -m heavy --timeout=600
 
   # `omcp` and `agno_fastomop` are separate repos (git submodules, see
   # .gitmodules) that each declare `requires-python = ">=3.13"` and manage

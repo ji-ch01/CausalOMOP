@@ -2,8 +2,13 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from causal.agents.tmle import TMLEAgent, _risk_ratio_from_targeted_arms, _target
+
+# Every test here fits a real cross-validated SuperLearner ensemble (via
+# TMLEAgent) -- multi-second each. Opt-in only; CI's heavy-tests job runs them.
+pytestmark = pytest.mark.heavy
 
 
 def _synthetic_dataset(n: int, true_risk_difference: float, seed: int = 0) -> pd.DataFrame:
