@@ -214,7 +214,8 @@ class SuperLearnerRegressorAdapterTests(unittest.TestCase):
 
     def test_rejects_predict_before_fit(self):
         reg = SuperLearnerRegressor()
-        with self.assertRaises(Exception):
+        # `predict` reads `self._learner`, which only `fit` sets.
+        with self.assertRaises(AttributeError):
             reg.predict(np.zeros((5, 1)))
 
 

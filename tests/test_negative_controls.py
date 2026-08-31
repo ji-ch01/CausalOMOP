@@ -8,7 +8,7 @@ import pandas as pd
 
 from causal.agents.estimation import EstimationAgent
 from causal.config import BigQueryDatasets
-from causal.mapping.registry import MAPPING_STATUS_APPROVED, OMOPVariableDefinition
+from causal.mapping.registry import MAPPING_STATUS_APPROVED
 from causal.queries import ConceptSetSpec, analytic_cohort_sql
 from causal.queries.negative_controls import (
     NEGATIVE_CONTROL_ROLES,

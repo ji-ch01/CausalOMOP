@@ -289,7 +289,9 @@ def _write_table(
             con.execute("CHECKPOINT")
             rows_since_checkpoint = 0
     if not created:
-        reader = pa.RecordBatchReader.from_batches(arrow_schema, [])
+        # `reader` is resolved by name inside the SQL below via DuckDB's Python
+        # replacement scan -- it is used, just not in a way ruff can see.
+        reader = pa.RecordBatchReader.from_batches(arrow_schema, [])  # noqa: F841
         con.execute(f"CREATE TABLE {qualified} AS SELECT * FROM reader")
 
     con.execute("CHECKPOINT")
@@ -428,6 +430,10 @@ def export_dataset_to_duckdb(
         con.execute("PRAGMA temp_directory=?", [duckdb_temp_directory])
     results: list[TableExportResult] = []
     try:
+        # The `lambda`/`_do_export` closures below capture `table`/`table_ref`,
+        # but each is handed straight to `_with_retries` and fully consumed
+        # inside its own iteration -- none outlives the loop, so the
+        # late-binding hazard B023 warns about cannot occur here.
         for table in resolved_tables:
             table_ref = f"{dataset_fqn}.{table}"
             table_present = not overwrite and _table_exists(con, schema, table)
@@ -439,7 +445,7 @@ def export_dataset_to_duckdb(
             if table_present and verify_row_counts:
                 dest_count = con.execute(f"SELECT COUNT(*) FROM {_qualified(schema, table)}").fetchone()[0]
                 source_count = _with_retries(
-                    lambda: _source_row_count(client, table_ref),
+                    lambda: _source_row_count(client, table_ref),  # noqa: B023
                     max_retries=max_retries, base_delay=retry_base_delay,
                     description=f"counting {table_ref}",
                 )
@@ -470,8 +476,8 @@ def export_dataset_to_duckdb(
             logger.info("Exporting %s -> %s.%s", table_ref, schema, table)
 
             def _do_export() -> int:
-                arrow_schema, batches = _fetch_arrow_batches(client, table_ref, batch_size, storage_client)
-                return _write_table(con, schema, table, arrow_schema, batches, overwrite=True)
+                arrow_schema, batches = _fetch_arrow_batches(client, table_ref, batch_size, storage_client)  # noqa: B023
+                return _write_table(con, schema, table, arrow_schema, batches, overwrite=True)  # noqa: B023
 
             dest_count = _with_retries(
                 _do_export, max_retries=max_retries, base_delay=retry_base_delay,
@@ -479,7 +485,7 @@ def export_dataset_to_duckdb(
             )
             source_count = (
                 _with_retries(
-                    lambda: _source_row_count(client, table_ref),
+                    lambda: _source_row_count(client, table_ref),  # noqa: B023
                     max_retries=max_retries, base_delay=retry_base_delay,
                     description=f"counting {table_ref}",
                 )

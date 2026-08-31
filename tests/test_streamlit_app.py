@@ -692,7 +692,6 @@ def _concept_lookup_term_suggester_script(runs_dir: str) -> None:
     """AppTest script: render the shared "Suggest search terms" button for a
     minimal run so the section renders without a crash (the button itself is
     not clicked -- that path needs a live LLM)."""
-    from pathlib import Path
 
     from causal.orchestrator.workflow import WorkflowManager
     from causal.ui.streamlit_app import _render_concept_lookup_term_suggester

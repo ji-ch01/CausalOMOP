@@ -102,10 +102,10 @@ def _normalize_weights(
     if total <= 0.0:
         equal = np.full(len(names), 1.0 / len(names))
         return (
-            dict(zip(names, (float(w) for w in equal))),
+            dict(zip(names, (float(w) for w in equal), strict=True)),
             "NNLS combination degenerate (all-zero weights); using equal weights across the library",
         )
-    return dict(zip(names, (float(w) for w in weights / total))), None
+    return dict(zip(names, (float(w) for w in weights / total), strict=True)), None
 
 
 @dataclass(frozen=True)

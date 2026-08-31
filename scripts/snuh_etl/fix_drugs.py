@@ -13,7 +13,6 @@ Fix drug_exposure data quality issues in two passes:
 Both passes are idempotent.
 """
 
-import duckdb
 from scripts.snuh_etl.etl_utils import backup_database, connect_write
 
 backup = backup_database("fix_drugs")

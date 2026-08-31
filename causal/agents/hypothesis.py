@@ -429,7 +429,9 @@ class HypothesisAgent:
             try:
                 concept_ids = tuple(int(concept_id) for concept_id in concept_ids)
             except (TypeError, ValueError):
-                raise ValueError(f"candidate_dag entry '{label}' concept_ids must be a list of integers")
+                raise ValueError(
+                    f"candidate_dag entry '{label}' concept_ids must be a list of integers"
+                ) from None
             if not isinstance(mapping_status, str):
                 raise ValueError("candidate_dag mapping_status must be a string")
             if mapping_status == "approved" and not concept_ids:

@@ -29,7 +29,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from causal.agents.hypothesis import DAGVariable, HypothesisArtifact
+from causal.agents.hypothesis import HypothesisArtifact
 from causal.roadmap import (
     DEFAULT_MAX_ADJUSTMENT_CANDIDATES,
     CausalDAG,
@@ -560,7 +560,6 @@ def assess_clinical_completeness(hypothesis: HypothesisArtifact) -> ClinicalVali
     blocking: list[str] = []
     advisory: list[str] = []
 
-    classified_labels = {variable.label for variable in hypothesis.candidate_dag}
     rejected_by_label = {rejection.label: rejection for rejection in hypothesis.rejected_covariates}
     major = set(hypothesis.major_confounders)
     for label in hypothesis.unresolved_covariates:

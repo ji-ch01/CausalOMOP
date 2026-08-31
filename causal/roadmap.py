@@ -444,7 +444,11 @@ class CausalDAG:
         isolated = self._isolated_non_confounder_candidates(candidates)
         return tuple(node_id for node_id in candidates if node_id not in isolated)
 
-    @lru_cache(maxsize=32)
+    # B019 warns that caching on `self` can leak instances; here `CausalDAG` is
+    # a small frozen value object and maxsize=32 bounds what the class-level
+    # cache retains, so the leak is negligible -- see the docstring for why the
+    # method is memoized at all.
+    @lru_cache(maxsize=32)  # noqa: B019
     def minimum_adjustment_sets(
         self, max_candidates: int = DEFAULT_MAX_ADJUSTMENT_CANDIDATES
     ) -> tuple[tuple[str, ...], ...]:

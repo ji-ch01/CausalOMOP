@@ -58,7 +58,6 @@ from causal.agents.dag_metrics import (
     max_structural_intervention_distance,
     normalized_agreement,
 )
-from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.data_science import LIFETIME_LOOKBACK_HOURS
 from causal.agents.hypothesis import (
     DAG_VARIABLE_DOMAINS,
@@ -1807,7 +1806,9 @@ def _render_concept_set_mapping_forms(
                 else:
                     chosen_ids = st.multiselect(
                         "Approve OMOP concept(s)", options=option_ids, default=default_ids,
-                        format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
+                        format_func=lambda cid, _names=name_by_id: _names.get(
+                            cid, f"{cid} — (previously approved, not in current search)"
+                        ),
                         key=f"concept_set_map_ids_{run_id}_{name}",
                     )
                 status_choice = st.selectbox(
@@ -2168,7 +2169,9 @@ def _render_negative_control_mapping_section(manager: WorkflowManager, run_id: s
             with st.form(key=f"negative_control_map_form_{run_id}_{control_id}"):
                 chosen_ids = st.multiselect(
                     "Approve OMOP concept(s)", options=option_ids, default=default_ids,
-                    format_func=lambda cid: name_by_id.get(cid, f"{cid} — (previously approved, not in current search)"),
+                    format_func=lambda cid, _names=name_by_id: _names.get(
+                        cid, f"{cid} — (previously approved, not in current search)"
+                    ),
                     key=f"negative_control_map_ids_{run_id}_{control_id}",
                 )
                 status_choice = st.selectbox(

@@ -33,7 +33,9 @@ PHASES = (
     "report",
 )
 
-NEXT_PHASE = dict(zip(PHASES, PHASES[1:]))
+# Deliberately offset (each phase -> the next), so the two operands differ in
+# length by one: strict=False is the intended behaviour, not an oversight.
+NEXT_PHASE = dict(zip(PHASES, PHASES[1:], strict=False))
 
 
 @dataclass

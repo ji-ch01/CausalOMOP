@@ -288,7 +288,7 @@ def parse_variable(data: dict[str, Any]) -> OMOPVariableDefinition:
         try:
             return tuple(int(value) for value in raw)
         except (TypeError, ValueError):
-            raise ValueError(f"'{variable_id}'.{field} must be a list of integers")
+            raise ValueError(f"'{variable_id}'.{field} must be a list of integers") from None
 
     root_concept_ids = _int_tuple("root_concept_ids")
     excluded_concept_ids = _int_tuple("excluded_concept_ids")
@@ -331,7 +331,9 @@ def parse_variable(data: dict[str, Any]) -> OMOPVariableDefinition:
             window_start_hours = int(window_start_hours)
             window_end_hours = int(window_end_hours)
         except (TypeError, ValueError):
-            raise ValueError(f"'{variable_id}'.window_start_hours/window_end_hours must be integers")
+            raise ValueError(
+                f"'{variable_id}'.window_start_hours/window_end_hours must be integers"
+            ) from None
         if not window_start_hours <= window_end_hours <= 0:
             raise ValueError(
                 f"'{variable_id}' window must satisfy window_start_hours <= window_end_hours <= 0"

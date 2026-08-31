@@ -250,7 +250,7 @@ class TMLERiskRatioTests(unittest.TestCase):
         delta method uses -- the algebraic identity `_target`'s docstring
         claims, checked directly rather than only indirectly through the
         fitted numbers above."""
-        y, a, w = np.array([1, 0, 1, 0]), np.array([1, 1, 0, 0]), np.array([0.1, 0.2, -0.1, 0.3])
+        y, a = np.array([1, 0, 1, 0]), np.array([1, 1, 0, 0])
         g1w = np.array([0.6, 0.5, 0.4, 0.7])
         q1w = np.array([0.7, 0.6, 0.5, 0.8])
         q0w = np.array([0.3, 0.2, 0.4, 0.1])

@@ -11,7 +11,6 @@ import os
 import urllib.request
 import urllib.parse
 import json
-import duckdb
 import urllib.error
 from scripts.snuh_etl.etl_utils import backup_database, connect_write
 

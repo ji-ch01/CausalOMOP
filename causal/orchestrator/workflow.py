@@ -75,9 +75,7 @@ from causal.sensitivity import e_value
 from causal.roadmap import (
     CENSORING_STRATEGIES,
     ESTIMATION_PROCEDURES,
-    IDENTIFYING_FUNCTIONALS,
     MISSING_DATA_STRATEGIES,
-    OUTCOME_MODEL_SPECS,
     CausalQuestion,
     StatisticalEstimand,
     TargetTrialProtocol,
@@ -123,7 +121,6 @@ from causal.queries import (
 )
 from causal.queries.negative_controls import (
     DEFAULT_NEGATIVE_CONTROL_PROMPT_PATH,
-    NEGATIVE_CONTROL_ROLES,
     build_negative_control_prompt,
     parse_negative_control_response,
     substitute_spec,
@@ -241,7 +238,7 @@ class _RunLock:
                     raise TimeoutError(
                         "Could not acquire the review lock for this run within "
                         f"{self._timeout_seconds}s -- another review is in progress"
-                    )
+                    ) from None
                 time.sleep(self._poll_seconds)
 
     def _steal_if_stale(self) -> None:
@@ -584,8 +581,12 @@ def _mapping_coverage_roles(
         spec = specs.get(role)
         if spec is not None and spec.domain in DOMAIN_TABLES and spec.concept_ids:
             roles.append((role, spec))
+    # `_load_concept_specs` appends to these two tuples in lockstep, so they are
+    # always the same length; strict= makes a future drift a loud failure.
     for name, spec in zip(
-        specs.get("population_additional_names", ()), specs.get("population_additional", ())
+        specs.get("population_additional_names", ()),
+        specs.get("population_additional", ()),
+        strict=True,
     ):
         if spec.domain in DOMAIN_TABLES and spec.concept_ids:
             roles.append((name, spec))
@@ -1179,7 +1180,7 @@ class WorkflowManager:
         try:
             concept_ids = [int(concept_id) for concept_id in concept_ids]
         except (TypeError, ValueError):
-            raise ValueError("concept_ids must be a list of integers")
+            raise ValueError("concept_ids must be a list of integers") from None
 
         state = self.load(run_id)
         run_dir = self.runs_dir / run_id
@@ -1538,7 +1539,7 @@ class WorkflowManager:
         try:
             concept_ids = [int(concept_id) for concept_id in concept_ids]
         except (TypeError, ValueError):
-            raise ValueError("concept_ids must be a list of integers")
+            raise ValueError("concept_ids must be a list of integers") from None
 
         state = self.load(run_id)
         run_dir = self.runs_dir / run_id
@@ -1851,7 +1852,7 @@ class WorkflowManager:
         try:
             concept_ids = [int(concept_id) for concept_id in concept_ids]
         except (TypeError, ValueError):
-            raise ValueError("concept_ids must be a list of integers")
+            raise ValueError("concept_ids must be a list of integers") from None
         if mapping_status == "approved" and not concept_ids:
             raise ValueError("mapping_status='approved' requires at least one concept_id")
 
@@ -2064,7 +2065,7 @@ class WorkflowManager:
             window_start_hours = int(window_start_hours)
             window_end_hours = int(window_end_hours)
         except (TypeError, ValueError):
-            raise ValueError("window_start_hours and window_end_hours must be integers")
+            raise ValueError("window_start_hours and window_end_hours must be integers") from None
         if not window_start_hours <= window_end_hours <= 0:
             raise ValueError(
                 "window must satisfy window_start_hours <= window_end_hours <= 0"

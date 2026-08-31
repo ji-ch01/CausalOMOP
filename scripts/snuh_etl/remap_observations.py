@@ -25,7 +25,6 @@ import json
 import urllib.parse
 import urllib.request
 
-import duckdb
 from scripts.snuh_etl.etl_utils import backup_database, connect_write
 
 backup = backup_database("remap_observations")
@@ -323,7 +322,7 @@ def parse_d_code(source_value: str):
 
 def best_snomed_for_term(term: str) -> tuple:
     """Return (concept_id, concept_name, vocabulary_id, domain_id) or None."""
-    order = f"""
+    order = """
         CASE domain_id
             WHEN 'Observation' THEN 1 WHEN 'Condition'   THEN 2
             WHEN 'Measurement' THEN 3 WHEN 'Procedure'   THEN 4 ELSE 5
@@ -406,7 +405,7 @@ mapped_rows = con.execute("""
     FROM main._obs_mapping
     ORDER BY source_value
 """).fetchall()
-for sv, term, cname, vocab, domain, strat in mapped_rows:
+for _sv, term, cname, vocab, domain, strat in mapped_rows:
     print(f"  '{term}'")
     print(f"    -> [{vocab}/{domain}] '{cname}'  ({strat})")
 
