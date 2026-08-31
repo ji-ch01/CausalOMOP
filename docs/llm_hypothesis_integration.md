@@ -82,8 +82,49 @@ Development uses the OpenRouter adapter by default:
 ```text
 CAUSALOMOP_ENV=dev
 OPENROUTER_API_KEY=...
-CAUSALOMOP_LLM_MODEL=openai/gpt-oss-120b
+CAUSALOMOP_LLM_MODEL=openai/gpt-5
 ```
+
+`CAUSALOMOP_LLM_MODEL` accepts any OpenRouter `vendor/model` slug
+(`openai/gpt-5`, `openai/o3`, `anthropic/claude-opus-5`,
+`google/gemini-2.5-pro`, ...); it is also overridable per invocation with the
+CLI `--model` flag and the Streamlit "Model override" field. Three optional
+knobs tune the call, mainly for reasoning models: `CAUSALOMOP_LLM_MAX_TOKENS`
+(response ceiling, default 20000 — the DAG stage silently falls back to an
+empty graph if the model is truncated mid-response),
+`CAUSALOMOP_LLM_REASONING_EFFORT` (`minimal|low|medium|high`, unset by
+default), and `CAUSALOMOP_LLM_TIMEOUT` (seconds per attempt, default 180).
+The response is requested in JSON mode and any surrounding Markdown code
+fence is stripped before parsing.
+
+### Model choice
+
+The default is a frontier reasoning model (`openai/gpt-5`; a newer
+same-family snapshot such as `openai/gpt-5.2` is a drop-in replacement and is
+what `.env` is normally set to). The demanding step is candidate-DAG drafting
+and critique: the model reasons over 15+ retrieved abstracts at once, must
+respect the role, timing, and acyclicity constraints checked by
+`_parse_dag_response`, and may only propose an edge whose evidence identifier
+was actually retrieved for that run. The previous default,
+`openai/gpt-oss-120b` (~5B active parameters), was observed truncating
+mid-reasoning and silently falling back to an empty `candidate_dag`, and
+proposing identifiers absent from the retrieved set; a model with stronger
+long-context reasoning and instruction-following reduces both failure modes.
+Every stage is parsed with a strict `json.loads`, so the model must also
+honour OpenRouter's JSON mode reliably — the OpenAI GPT family and Anthropic
+Claude both do, which is a practical constraint on the choice.
+
+The model is swappable by design. Scientific rigor here comes from the
+deterministic machinery *around* the model — the citation allow-list, the
+structural DAG gate, `verify_narrative`, and the human approval gates — and
+from comparing pipeline output against published ground truth (the validation
+strategy in the top-level README), not from the model itself. The default is
+simply the most capable reasonable option; at this pipeline's call volume
+(single digits of requests per run) the cost gap between candidate models is
+immaterial next to the review effort each run already requires. This mirrors
+the evidence-grounded-co-pilot design of Alaa et al. (2024,
+[arXiv:2407.19118](https://arxiv.org/abs/2407.19118)), where verifiable
+grounding, not model capability alone, is what makes the output trustworthy.
 
 Production mode requires a local OpenAI-compatible endpoint:
 

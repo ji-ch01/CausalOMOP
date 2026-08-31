@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from causal.llm.base import load_dotenv_if_available
+from causal.llm.base import load_dotenv_if_available, strip_json_code_fence
 
 
 @dataclass(frozen=True)
@@ -20,10 +20,11 @@ class LocalLLMConfig:
 
     model: str = "local-model"
     base_url: str = "http://localhost:11434/v1"
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = 180.0
     # Kept in sync with OpenRouterGPTConfig.max_completion_tokens — see that
-    # field's comment for why 2500 was raised, then 6000.
-    max_completion_tokens: int = 12000
+    # field's comment for why the ceiling was raised (2500 -> 6000 -> 12000
+    # -> 20000), the last step to leave a local reasoning model room.
+    max_completion_tokens: int = 20000
 
     @classmethod
     def from_env(cls) -> "LocalLLMConfig":
@@ -70,4 +71,4 @@ class LocalLLMClient:
         content = completion.choices[0].message.content if completion.choices else None
         if not content:
             raise RuntimeError("The local model returned no JSON content")
-        return content
+        return strip_json_code_fence(content)

@@ -161,7 +161,7 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         self.assertEqual(result.llm_outputs[0].stage, "target_trial_draft")
 
         state = WorkflowManager(Path(self.temp.name) / "runs").start_generated(
-            result, model="openrouter:openai/gpt-oss-120b"
+            result, model="openrouter:openai/gpt-5"
         )
         raw_artifact = json.loads(
             (Path(self.temp.name) / "runs" / state.run_id / "llm_outputs.json").read_text(

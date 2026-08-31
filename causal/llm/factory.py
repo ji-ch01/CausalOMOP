@@ -1,7 +1,8 @@
 """Environment-aware selection between the OpenRouter and local LLM providers.
 
-`CAUSALOMOP_ENV=dev` (the default) allows the OpenRouter/GPT provider for
-development, where no on-premise model is available yet. `CAUSALOMOP_ENV=prod`
+`CAUSALOMOP_ENV=dev` (the default) allows the OpenRouter provider for
+development, where no on-premise model is available yet; the specific model is
+`CAUSALOMOP_LLM_MODEL` (any `vendor/model` slug). `CAUSALOMOP_ENV=prod`
 requires the local, on-premise provider and refuses to start if a cloud
 provider is still configured — clinical questions must never reach a cloud
 API once this runs against real SNUH data.
