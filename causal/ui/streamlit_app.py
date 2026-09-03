@@ -151,7 +151,7 @@ _GATE_INFO: dict[str, dict[str, str]] = {
         "title": "Results review",
         "phase": "results_review",
         "description": (
-            "Approves the final causal effect estimate and diagnostics before the demo report "
+            "Approves the final causal effect estimate and diagnostics before the quick summary "
             "is finalized."
         ),
     },
@@ -482,7 +482,7 @@ _PHASE_LABELS: dict[str, str] = {
     "execution": "cohort execution",
     "diagnostics": "diagnostics",
     "results_review": "results review",
-    "report": "demo report",
+    "report": "quick summary",
 }
 
 # Phases with no approval gate (`_PHASE_TO_GATE` has no entry) have no
@@ -492,7 +492,7 @@ _NO_GATE_NEXT_ACTION: dict[str, str] = {
     "feasibility": "run the feasibility check (Feasibility & cohort)",
     "execution": "build the cohort plan and run it (Feasibility & cohort)",
     "diagnostics": "review the cohort diagnostics (Feasibility & cohort)",
-    "report": "generate the demo report (Report & audit)",
+    "report": "generate the quick summary (Run history & artifacts)",
 }
 
 
@@ -3032,7 +3032,7 @@ _EVENT_LABELS: dict[str, str] = {
     "cohort_profile_completed": "Cohort profile completed",
     "followup_audit_completed": "Follow-up audit completed",
     "mapping_audit_completed": "Concept mapping audit completed",
-    "report_generated": "Demo report generated",
+    "report_generated": "Quick summary generated",
     "exposure_contrast_set": "Comparator design saved",
     "feasibility_completed": "Feasibility check completed",
 }
@@ -3139,12 +3139,12 @@ def _render_reviewer_memory(manager: WorkflowManager, run_id: str) -> None:
 
 
 def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:
-    st.subheader("Demo report")
+    st.subheader("Quick summary")
     st.caption(
-        "A quick, always-regeneratable walkthrough for demos -- not the auditable causal report. "
-        "Build that one from the **Estimation & report** workspace instead."
+        "An always-regeneratable plain-text walkthrough of this run -- not the auditable causal "
+        "report. Build that one from the **Estimation & report** workspace instead."
     )
-    if st.button("Regenerate demo report"):
+    if st.button("Regenerate quick summary"):
         manager.build_demo_report(state.run_id)
         st.rerun()
 
@@ -3154,7 +3154,7 @@ def _render_report_tab(manager: WorkflowManager, state: RunState, run_dir: Path)
         st.download_button("Download demo_report.md", report_text, file_name="demo_report.md")
         st.markdown(report_text)
     else:
-        st.caption("No demo report generated yet.")
+        st.caption("No quick summary generated yet.")
 
     st.subheader("History")
     if state.history:
@@ -3942,7 +3942,7 @@ def main() -> None:
                 "Mapping & plan",
                 "Feasibility & cohort",
                 "Estimation & report",
-                "Report & audit",
+                "Run history & artifacts",
             ),
             default="Current task",
             required=True,

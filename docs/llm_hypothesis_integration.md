@@ -213,7 +213,7 @@ loads for the turn, so `run_companion_turn` stays read-only.
 From the gate objects only a `rejected` gate is replayed (a routine
 approval does not change how the companion should behave); gate
 *invalidations* come through the history stream. It is inspectable three
-ways: live in the Streamlit **Report & audit** tab, via `python -m
+ways: live in the Streamlit **Run history & artifacts** tab, via `python -m
 causal.cli workflow decision-memory <run_id>` (`--json` for the raw
 object), and as a frozen `decision_memory.json` snapshot that
 `build_causal_report` writes and lists in the report's Provenance table.
@@ -234,8 +234,8 @@ loaded read-only and rendered into the prompt under `REVIEWER CONVENTIONS`,
 with an instruction to use it for consistency but never to treat a past
 choice as one already made for this study. Same boundary as the per-run
 decision memory: decision-level text only, feeds a prompt, never a gate.
-Inspect with `workflow reviewer-memory <name>` or the **Report & audit**
-tab.
+Inspect with `workflow reviewer-memory <name>` or the **Run history &
+artifacts** tab.
 
 ## Results narrative (post-estimation interpretation)
 
