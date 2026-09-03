@@ -3768,7 +3768,6 @@ def _render_estimation_report_tab(manager: WorkflowManager, state: RunState, run
     if estimation_preview:
         narrative = _render_results_narrative_section(manager, state, run_dir)
     else:
-        st.subheader("Prepare results")
         _render_estimation_actions(manager, state, state.run_id, run_dir)
         with st.container(border=True):
             st.markdown("**Interpretation assisted by LLM**")
@@ -3780,8 +3779,6 @@ def _render_estimation_report_tab(manager: WorkflowManager, state: RunState, run
     dataset_manifest = _read_json(run_dir / "dataset_manifest.json")
     estimation = _read_json(run_dir / "estimation.json")
     diagnostics = _read_json(run_dir / "diagnostics.json")
-
-    st.subheader("Results and diagnostics")
 
     if dataset_manifest:
         st.subheader("Analytic dataset")
@@ -3835,7 +3832,7 @@ def _render_estimation_report_tab(manager: WorkflowManager, state: RunState, run
             st.caption("Re-run materialization, diagnostics, or the primary estimator when the reviewed study inputs change.")
             _render_estimation_actions(manager, state, state.run_id, run_dir)
 
-    st.subheader("3. Causal report")
+    st.subheader("Build the causal report")
     report_phase_ok = state.phase in {"results_review", "report"}
     narrative_blocks = _narrative_blocks_report(narrative)
     build_disabled = not report_phase_ok or narrative_blocks
