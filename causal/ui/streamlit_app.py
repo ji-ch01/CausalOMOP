@@ -95,7 +95,7 @@ _GATE_INFO: dict[str, dict[str, str]] = {
         "title": "Question & target trial",
         "phase": "target_trial_review",
         "description": (
-            "Approves the normalized causal question (population / treatment / comparator / "
+            "Approves the structured causal question (population / treatment / comparator / "
             "outcome) and the target-trial protocol around it — eligibility criteria, "
             "assignment procedure, censoring strategy, analysis strategy, and the counterfactual "
             "estimand (effect measure, treatment/comparator contrast values)."
@@ -1054,7 +1054,7 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
         st.caption("No hypothesis.json for this run yet.")
         return
 
-    st.subheader("Normalized causal question")
+    st.subheader("Structured causal question")
     col1, col2 = st.columns(2)
     col1.markdown(f"**Population**  \n{hypothesis.get('population', '—')}")
     col1.markdown(f"**Treatment**  \n{hypothesis.get('treatment', '—')}")
@@ -1582,17 +1582,17 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                 st.markdown(f"- **{rejection.label}** rejected by {rejection.reviewer}{detail}{when}")
 
     if artifact.design_constraints:
-        st.subheader("Generation notes")
-        st.caption(
-            "Auditable notes recorded while this draft was generated, including whether an "
-            "independent critique step reviewed and revised the DAG."
-        )
-        for note in artifact.design_constraints:
-            st.markdown(f"- {note}")
+        with st.expander("How this DAG was drafted", icon=":material/history_edu:"):
+            st.caption(
+                "Auditable notes recorded while this draft was generated, including whether an "
+                "independent critique step reviewed and revised the DAG."
+            )
+            for note in artifact.design_constraints:
+                st.markdown(f"- {note}")
 
     llm_outputs = _read_json(run_dir / "llm_outputs.json")
     if llm_outputs and llm_outputs.get("outputs"):
-        with st.expander(f"Generation audit trail ({len(llm_outputs['outputs'])} LLM call(s))"):
+        with st.expander(f"Raw LLM responses ({len(llm_outputs['outputs'])} call(s))"):
             st.caption(
                 f"Model `{llm_outputs.get('model', 'unknown')}`, prompt version "
                 f"`{llm_outputs.get('prompt_version', '—')}`. Raw, unedited LLM responses."

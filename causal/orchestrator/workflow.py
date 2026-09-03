@@ -3754,7 +3754,7 @@ class WorkflowManager:
             )
         if hypothesis:
             lines.extend([
-                "", "## Normalized causal question", "",
+                "", "## Structured causal question", "",
                 f"- Population: {hypothesis['population']}",
                 f"- Treatment: {hypothesis['treatment']}",
                 f"- Comparator: {hypothesis['comparator']}",
