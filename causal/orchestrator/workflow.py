@@ -312,15 +312,27 @@ def _make_run_id(study_id: str) -> str:
     return f"{timestamp}_{study_id}-{uuid.uuid4().hex[:8]}"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` through a `.tmp` sidecar and an atomic
+    `replace`, so a concurrent reader holding no `_RunLock` (e.g. the
+    Streamlit UI polling a run) never observes a half-written file. Use for
+    non-JSON run artifacts (`cohort.sql`, `causal_report.md`, ...);
+    `_atomic_write_json` is the JSON equivalent. Every persisted run
+    artifact goes through one of these two.
+    """
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     """Serialize `data` to `path` as indented JSON through a `.tmp` sidecar
     and an atomic `replace`, so a concurrent reader holding no `_RunLock`
     (e.g. the Streamlit UI polling a run) never observes a half-written
-    file. Every persisted run artifact is written this way.
+    file. Every persisted run artifact is written this way or through
+    `_atomic_write_text` (its non-JSON counterpart).
     """
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    _atomic_write_text(path, json.dumps(data, indent=2))
 
 
 #: Cap on how many free-text correction points one
@@ -990,24 +1002,17 @@ class WorkflowManager:
         run_id = _make_run_id(study_id)
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
-        (run_dir / "protocol.json").write_text(
-            json.dumps(generated.protocol, indent=2), encoding="utf-8"
-        )
-        (run_dir / "hypothesis.json").write_text(
-            json.dumps(generated.hypothesis.to_dict(), indent=2), encoding="utf-8"
-        )
-        (run_dir / "llm_outputs.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": "1.0",
-                    "model": model,
-                    "prompt_version": generated.prompt_version,
-                    "contains_raw_llm_text": True,
-                    "outputs": [item.to_dict() for item in generated.llm_outputs],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        _atomic_write_json(run_dir / "protocol.json", generated.protocol)
+        _atomic_write_json(run_dir / "hypothesis.json", generated.hypothesis.to_dict())
+        _atomic_write_json(
+            run_dir / "llm_outputs.json",
+            {
+                "schema_version": "1.0",
+                "model": model,
+                "prompt_version": generated.prompt_version,
+                "contains_raw_llm_text": True,
+                "outputs": [item.to_dict() for item in generated.llm_outputs],
+            },
         )
         state = RunState(
             run_id=run_id,
@@ -2959,13 +2964,9 @@ class WorkflowManager:
         # silently overwritten by a stale save.
         with _RunLock(run_dir):
             state = self.load(run_id)
-            (run_dir / "cohort.sql").write_text(sql, encoding="utf-8")
-            (run_dir / "cohort_manifest.json").write_text(
-                json.dumps(manifest.to_dict(), indent=2), encoding="utf-8"
-            )
-            (run_dir / "cohort_query_validation.json").write_text(
-                json.dumps(validation.to_dict(), indent=2), encoding="utf-8"
-            )
+            _atomic_write_text(run_dir / "cohort.sql", sql)
+            _atomic_write_json(run_dir / "cohort_manifest.json", manifest.to_dict())
+            _atomic_write_json(run_dir / "cohort_query_validation.json", validation.to_dict())
             for artifact in ("cohort.sql", "cohort_manifest.json", "cohort_query_validation.json"):
                 if artifact not in state.artifacts:
                     state.artifacts.append(artifact)
@@ -3036,9 +3037,7 @@ class WorkflowManager:
                 study_id=state.study_id, run_id=state.run_id,
                 source_query_sha256=cohort_manifest["query_sha256"],
             )
-            (run_dir / "dataset_manifest.json").write_text(
-                json.dumps(dataset_manifest.to_dict(), indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(run_dir / "dataset_manifest.json", dataset_manifest.to_dict())
             for artifact in ("analytic_dataset.parquet", "dataset_manifest.json"):
                 if artifact not in state.artifacts:
                     state.artifacts.append(artifact)
@@ -3117,9 +3116,7 @@ class WorkflowManager:
         )
         with _RunLock(run_dir):
             state = self.load(run_id)
-            (run_dir / "estimation.json").write_text(
-                json.dumps(artifact.to_dict(), indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(run_dir / "estimation.json", artifact.to_dict())
             if "estimation.json" not in state.artifacts:
                 state.artifacts.append("estimation.json")
             estimand = artifact.estimand
@@ -3172,9 +3169,7 @@ class WorkflowManager:
         )
         with _RunLock(run_dir):
             state = self.load(run_id)
-            (run_dir / "diagnostics.json").write_text(
-                json.dumps(artifact.to_dict(), indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(run_dir / "diagnostics.json", artifact.to_dict())
             if "diagnostics.json" not in state.artifacts:
                 state.artifacts.append("diagnostics.json")
             state.record(
@@ -3236,9 +3231,7 @@ class WorkflowManager:
         }
         with _RunLock(run_dir):
             state = self.load(run_id)
-            (run_dir / "sensitivity_analysis.json").write_text(
-                json.dumps(artifact, indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(run_dir / "sensitivity_analysis.json", artifact)
             if "sensitivity_analysis.json" not in state.artifacts:
                 state.artifacts.append("sensitivity_analysis.json")
             state.record(
@@ -3385,10 +3378,8 @@ class WorkflowManager:
             state = self.load(run_id)
             sql_filename = f"negative_control_{control_id}_cohort.sql"
             result_filename = f"negative_control_estimation_{control_id}.json"
-            (run_dir / sql_filename).write_text(sql, encoding="utf-8")
-            (run_dir / result_filename).write_text(
-                json.dumps(artifact.to_dict(), indent=2), encoding="utf-8"
-            )
+            _atomic_write_text(run_dir / sql_filename, sql)
+            _atomic_write_json(run_dir / result_filename, artifact.to_dict())
             for artifact_name in (sql_filename, result_filename):
                 if artifact_name not in state.artifacts:
                     state.artifacts.append(artifact_name)
@@ -3534,9 +3525,7 @@ class WorkflowManager:
         }
         with _RunLock(run_dir):
             state = self.load(run_id)
-            (run_dir / "results_narrative.json").write_text(
-                json.dumps(artifact, indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(run_dir / "results_narrative.json", artifact)
             if "results_narrative.json" not in state.artifacts:
                 state.artifacts.append("results_narrative.json")
             state.record(
@@ -3661,7 +3650,7 @@ class WorkflowManager:
             artifact["reviewer"] = reviewer.strip()
             artifact["review_note"] = note.strip() if note else None
             artifact["reviewed_at"] = datetime.now(timezone.utc).isoformat()
-            narrative_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+            _atomic_write_json(narrative_path, artifact)
             state.record("results_narrative_reviewed", f"results_narrative.json {decision} by {reviewer.strip()}")
             self.save(state)
         return state
@@ -3792,9 +3781,7 @@ class WorkflowManager:
                 "Clinical and data-owner validation is required before using this field analytically.",
             ],
         }
-        (run_dir / "followup_audit.json").write_text(
-            json.dumps(artifact, indent=2), encoding="utf-8"
-        )
+        _atomic_write_json(run_dir / "followup_audit.json", artifact)
         if "followup_audit.json" not in state.artifacts:
             state.artifacts.append("followup_audit.json")
         state.record("followup_audit_completed", "aggregate audit via OMCP")
@@ -3873,9 +3860,7 @@ class WorkflowManager:
                 "Value-covariate min/mean/max is a distributional summary, not a stratified overlap check.",
             ],
         }
-        (run_dir / "positivity_audit.json").write_text(
-            json.dumps(artifact, indent=2), encoding="utf-8"
-        )
+        _atomic_write_json(run_dir / "positivity_audit.json", artifact)
         if "positivity_audit.json" not in state.artifacts:
             state.artifacts.append("positivity_audit.json")
         state.record("positivity_audit_completed", "aggregate audit via OMCP")
@@ -3948,9 +3933,7 @@ class WorkflowManager:
                 "measurement/observation covariates.",
             ],
         }
-        (run_dir / "covariate_missingness.json").write_text(
-            json.dumps(artifact, indent=2), encoding="utf-8"
-        )
+        _atomic_write_json(run_dir / "covariate_missingness.json", artifact)
         if "covariate_missingness.json" not in state.artifacts:
             state.artifacts.append("covariate_missingness.json")
         state.record("covariate_missingness_audit_completed", "aggregate audit via OMCP")
@@ -4195,7 +4178,7 @@ class WorkflowManager:
             "",
         ])
         report_path = run_dir / "demo_report.md"
-        report_path.write_text("\n".join(lines), encoding="utf-8")
+        _atomic_write_text(report_path, "\n".join(lines))
         if "demo_report.md" not in state.artifacts:
             state.artifacts.append("demo_report.md")
         state.record("report_generated", "demo_report.md")
@@ -4506,17 +4489,14 @@ class WorkflowManager:
             )
 
         decision_memory = self._decision_memory(state, protocol or {})
-        (run_dir / "decision_memory.json").write_text(
-            json.dumps(
-                {
-                    **decision_memory.to_dict(),
-                    "metadata": artifact_metadata(
-                        "decision_memory", "1.0", {"study_id": state.study_id}
-                    ),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        _atomic_write_json(
+            run_dir / "decision_memory.json",
+            {
+                **decision_memory.to_dict(),
+                "metadata": artifact_metadata(
+                    "decision_memory", "1.0", {"study_id": state.study_id}
+                ),
+            },
         )
         lines.extend([
             "", "## Reviewer decisions", "",
@@ -4571,7 +4551,7 @@ class WorkflowManager:
         lines.extend(["", "## Interpretation", "", interpretation, ""])
 
         report_path = run_dir / "causal_report.md"
-        report_path.write_text("\n".join(lines), encoding="utf-8")
+        _atomic_write_text(report_path, "\n".join(lines))
         with _RunLock(run_dir):
             state = self.load(run_id)
             for artifact_name in ("causal_report.md", "decision_memory.json"):
@@ -5194,7 +5174,7 @@ class WorkflowManager:
             raise RuntimeError(f"Cannot run CATE estimation: {exc}") from exc
         with _RunLock(run_dir):
             state = self.load(run_id)
-            (run_dir / "cate.json").write_text(json.dumps(artifact.to_dict(), indent=2), encoding="utf-8")
+            _atomic_write_json(run_dir / "cate.json", artifact.to_dict())
             if "cate.json" not in state.artifacts:
                 state.artifacts.append("cate.json")
             estimand = artifact.estimand
