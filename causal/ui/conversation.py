@@ -65,6 +65,11 @@ _ESTIMAND_PHASE = "estimand_review"
 # even after the run advances from `results_review` to `report`.
 _RESULTS_PHASES = frozenset({"results_review", "report"})
 _RESULTS_DIALOGUE_PHASE = "results_review"
+# The study-design dialogue runs across target_trial_review and dag_review;
+# its transcript turns all carry this one tag so history filtering stays
+# stable as the run advances between the two.
+_DESIGN_PHASES = frozenset({"target_trial_review", "dag_review"})
+_DESIGN_DIALOGUE_PHASE = "study_design"
 
 _CATEGORY_LABELS = {
     "causal": "Causal question",
@@ -174,6 +179,33 @@ def latest_pending_action(entries: Sequence[ConversationEntry]) -> ConversationE
     pending: ConversationEntry | None = None
     for entry in entries:
         if entry.phase != _ESTIMAND_PHASE:
+            continue
+        if entry.kind == "proposed_action":
+            pending = entry
+        elif entry.kind in ("action_taken", "action_dismissed"):
+            pending = None
+    return pending
+
+
+def design_dialogue_history(entries: Sequence[ConversationEntry]) -> list[CompanionMessage]:
+    """The study-design dialogue turns, as the companion sees them: reviewer
+    (`user`) and companion (`assistant`) messages in order. `event` lines (a
+    card applied / dismissed) and turns from other dialogues are dropped."""
+    history: list[CompanionMessage] = []
+    for entry in entries:
+        if entry.phase != _DESIGN_DIALOGUE_PHASE or entry.role not in ("user", "assistant"):
+            continue
+        if entry.text.strip():
+            history.append(CompanionMessage(role=entry.role, text=entry.text))
+    return history
+
+
+def latest_pending_design_action(entries: Sequence[ConversationEntry]) -> ConversationEntry | None:
+    """The most recent study-design `proposed_action` not yet applied or
+    dismissed (same supersede rule as `latest_pending_action`)."""
+    pending: ConversationEntry | None = None
+    for entry in entries:
+        if entry.phase != _DESIGN_DIALOGUE_PHASE:
             continue
         if entry.kind == "proposed_action":
             pending = entry
@@ -654,6 +686,168 @@ def _render_estimand_dialogue(manager: WorkflowManager, run_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Study-design dialogue (phases target_trial_review / dag_review)
+# --------------------------------------------------------------------------- #
+_DESIGN_EMPTY_MESSAGE = (
+    "Spotted a mistake in the drafted target trial or DAG? Describe it here — "
+    "wrong follow-up window, a missing confounder, the wrong estimand — and the "
+    "companion proposes a targeted fix you confirm, without regenerating the study."
+)
+
+
+def _run_design_companion_reply(
+    manager: WorkflowManager, run_id: str, store: ConversationStore
+) -> bool:
+    """One study-design companion turn. Returns True on success; on any
+    provider/parse failure records the message for the panel and returns
+    False without writing anything (mirrors `_run_companion_reply`)."""
+    history = design_dialogue_history(store.read())
+    reviewer = (st.session_state.get("reviewer_name") or "").strip() or None
+    status = st.status("Companion is thinking...", expanded=False)
+    try:
+        resolved_llm = build_hypothesis_llm()
+        turn = manager.run_design_companion_turn(
+            run_id, resolved_llm.call, history, reviewer=reviewer
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced in the panel, not swallowed
+        status.update(label="Companion unavailable", state="error")
+        st.session_state[_companion_error_key(run_id)] = str(exc)
+        return False
+    status.update(label="Companion replied", state="complete")
+    st.session_state.pop(_companion_error_key(run_id), None)
+    if turn.proposed_action is not None:
+        store.append(
+            ConversationEntry(
+                role="assistant",
+                kind="proposed_action",
+                phase=_DESIGN_DIALOGUE_PHASE,
+                text=turn.reply,
+                data={
+                    "action": turn.proposed_action.action,
+                    "args": turn.proposed_action.args,
+                    "summary": turn.proposed_action.summary,
+                },
+            )
+        )
+    else:
+        store.append(
+            ConversationEntry(
+                role="assistant", kind="message", phase=_DESIGN_DIALOGUE_PHASE, text=turn.reply
+            )
+        )
+    return True
+
+
+def _apply_design_action(
+    manager: WorkflowManager, run_id: str, reviewer: str, action: str, args: dict[str, Any]
+) -> None:
+    """Dispatch a confirmed study-design card to its `WorkflowManager` write.
+    `revise_candidate_dag_from_points` needs a formatter LLM at apply time;
+    the other two are deterministic."""
+    if action == "set_target_trial_timing":
+        manager.set_target_trial_timing(run_id, reviewer=reviewer, **args)
+    elif action == "set_target_trial_estimand":
+        manager.set_target_trial_estimand(run_id, reviewer=reviewer, **args)
+    elif action == "revise_candidate_dag_from_points":
+        resolved_llm = build_hypothesis_llm()
+        manager.revise_candidate_dag_from_points(
+            run_id,
+            args.get("points", []),
+            resolved_llm.call,
+            reviewer,
+            comment=args.get("comment", ""),
+        )
+    else:  # pragma: no cover - allow-list keeps this unreachable
+        raise ValueError(f"Unknown study-design action: {action}")
+
+
+def _render_pending_design_action_card(
+    manager: WorkflowManager, run_id: str, entry: ConversationEntry
+) -> None:
+    action = entry.data.get("action", "")
+    args = dict(entry.data.get("args") or {})
+    reviewer = (st.session_state.get("reviewer_name") or "").strip()
+    store = ConversationStore(manager.runs_dir / run_id)
+    with st.container(border=True):
+        st.markdown(":material/description: **Proposed correction — not yet applied**")
+        st.caption(entry.data.get("summary", ""))
+        if action == "revise_candidate_dag_from_points":
+            st.markdown("\n".join(f"- {point}" for point in args.get("points", [])))
+            st.caption("Applying this asks the model to turn each point into a DAG edit, then re-validates the graph.")
+        else:
+            st.markdown(
+                "\n".join(f"- `{key}` → `{value}`" for key, value in args.items()) or "_(no fields)_"
+            )
+        if not reviewer:
+            st.caption("Enter your name in the sidebar to confirm.")
+        confirm_col, dismiss_col = st.columns(2)
+        confirm = confirm_col.button(
+            "Confirm & apply", type="primary", disabled=not reviewer,
+            key=f"design_card_confirm_{entry.id}", width="stretch",
+        )
+        dismiss = dismiss_col.button(
+            "Dismiss", key=f"design_card_dismiss_{entry.id}", width="stretch"
+        )
+        if confirm:
+            try:
+                _apply_design_action(manager, run_id, reviewer, action, args)
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+                return
+            store.append(
+                ConversationEntry(
+                    role="event", kind="action_taken", phase=_DESIGN_DIALOGUE_PHASE,
+                    text=f"Applied: {entry.data.get('summary', action)} (by {reviewer}).",
+                    data={"action_id": entry.id, "action": action, "args": args, "reviewer": reviewer},
+                )
+            )
+            st.rerun()
+        if dismiss:
+            store.append(
+                ConversationEntry(
+                    role="event", kind="action_dismissed", phase=_DESIGN_DIALOGUE_PHASE,
+                    text="Proposed correction dismissed.", data={"action_id": entry.id},
+                )
+            )
+            st.rerun()
+
+
+def _render_design_dialogue(manager: WorkflowManager, run_id: str) -> None:
+    store = ConversationStore(manager.runs_dir / run_id)
+    entries = store.read()
+    dialogue_entries = [entry for entry in entries if entry.phase == _DESIGN_DIALOGUE_PHASE]
+
+    st.caption(
+        "Correct the drafted study design with the companion. Nothing is applied until you confirm."
+    )
+    _render_thread(dialogue_entries, empty_message=_DESIGN_EMPTY_MESSAGE)
+
+    error = st.session_state.get(_companion_error_key(run_id))
+    if error:
+        st.warning(
+            f"The companion is unavailable ({error}). Use the forms under **Current task** "
+            "and **Study design** to correct fields directly."
+        )
+        if st.button("Retry the companion", icon=":material/refresh:", key=f"design_retry_{run_id}"):
+            st.session_state.pop(_companion_error_key(run_id), None)
+            st.rerun()
+
+    pending = latest_pending_design_action(entries)
+    if pending is not None:
+        _render_pending_design_action_card(manager, run_id, pending)
+
+    submitted = st.chat_input("Describe a mistake in the draft…", key=f"design_chat_{run_id}")
+    if submitted and submitted.strip():
+        store.append(
+            ConversationEntry(
+                role="user", kind="message", phase=_DESIGN_DIALOGUE_PHASE, text=submitted.strip()
+            )
+        )
+        _run_design_companion_reply(manager, run_id, store)
+        st.rerun()
+
+
+# --------------------------------------------------------------------------- #
 # Results-interpretation dialogue (phase results_review / report)
 # --------------------------------------------------------------------------- #
 _RESULTS_EMPTY_MESSAGE = (
@@ -923,6 +1117,8 @@ def render_conversation_panel(manager: WorkflowManager, run_id: str | None) -> N
             _render_estimand_dialogue(manager, run_id)
         elif state.phase in _RESULTS_PHASES:
             _render_results_dialogue(manager, run_id, run_dir)
+        elif state.phase in _DESIGN_PHASES:
+            _render_design_dialogue(manager, run_id)
         else:
             _render_thread(ConversationStore(run_dir).read())
             st.caption(

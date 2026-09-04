@@ -11,12 +11,15 @@ from pathlib import Path
 from causal.agents.results_narrative import NarrativeInput, NarrativeResult
 from causal.companion.actions import ProposedAction
 from causal.companion.companion import (
+    DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH,
     DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
     DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
     CompanionMessage,
     CompanionTurn,
+    DesignDialogueContext,
     EstimandDialogueContext,
     ResultsCompanionTurn,
+    build_design_dialogue_prompt,
     build_estimand_dialogue_prompt,
     build_results_dialogue_prompt,
     parse_companion_turn,
@@ -289,6 +292,64 @@ _VALID_DRAFT = {
         },
     ],
 }
+
+
+_DESIGN_PLACEHOLDERS = (
+    "{{CONVERSATION}}", "{{SOURCE_QUESTION}}", "{{PHASE}}", "{{TARGET_TRIAL_GATE}}",
+    "{{TARGET_TRIAL}}", "{{CANDIDATE_DAG}}", "{{FIRST_PASS_COVARIATES}}",
+    "{{UNRESOLVED_COVARIATES}}", "{{CORRECTION_LOG}}", "{{DECISION_MEMORY}}", "{{REVIEWER_MEMORY}}",
+)
+
+
+class BuildDesignDialoguePromptTests(unittest.TestCase):
+    def _context(self, **overrides):
+        base = dict(
+            source_question="Does drug A vs B affect AKI?",
+            phase="dag_review",
+            target_trial_gate_approved=True,
+            target_trial={"population": "ICU adults", "follow_up_days": 7},
+            candidate_dag=[{"label": "age", "role": "confounder", "temporal_classification": "pre_treatment"}],
+            first_pass_covariates=["age", "sex"],
+            correction_log=[{"kind": "target_trial_timing", "summary": "follow_up_days -> 90", "comment": "D90"}],
+        )
+        base.update(overrides)
+        return DesignDialogueContext(**base)
+
+    def test_shipped_template_has_every_placeholder_filled(self):
+        prompt = build_design_dialogue_prompt(
+            DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH, history=[], context=self._context()
+        )
+        for placeholder in _DESIGN_PLACEHOLDERS:
+            self.assertNotIn(placeholder, prompt)
+        self.assertIn("age", prompt)
+        self.assertIn("follow_up_days -> 90", prompt)
+
+    def test_approved_gate_state_is_surfaced(self):
+        approved = build_design_dialogue_prompt(
+            DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH, history=[], context=self._context()
+        )
+        self.assertIn("reject the target_trial gate first", approved)
+        pending = build_design_dialogue_prompt(
+            DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH, history=[],
+            context=self._context(target_trial_gate_approved=False),
+        )
+        self.assertIn("can be applied directly", pending)
+
+    def test_history_is_labelled_by_speaker(self):
+        prompt = build_design_dialogue_prompt(
+            DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH,
+            history=[CompanionMessage("user", "the follow-up is wrong")],
+            context=self._context(),
+        )
+        self.assertIn("Reviewer: the follow-up is wrong", prompt)
+
+    def test_missing_placeholder_in_template_raises(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        template = Path(temp.name) / "design_dialogue.md"
+        template.write_text("no placeholders", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            build_design_dialogue_prompt(template, history=[], context=self._context())
 
 
 class BuildResultsDialoguePromptTests(unittest.TestCase):

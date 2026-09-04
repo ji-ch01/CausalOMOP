@@ -62,12 +62,15 @@ from causal.agents.results_narrative import (
 )
 from causal.agents.user_question import GeneratedHypothesis
 from causal.companion.companion import (
+    DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH,
     DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH,
     DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH,
     CompanionMessage,
     CompanionTurn,
+    DesignDialogueContext,
     EstimandDialogueContext,
     ResultsCompanionTurn,
+    build_design_dialogue_prompt,
     build_estimand_dialogue_prompt,
     build_results_dialogue_prompt,
     parse_companion_turn,
@@ -4843,6 +4846,50 @@ class WorkflowManager:
             )
             self.save(state)
         return state
+
+    def run_design_companion_turn(
+        self,
+        run_id: str,
+        llm: LLMCallable,
+        history: Sequence[CompanionMessage],
+        *,
+        reviewer: str | None = None,
+        prompt_path: Path = DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH,
+    ) -> CompanionTurn:
+        """One turn of the study-design dialogue (`target_trial_review` /
+        `dag_review` phases). Mirrors `run_companion_turn`: owns the
+        `llm(prompt)` call and the JSON reads, records nothing, writes
+        nothing, takes no lock. The returned `CompanionTurn.proposed_action`
+        has been through `causal.companion.actions.validate_proposed_action`,
+        so it can only ever name `set_target_trial_timing`,
+        `set_target_trial_estimand`, or `revise_candidate_dag_from_points`
+        with in-range arguments -- and the reviewer still confirms each card.
+        """
+        state = self.load(run_id)
+        if state.phase not in {"target_trial_review", "dag_review"}:
+            raise RuntimeError(
+                "The study-design dialogue requires the target_trial_review or dag_review phase"
+            )
+        run_dir = self.runs_dir / run_id
+        protocol = json.loads((run_dir / "protocol.json").read_text(encoding="utf-8"))
+        hypothesis = self._read_optional_json(run_dir / "hypothesis.json")
+        unresolved = [
+            str(item) for item in (hypothesis.get("unresolved_covariates") or ())
+        ] if isinstance(hypothesis, dict) else []
+        context = DesignDialogueContext(
+            source_question=str(protocol.get("source_question", "")),
+            phase=state.phase,
+            target_trial_gate_approved=state.gates["target_trial"].status == "approved",
+            target_trial=protocol.get("target_trial") or {},
+            candidate_dag=list(protocol.get("candidate_dag") or []),
+            first_pass_covariates=[str(item) for item in (protocol.get("first_pass_covariates") or ())],
+            unresolved_covariates=unresolved,
+            correction_log=list(protocol.get("correction_log") or []),
+            decision_memory=self._decision_memory(state, protocol),
+            reviewer_memory=self.reviewer_memory(reviewer) if reviewer else ReviewerMemory(),
+        )
+        prompt = build_design_dialogue_prompt(prompt_path, history=history, context=context)
+        return parse_companion_turn(llm(prompt))
 
     def run_companion_turn(
         self,

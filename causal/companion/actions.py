@@ -26,15 +26,31 @@ _ENUM_FIELDS: dict[str, frozenset[str]] = {
     "missing_data_strategy": frozenset(MISSING_DATA_STRATEGIES),
     "censoring_strategy": frozenset(CENSORING_STRATEGIES),
     "estimation_procedure": frozenset(ESTIMATION_PROCEDURES),
+    "primary_estimand": frozenset({"ATE", "ATT", "CATE"}),
 }
 
 _MAX_RATIONALE_CHARS = 2000
+_MAX_LIST_ITEMS = 20
+_MAX_LIST_ITEM_CHARS = 400
+
+
+@dataclass(frozen=True)
+class _IntField:
+    name: str
+    minimum: int
+    maximum: int
 
 
 @dataclass(frozen=True)
 class _ActionSpec:
-    enum_fields: tuple[str, ...]
-    text_fields: tuple[str, ...]
+    enum_fields: tuple[str, ...] = ()
+    text_fields: tuple[str, ...] = ()
+    int_fields: tuple[_IntField, ...] = ()
+    #: fields whose value is a list of non-empty strings
+    str_list_fields: tuple[str, ...] = ()
+    #: any field name above that may be absent from `args` (or present as
+    #: null); every other field is required
+    optional_fields: frozenset[str] = frozenset()
 
 
 #: The only writes a companion may propose. Widening what the companion can
@@ -44,6 +60,25 @@ _ALLOWED_ACTIONS: dict[str, _ActionSpec] = {
     "set_statistical_estimand_strategy": _ActionSpec(
         enum_fields=("missing_data_strategy", "censoring_strategy", "estimation_procedure"),
         text_fields=("censoring_rationale",),
+    ),
+    "set_target_trial_timing": _ActionSpec(
+        text_fields=("time_zero", "comment"),
+        int_fields=(
+            _IntField("grace_period_hours", 0, 8760),
+            _IntField("follow_up_days", 1, 3650),
+        ),
+        optional_fields=frozenset({"time_zero", "grace_period_hours", "follow_up_days"}),
+    ),
+    "set_target_trial_estimand": _ActionSpec(
+        enum_fields=("primary_estimand",),
+        text_fields=("comment",),
+        str_list_fields=("secondary_estimands",),
+        optional_fields=frozenset({"secondary_estimands"}),
+    ),
+    "revise_candidate_dag_from_points": _ActionSpec(
+        text_fields=("comment",),
+        str_list_fields=("points",),
+        optional_fields=frozenset({"comment"}),
     ),
 }
 
@@ -96,15 +131,31 @@ def validate_proposed_action(raw: Any) -> ProposedAction | None:
     if not isinstance(raw_args, dict):
         raise ActionValidationError("proposed_action.args must be an object")
 
-    allowed = set(spec.enum_fields) | set(spec.text_fields)
+    int_field_names = tuple(field.name for field in spec.int_fields)
+    allowed = (
+        set(spec.enum_fields)
+        | set(spec.text_fields)
+        | set(int_field_names)
+        | set(spec.str_list_fields)
+    )
     unexpected = set(raw_args) - allowed
     if unexpected:
         raise ActionValidationError(
             f"unexpected arg(s) for {name}: {sorted(unexpected)} (the companion may not set these)"
         )
 
+    def _present(field: str) -> bool:
+        """An optional field that is absent, or explicitly null, is skipped."""
+        if raw_args.get(field) is not None:
+            return True
+        if field not in spec.optional_fields:
+            raise ActionValidationError(f"{name} requires {field}")
+        return False
+
     args: dict[str, Any] = {}
     for field in spec.enum_fields:
+        if not _present(field):
+            continue
         value = raw_args.get(field)
         if value not in _ENUM_FIELDS[field]:
             raise ActionValidationError(
@@ -112,6 +163,8 @@ def validate_proposed_action(raw: Any) -> ProposedAction | None:
             )
         args[field] = value
     for field in spec.text_fields:
+        if not _present(field):
+            continue
         value = raw_args.get(field)
         if not isinstance(value, str) or not value.strip():
             raise ActionValidationError(f"{field} must be non-empty text")
@@ -120,6 +173,32 @@ def validate_proposed_action(raw: Any) -> ProposedAction | None:
                 f"{field} must be at most {_MAX_RATIONALE_CHARS} characters"
             )
         args[field] = value.strip()
+    for int_field in spec.int_fields:
+        if not _present(int_field.name):
+            continue
+        value = raw_args.get(int_field.name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ActionValidationError(f"{int_field.name} must be an integer")
+        if not int_field.minimum <= value <= int_field.maximum:
+            raise ActionValidationError(
+                f"{int_field.name} must be between {int_field.minimum} and {int_field.maximum}"
+            )
+        args[int_field.name] = value
+    for field in spec.str_list_fields:
+        if not _present(field):
+            continue
+        value = raw_args.get(field)
+        if not isinstance(value, list) or not value:
+            raise ActionValidationError(f"{field} must be a non-empty list")
+        cleaned: list[str] = []
+        for item in value[:_MAX_LIST_ITEMS]:
+            if not isinstance(item, str) or not item.strip():
+                raise ActionValidationError(f"{field} entries must be non-empty text")
+            cleaned.append(item.strip()[:_MAX_LIST_ITEM_CHARS])
+        args[field] = cleaned
+
+    if not args:
+        raise ActionValidationError(f"{name} was proposed with no arguments")
 
     return ProposedAction(action=name, args=args, summary=_summarize(name, args))
 
@@ -133,4 +212,18 @@ def _summarize(name: str, args: dict[str, Any]) -> str:
                 args["estimation_procedure"],
             )
         )
+    if name == "set_target_trial_timing":
+        parts = [
+            f"{field}={args[field]}"
+            for field in ("time_zero", "grace_period_hours", "follow_up_days")
+            if field in args
+        ]
+        return "Correct target-trial timing: " + ", ".join(parts)
+    if name == "set_target_trial_estimand":
+        secondary = args.get("secondary_estimands") or []
+        tail = f" (secondary: {', '.join(secondary)})" if secondary else ""
+        return f"Correct the estimand: primary = {args['primary_estimand']}{tail}"
+    if name == "revise_candidate_dag_from_points":
+        points = args.get("points") or []
+        return f"Revise the candidate DAG from {len(points)} correction point(s)"
     return name  # pragma: no cover - every allow-listed action has a branch above

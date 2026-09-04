@@ -48,6 +48,7 @@ from causal.companion.reviewer_memory import ReviewerMemory
 
 DEFAULT_ESTIMAND_DIALOGUE_PROMPT_PATH = Path("causal/prompts/estimand_dialogue.md")
 DEFAULT_RESULTS_DIALOGUE_PROMPT_PATH = Path("causal/prompts/results_dialogue.md")
+DEFAULT_DESIGN_DIALOGUE_PROMPT_PATH = Path("causal/prompts/design_dialogue.md")
 
 _MESSAGE_ROLES = frozenset({"user", "assistant"})
 
@@ -171,6 +172,95 @@ def build_estimand_dialogue_prompt(
     for placeholder, value in required.items():
         if placeholder not in template:
             raise ValueError(f"Estimand dialogue prompt is missing {placeholder}")
+        template = template.replace(placeholder, value)
+    return template
+
+
+@dataclass(frozen=True)
+class DesignDialogueContext:
+    """JSON-safe grounding for a study-design-dialogue turn (phases
+    `target_trial_review` / `dag_review`).
+
+    The companion is shown the drafted target trial, the current candidate
+    DAG, the first-pass covariate list, and what the reviewer has already
+    ruled on -- everything it needs to turn a free-text correction point into
+    a `set_target_trial_timing` / `set_target_trial_estimand` /
+    `revise_candidate_dag_from_points` proposal. No patient-level data.
+    """
+
+    source_question: str = ""
+    phase: str = ""
+    target_trial_gate_approved: bool = False
+    target_trial: dict[str, Any] = field(default_factory=dict)
+    candidate_dag: list[dict[str, Any]] = field(default_factory=list)
+    first_pass_covariates: list[str] = field(default_factory=list)
+    unresolved_covariates: list[str] = field(default_factory=list)
+    correction_log: list[dict[str, Any]] = field(default_factory=list)
+    decision_memory: DecisionMemory = field(default_factory=DecisionMemory)
+    reviewer_memory: ReviewerMemory = field(default_factory=ReviewerMemory)
+
+
+def _dag_summary(candidate_dag: list[dict[str, Any]]) -> str:
+    rows = []
+    for variable in candidate_dag:
+        label = str(variable.get("label", "")).strip()
+        if not label:
+            continue
+        rows.append(
+            f"- {label} [role={variable.get('role', '?')}, "
+            f"timing={variable.get('temporal_classification', '?')}]"
+        )
+    return "\n".join(rows) or "(no candidate DAG variables yet)"
+
+
+def _correction_log_summary(correction_log: list[dict[str, Any]]) -> str:
+    if not correction_log:
+        return "(no corrections applied to this run yet)"
+    return "\n".join(
+        f"- [{entry.get('kind', '?')}] {entry.get('summary', '')}"
+        f" ({entry.get('comment', '')})".rstrip()
+        for entry in correction_log
+    )
+
+
+def build_design_dialogue_prompt(
+    template_path: Path,
+    *,
+    history: Sequence[CompanionMessage],
+    context: DesignDialogueContext,
+) -> str:
+    """Render `causal/prompts/design_dialogue.md`. Same required-placeholder
+    rule as `build_estimand_dialogue_prompt`."""
+    template = template_path.read_text(encoding="utf-8")
+    target = context.target_trial
+    if context.target_trial_gate_approved:
+        gate_state = (
+            "APPROVED -- a target-trial timing or estimand correction now needs the reviewer "
+            "to reject the target_trial gate first. Tell them that rather than proposing "
+            "set_target_trial_timing / set_target_trial_estimand. DAG corrections are fine."
+        )
+    else:
+        gate_state = "not yet approved -- timing / estimand corrections can be applied directly."
+    required = {
+        "{{CONVERSATION}}": _format_history(history),
+        "{{SOURCE_QUESTION}}": context.source_question or "(not recorded)",
+        "{{PHASE}}": context.phase or "(unknown)",
+        "{{TARGET_TRIAL_GATE}}": gate_state,
+        "{{TARGET_TRIAL}}": json.dumps(target, indent=2) if target else "(not drafted yet)",
+        "{{CANDIDATE_DAG}}": _dag_summary(context.candidate_dag),
+        "{{FIRST_PASS_COVARIATES}}": (
+            ", ".join(context.first_pass_covariates) or "(none listed)"
+        ),
+        "{{UNRESOLVED_COVARIATES}}": (
+            ", ".join(context.unresolved_covariates) or "(none)"
+        ),
+        "{{CORRECTION_LOG}}": _correction_log_summary(context.correction_log),
+        "{{DECISION_MEMORY}}": context.decision_memory.format_for_prompt(),
+        "{{REVIEWER_MEMORY}}": context.reviewer_memory.format_for_prompt(),
+    }
+    for placeholder, value in required.items():
+        if placeholder not in template:
+            raise ValueError(f"Design dialogue prompt is missing {placeholder}")
         template = template.replace(placeholder, value)
     return template
 

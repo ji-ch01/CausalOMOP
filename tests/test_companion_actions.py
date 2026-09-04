@@ -89,5 +89,65 @@ class ValidateProposedActionTests(unittest.TestCase):
             self.assertTrue(callable(getattr(WorkflowManager, name, None)), name)
 
 
+class StudyDesignActionTests(unittest.TestCase):
+    """The three study-design-dialogue actions: partial int fields, an
+    optional string list, and the same `reviewer`/`run_id` injection guard."""
+
+    def test_timing_accepts_a_partial_field_set(self):
+        result = validate_proposed_action({
+            "action": "set_target_trial_timing",
+            "args": {"follow_up_days": 90, "comment": "anchor RCT primary endpoint"},
+        })
+        self.assertEqual(result.args, {"follow_up_days": 90, "comment": "anchor RCT primary endpoint"})
+        self.assertIn("follow_up_days=90", result.summary)
+
+    def test_timing_out_of_range_int_raises(self):
+        for bad in (0, -1, 4000):
+            with self.assertRaises(ActionValidationError):
+                validate_proposed_action({
+                    "action": "set_target_trial_timing",
+                    "args": {"follow_up_days": bad, "comment": "x"},
+                })
+
+    def test_timing_requires_comment(self):
+        with self.assertRaises(ActionValidationError):
+            validate_proposed_action({
+                "action": "set_target_trial_timing", "args": {"follow_up_days": 30},
+            })
+
+    def test_timing_rejects_injected_reviewer(self):
+        with self.assertRaises(ActionValidationError):
+            validate_proposed_action({
+                "action": "set_target_trial_timing",
+                "args": {"follow_up_days": 30, "comment": "x", "reviewer": "attacker"},
+            })
+
+    def test_estimand_enum_and_optional_secondary_list(self):
+        result = validate_proposed_action({
+            "action": "set_target_trial_estimand",
+            "args": {"primary_estimand": "CATE", "comment": "prespecified subgroups"},
+        })
+        self.assertEqual(result.args["primary_estimand"], "CATE")
+        self.assertNotIn("secondary_estimands", result.args)
+
+        with self.assertRaises(ActionValidationError):
+            validate_proposed_action({
+                "action": "set_target_trial_estimand",
+                "args": {"primary_estimand": "RISK_RATIO", "comment": "x"},
+            })
+
+    def test_dag_points_requires_a_non_empty_list(self):
+        result = validate_proposed_action({
+            "action": "revise_candidate_dag_from_points",
+            "args": {"points": ["add baseline creatinine as a confounder"]},
+        })
+        self.assertEqual(len(result.args["points"]), 1)
+        for bad in ([], [""], "not a list"):
+            with self.assertRaises(ActionValidationError):
+                validate_proposed_action({
+                    "action": "revise_candidate_dag_from_points", "args": {"points": bad},
+                })
+
+
 if __name__ == "__main__":
     unittest.main()

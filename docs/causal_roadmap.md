@@ -89,6 +89,44 @@ unless it constructs without error, and the result is persisted as
 scientific review is split across `target_trial`, `dag_review`, and
 `identification_estimand`.
 
+When the LLM draft of the study design is wrong in a bounded way, the
+reviewer does not have to regenerate the whole run (which discards every
+covariate decision and mapping already made). Scoped in-place corrections
+exist, each recording a `before`/`after` in `state.history`, appending to
+`protocol.json`'s `correction_log`, and re-opening the gates that depended on
+the changed content:
+
+- `set_target_trial_estimand` (`primary_estimand`/`secondary_estimands`) and
+  `set_target_trial_timing` (`time_zero`/`grace_period_hours`/
+  `follow_up_days`, CLI `workflow target-trial-timing`, also re-opening
+  `analysis_plan` and `statistical_estimand` because `follow_up_days` feeds
+  the cohort SQL and the censoring definition). Both are refused once
+  `target_trial` is `approved` -- reject it first.
+- `revise_candidate_dag_from_points` (CLI `workflow revise-dag`): a reviewer's
+  free-text DAG correction points ("add baseline creatinine as a confounder",
+  "vasopressor use is a mediator", "remove ICU LOS, it is a collider"). An LLM
+  *formats* each point into an `add`/`reclassify`/`remove` operation
+  (`causal.agents.dag_point_revision`) -- the reviewer is the grounding, so
+  added variables are expert-asserted (`pmid=""`), the same as
+  `review_covariate`; this is not the literature-grounded
+  `_critique_and_revise_dag` loop and skips its citation allow-list. The
+  revised graph is still validated by `HypothesisAgent` before anything is
+  written, and `dag_review`/`clinical_mapping`/`analysis_plan` re-open.
+
+The free-text population/treatment/comparator/outcome fields have no in-place
+editor: they also seed the literature search and `first_pass_covariates`, so
+correcting them stays a regeneration -- but the accumulated `correction_log`
+is replayed into that regeneration prompt
+(`UserQuestionHypothesisService.generate`'s `prior_corrections`) so a fresh
+draft is less likely to repeat a mistake a reviewer already fixed.
+
+During `target_trial_review` and `dag_review` the left-column companion
+becomes a **study-design dialogue** (`run_design_companion_turn`,
+`causal/prompts/design_dialogue.md`): the reviewer describes a mistake, the
+companion proposes one of the three corrections above as a card the reviewer
+confirms -- same allow-list mechanism (`causal.companion.actions`) and the
+same "companion never approves a gate" boundary as the estimand dialogue.
+
 `StatisticalEstimand` is deliberately a separate contract from
 `CausalEstimand`, not a few extra fields on it: `CausalEstimand` (stage 3)
 fixes the counterfactual contrast and is meaningful before any OMOP data
@@ -107,16 +145,19 @@ reviewable graphs.
 
 ## Evidence and LLM boundary
 
-- The question gate, the drafting agents, the estimand-dialogue companion
-  (`causal.companion.companion`, at the `statistical_estimand` gate), and the
-  results-interpretation dialogue companion (same module, at
+- The question gate, the drafting agents, the study-design dialogue companion
+  (`causal.companion.companion`, at `target_trial_review` / `dag_review`), the
+  estimand-dialogue companion (same module, at the `statistical_estimand`
+  gate), and the results-interpretation dialogue companion (same module, at
   `results_review` / `report`) are advisory LLM steps. They cannot approve a
   protocol, a DAG, an OMOP mapping, a statistical estimand, execution, or the
-  `results` gate. The estimand companion's one possible write,
-  `set_statistical_estimand_strategy`, is an explicitly human-confirmed card
-  gated by a code-level allow-list (`causal.companion.actions`); approving
-  the gate itself stays manual. The results companion's only outcome is a
-  drafted narrative the reviewer explicitly saves
+  `results` gate. The design and estimand companions' possible writes
+  (`set_target_trial_timing`, `set_target_trial_estimand`,
+  `revise_candidate_dag_from_points`, `set_statistical_estimand_strategy`) are
+  each an explicitly human-confirmed card gated by a code-level allow-list
+  (`causal.companion.actions`, which also rejects an injected `reviewer` /
+  `run_id`); approving the gate itself stays manual. The results companion's
+  only outcome is a drafted narrative the reviewer explicitly saves
   (`save_results_narrative_draft`), which then goes through the same
   deterministic `verify_narrative` and the same human
   `review_results_narrative` approval as a one-shot narrative.

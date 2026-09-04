@@ -331,6 +331,36 @@ class WorkflowTests(unittest.TestCase):
                 state.run_id, ["   "], _CapturingLLM("{}"), "tester"
             )
 
+    def test_run_design_companion_turn_returns_a_validated_card(self):
+        state = self.manager.start(self._dag_protocol_path())
+        self.manager.run_hypothesis_agent(state.run_id)
+        response = json.dumps({
+            "reply": "The anchor RCT used 90-day mortality; I'll propose that.",
+            "proposed_action": {
+                "action": "set_target_trial_timing",
+                "args": {"follow_up_days": 90, "comment": "anchor RCT primary endpoint"},
+            },
+        })
+        llm = _CapturingLLM(response)
+        turn = self.manager.run_design_companion_turn(
+            state.run_id, llm, [CompanionMessage("user", "follow-up should be 90 days")]
+        )
+        self.assertEqual(turn.proposed_action.action, "set_target_trial_timing")
+        self.assertIn("DRAFTED CANDIDATE DAG", llm.prompts[0])
+        self.assertIn("Reviewer: follow-up should be 90 days", llm.prompts[0])
+        # read-only: no history entry, no protocol write
+        before = self.manager.load(state.run_id)
+        self.manager.run_design_companion_turn(state.run_id, _CapturingLLM(response), [])
+        self.assertEqual(len(self.manager.load(state.run_id).history), len(before.history))
+
+    def test_run_design_companion_turn_rejects_wrong_phase(self):
+        state = self.manager.start(self._dag_protocol_path())
+        _approve_pre_mapping_gates(self.manager, state.run_id)
+        for _ in range(3):
+            state = self.manager.advance(state.run_id)
+        with self.assertRaises(RuntimeError):
+            self.manager.run_design_companion_turn(state.run_id, _CapturingLLM("{}"), [])
+
     def _protocol_path_with_approved_concept_sets(self):
         """`_full_protocol_path` plus an approved population/treatment/
         comparator, needed as a base for `add_population_concept_set`
