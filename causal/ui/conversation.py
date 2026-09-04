@@ -278,7 +278,29 @@ def _render_thread(entries: Sequence[ConversationEntry], *, empty_message: str =
 
 def _render_draft_options() -> dict[str, Any]:
     with st.expander("Draft options", icon=":material/tune:"):
-        mode = st.selectbox("Mode", ("exploratory", "final"), key="intake_mode")
+        mode = st.selectbox(
+            "Mode",
+            ("exploratory", "final"),
+            key="intake_mode",
+            help=(
+                "Governs how strict the gates are before the Execution Agent may "
+                "act. **exploratory**: a *provisional* concept mapping is enough "
+                "to proceed, and only aggregate feasibility / attrition counts "
+                "run -- no person-level analytic dataset and no effect estimate. "
+                "**final**: every gate must be fully *approved*, which unlocks "
+                "the analytic dataset build and the causal effect estimate."
+            ),
+        )
+        if mode == "exploratory":
+            st.caption(
+                ":material/science: First-pass check on a provisional mapping -- "
+                "aggregate counts only, no person-level dataset or effect estimate."
+            )
+        else:
+            st.caption(
+                ":material/verified: Confirmatory run -- needs every gate approved "
+                "before the person-level dataset build and the effect estimate."
+            )
         model = st.text_input("Model override (optional)", key="intake_model")
         skip_question_gate = st.checkbox(
             "Assume the question is already causal (skip the classification gate)",
