@@ -214,7 +214,12 @@ class StatisticalEstimand:
     question from `identifying_functional`, which both procedures currently
     share (`g_formula_standardization`): the functional says what
     statistical quantity identifies the causal contrast, the procedure says
-    which reviewed estimator computes it.
+    which reviewed estimator computes it. `targeted_minimum_loss_based_
+    estimation` additionally rejects `censoring_strategy=
+    "ipcw_administrative_censoring"` -- `TMLEAgent` only implements
+    uncensored-data TMLE (`docs/causal_roadmap.md` milestone 4), so the
+    combination is caught here at gate-approval time rather than at fit
+    time.
 
     `population_summary` (added in schema_version 1.2) must match
     `study_specification.json`'s `estimand.population_summary` -- closes a
@@ -268,6 +273,20 @@ class StatisticalEstimand:
             raise ValueError(f"Unsupported missing-data strategy: {self.missing_data_strategy!r}")
         if self.censoring_strategy not in CENSORING_STRATEGIES:
             raise ValueError(f"Unsupported censoring strategy: {self.censoring_strategy!r}")
+        if (
+            self.estimation_procedure == "targeted_minimum_loss_based_estimation"
+            and self.censoring_strategy == "ipcw_administrative_censoring"
+        ):
+            raise ValueError(
+                "estimation_procedure='targeted_minimum_loss_based_estimation' does not support "
+                "censoring_strategy='ipcw_administrative_censoring' -- censored-data TMLE needs a "
+                "materially different efficient-influence-function construction (Van der Laan & "
+                "Rose 2011, ch. 5), not a reuse of the stabilized-weight IPCW g-formula "
+                "(TMLEAgent raises the same ValueError at fit time). Use "
+                "estimation_procedure='plug_in_standardization' for IPCW, or keep TMLE with "
+                "censoring_strategy='exclude_censored_before_analysis' / "
+                "'ignore_censoring_administrative_waiver'."
+            )
         object.__setattr__(
             self, "censoring_rationale", _require_text(self.censoring_rationale, "censoring_rationale")
         )

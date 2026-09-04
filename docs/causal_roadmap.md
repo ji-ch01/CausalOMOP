@@ -343,7 +343,12 @@ parser and is not applied uniformly to those aggregate paths.
    `ipcw_administrative_censoring` (`TMLEAgent.run` raises `ValueError` --
    censored-data TMLE needs a materially different efficient-influence-
    function construction, Van der Laan & Rose 2011 ch. 5, not a reuse of
-   `EstimationAgent`'s stabilized-weight IPCW).
+   `EstimationAgent`'s stabilized-weight IPCW). `StatisticalEstimand.
+   __post_init__` now rejects the pairing of
+   `targeted_minimum_loss_based_estimation` with
+   `ipcw_administrative_censoring` at `statistical_estimand` gate-approval
+   time, so the incompatibility surfaces during review rather than as a
+   fit-time crash in the `execution` phase.
 
    Done for CATE: `causal.agents.cate.CATEAgent` (Athey & Imbens 2016,
    Wager & Athey 2018) fits `econml.dml.CausalForestDML` over

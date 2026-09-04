@@ -170,10 +170,11 @@ touches:
   logic is built around one scalar estimate, and stretching it to N
   subgroup results without redesigning it would be exactly the kind of
   bolted-on half-extension this project avoids. TMLE also does not support
-  `ipcw_administrative_censoring` (`TMLEAgent.run` raises `ValueError`):
-  censored-data TMLE needs a materially different efficient-influence-
-  function construction (Van der Laan & Rose 2011, ch. 5), not a reuse of
-  `EstimationAgent`'s stabilized-weight IPCW.
+  `ipcw_administrative_censoring` (`StatisticalEstimand` rejects the pair at
+  `statistical_estimand` gate-approval time, and `TMLEAgent.run` raises the
+  same `ValueError` if reached): censored-data TMLE needs a materially
+  different efficient-influence-function construction (Van der Laan & Rose
+  2011, ch. 5), not a reuse of `EstimationAgent`'s stabilized-weight IPCW.
 - IPCW censoring weighting (g-computation only) covers a single fixed-
   horizon administrative-censoring indicator, not time-varying censoring;
   multiple imputation for missing covariates is not implemented

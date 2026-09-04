@@ -339,6 +339,25 @@ class StatisticalEstimandValidationTests(unittest.TestCase):
         for strategy in ("exclude_censored_before_analysis", "ignore_censoring_administrative_waiver"):
             self.assertEqual(_statistical_estimand(censoring_strategy=strategy).censoring_strategy, strategy)
 
+    def test_accepts_ipcw_with_plug_in_standardization(self):
+        estimand = _statistical_estimand(
+            censoring_strategy="ipcw_administrative_censoring",
+            estimation_procedure="plug_in_standardization",
+        )
+        self.assertEqual(estimand.censoring_strategy, "ipcw_administrative_censoring")
+
+    def test_rejects_tmle_with_ipcw_administrative_censoring(self):
+        # TMLEAgent only implements uncensored-data TMLE and raises the same
+        # ValueError at fit time -- catching the pair here means the
+        # `statistical_estimand` gate cannot be approved for a combination
+        # that would crash mid-`execution`.
+        with self.assertRaisesRegex(ValueError, "ipcw_administrative_censoring"):
+            _statistical_estimand(
+                censoring_strategy="ipcw_administrative_censoring",
+                estimation_procedure="targeted_minimum_loss_based_estimation",
+                outcome_model="super_learner_ensemble",
+            )
+
     def test_rejects_blank_censoring_rationale(self):
         with self.assertRaisesRegex(ValueError, "censoring_rationale"):
             _statistical_estimand(censoring_rationale="   ")

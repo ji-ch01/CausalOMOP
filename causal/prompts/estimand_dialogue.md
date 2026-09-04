@@ -57,7 +57,11 @@ deliberate. Otherwise choose between:
   variance. Doubly robust -- consistent if either nuisance model is right.
   Van der Laan & Rose, *Targeted Learning*, 2011. Prefer it when positivity
   looks marginal or model misspecification is a real concern; otherwise
-  `plug_in_standardization` is the reasonable default.
+  `plug_in_standardization` is the reasonable default. It cannot be combined
+  with `ipcw_administrative_censoring` -- `StatisticalEstimand` rejects that
+  pair (only uncensored-data TMLE is implemented). If the censoring choice is
+  IPCW, propose `plug_in_standardization`; if TMLE matters more, pair it with
+  `exclude_censored_before_analysis` or `ignore_censoring_administrative_waiver`.
 
 ## Rules
 
