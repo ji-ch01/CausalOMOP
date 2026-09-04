@@ -197,9 +197,13 @@ _NULL_EFFECT_WORDS = ("no difference", "no effect", "similar", "comparable", "ne
 _CROSSES_NULL_WORDS = (
     "crosses the null", "crosses zero", "not statistically significant", "not significant",
     "includes the null", "includes zero", "consistent with no effect", "imprecise", "uncertain",
+    "includes no effect", "includes the possibility of no effect",
+    "include the possibility of no effect", "cannot rule out no effect",
+    "cannot distinguish a real effect", "cannot separate a real effect",
 )
 _EXCLUDES_NULL_WORDS = (
     "does not cross", "excludes the null", "excludes zero", "statistically significant",
+    "does not include no effect", "does not include the possibility of no effect",
 )
 
 

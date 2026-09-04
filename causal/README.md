@@ -123,8 +123,12 @@ call it.
   approval-gate history, and each artifact's provenance, gated by a human
   `results` decision; with an optional, gracefully-degrading LLM narrative
   section that only ever reads already-computed JSON results, never the
-  patient-level dataset, must return typed/source-cited `claims` alongside
-  its prose, is deterministically fact-checked by `causal.agents.
+  patient-level dataset, is fed a deterministic `narrative_display` block
+  (`causal.agents.narrative_display`: every figure pre-rounded for
+  communication, plus events-per-1000 / relative-risk-change / number-
+  needed-to-treat restatements) so its prose reads clinically without ever
+  rounding a number itself, must return typed/source-cited `claims`
+  alongside its prose, is deterministically fact-checked by `causal.agents.
   results_faithfulness` (no second LLM), and is included in the report only
   once a human reviewer approves it with no failed check
   (`WorkflowManager.review_results_narrative`) -- a decision entirely

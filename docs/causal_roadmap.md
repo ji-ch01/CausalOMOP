@@ -148,7 +148,18 @@ reviewable graphs.
   quote every number verbatim from that input, must break its own prose
   into structured `claims` (typed, each citing the JSON path it is based
   on), and its output is always wrapped in a fixed, code-appended boundary
-  statement the model's own text cannot override. Before any human ever
+  statement the model's own text cannot override. So that the narrative
+  reads like a clinician's write-up rather than a string of raw floats, the
+  input carries a deterministic `estimation.narrative_display` block
+  (`causal.agents.narrative_display`): every reported quantity rounded to a
+  communication precision, plus the derived restatements a clinician
+  reasons with (events per 1000 patients, relative risk change, number
+  needed to treat) and a plain-language sentence per topic. It is pure
+  arithmetic on numbers already in `estimation.json` /
+  `diagnostics.json` / `sensitivity_analysis.json` -- so every rounded value
+  is still a verbatim token `verify_narrative` accepts, and `estimation.
+  json` keeps full precision for audit. `build_causal_report` renders its
+  "Causal effect estimate" section from the same block. Before any human ever
   sees it, `causal.agents.results_faithfulness.verify_narrative` -- plain
   deterministic code, not a second LLM -- checks every number, the effect
   direction, the null-crossing interpretation, diagnostic-warning coverage,

@@ -36,7 +36,12 @@ from causal.agents.estimation_procedure_suggestion import (
     deterministic_cate_suggestion,
     parse_estimation_procedure_suggestion_response,
 )
-from causal.agents.hypothesis import DAG_VARIABLE_DOMAINS, DAG_VARIABLE_ROLES, DAG_VARIABLE_TEMPORAL_CLASSES
+from causal.agents.hypothesis import (
+    DAG_VARIABLE_DOMAINS,
+    DAG_VARIABLE_ROLES,
+    DAG_VARIABLE_TEMPORAL_CLASSES,
+)
+from causal.agents.narrative_display import build_narrative_display, display_or_dash
 from causal.agents.results_faithfulness import verify_narrative
 from causal.agents.results_narrative import (
     DEFAULT_NARRATIVE_PROMPT_PATH,
@@ -746,6 +751,17 @@ def _mismatched_concept_domains(
                 f"for declared domain '{expected_domain}'"
             )
     return mismatches
+
+
+def _signed_events(value: Any) -> str:
+    """`+42` / `-16` / `0` for a signed events-per-1000 count in a
+    `causal_report.md` bullet -- the sign carries the direction (more vs
+    fewer outcome events with treatment), so it is always shown. `?` when
+    the count is unavailable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "?"
+    value = int(value)
+    return f"+{value}" if value > 0 else str(value)
 
 
 def _censoring_strategy_report_note(estimand_block: dict[str, Any]) -> str:
@@ -3131,6 +3147,7 @@ class WorkflowManager:
         dataset_manifest = self._read_optional_json(run_dir / "dataset_manifest.json")
         estimation = json.loads(estimation_path.read_text(encoding="utf-8"))
         diagnostics = self._read_optional_json(run_dir / "diagnostics.json")
+        sensitivity_analysis = self._read_optional_json(run_dir / "sensitivity_analysis.json")
         readiness = self._read_optional_json(run_dir / "execution_readiness.json")
         cohort_manifest = self._read_optional_json(run_dir / "cohort_manifest.json")
         cate = self._read_optional_json(run_dir / "cate.json")
@@ -3138,6 +3155,16 @@ class WorkflowManager:
             study_spec, readiness, cohort_manifest, dataset_manifest, diagnostics,
             estimation.get("estimand", {}), cate,
         )
+        # Deterministic, communication-ready rounding + derived clinical
+        # quantities (events per 1000, relative risk change, NNT). Injected
+        # under `estimation` so a claim can cite it (`estimation.
+        # narrative_display....`) with the root already allow-listed, and so
+        # every rounded value becomes a verbatim token `verify_narrative`
+        # accepts. estimation.json on disk keeps full precision.
+        estimation = {
+            **estimation,
+            "narrative_display": build_narrative_display(estimation, diagnostics, sensitivity_analysis),
+        }
         return NarrativeInput(
             study_id=state.study_id,
             question=study_spec.get("question", {}),
@@ -3971,17 +3998,35 @@ class WorkflowManager:
 
         estimand_block = estimation.get("estimand", {}) if estimation else {}
         if estimand_block:
+            display = build_narrative_display(estimation, diagnostics, sensitivity_analysis)
+            absolute = display.get("absolute_effect", {})
+            relative = display.get("relative_effect", {})
+            nnt = display.get("number_needed_to_treat", {})
+            fit = display.get("model_fit", {})
+            ci_pct = absolute.get("ci_level_pct") or int(estimand_block.get("ci_level", 0.95) * 100)
+            per_n = absolute.get("events_per_n_patients", 1000)
+            risk_ratio_line = (
+                f"{display_or_dash(relative.get('risk_ratio'))} "
+                f"[{display_or_dash(relative.get('ci_lower'))}, {display_or_dash(relative.get('ci_upper'))}]"
+                if relative.get("available")
+                else f"not computable ({relative.get('reason', '-')})"
+            )
             lines.extend([
                 "", "## Causal effect estimate", "",
+                "> Numbers here are rounded for readability; the exact values are in "
+                "`estimation.json` (see Provenance below).",
+                "",
                 f"- Method: {estimand_block.get('method', '-')} "
                 f"({estimand_block.get('citation', '-')})",
-                f"- Effect measure: {estimand_block.get('effect_measure', '-')}",
-                f"- Point estimate: **{estimand_block.get('point_estimate', '-')}**",
-                f"- {int(estimand_block.get('ci_level', 0.95) * 100)}% CI: "
-                f"[{estimand_block.get('ci_lower', '-')}, {estimand_block.get('ci_upper', '-')}]",
-                f"- Risk ratio: {estimand_block.get('risk_ratio_point_estimate', '-')} "
-                f"[{estimand_block.get('risk_ratio_ci_lower', '-')}, "
-                f"{estimand_block.get('risk_ratio_ci_upper', '-')}]",
+                f"- Effect measure: {estimand_block.get('effect_measure', '-')} "
+                "(absolute change in the probability of the outcome)",
+                f"- Point estimate: **{display_or_dash(absolute.get('risk_difference', estimand_block.get('point_estimate', '-')))}** "
+                f"({_signed_events(absolute.get('events_per_n_point'))} events per {per_n} patients treated)",
+                f"- {ci_pct}% CI: "
+                f"[{display_or_dash(absolute.get('ci_lower', estimand_block.get('ci_lower', '-')))}, "
+                f"{display_or_dash(absolute.get('ci_upper', estimand_block.get('ci_upper', '-')))}]"
+                + (" -- includes no effect" if absolute.get("interval_includes_no_effect") else ""),
+                f"- Risk ratio: {risk_ratio_line}",
                 f"- N (total / treated / comparator): "
                 f"{estimand_block.get('n_total', '-')} / {estimand_block.get('n_treated', '-')} / "
                 f"{estimand_block.get('n_comparator', '-')}",
@@ -3989,12 +4034,25 @@ class WorkflowManager:
                 f"- Bootstrap resamples used: {estimand_block.get('n_bootstrap', '-')} "
                 f"(seed {estimand_block.get('bootstrap_seed', '-')})",
                 f"- Outcome model: {estimand_block.get('outcome_model', '-')} "
-                f"(AUC {estimand_block.get('outcome_model_auc', '-')}, "
-                f"Brier {estimand_block.get('outcome_model_brier', '-')})",
+                f"(AUC {display_or_dash(fit.get('outcome_model_auc', estimand_block.get('outcome_model_auc', '-')))}, "
+                f"Brier {display_or_dash(fit.get('outcome_model_brier', estimand_block.get('outcome_model_brier', '-')))})",
                 f"- Covariates adjusted for: {list(estimand_block.get('covariates_adjusted', ()))}",
                 f"- Missing-data strategy: {estimand_block.get('missing_data_strategy', '-')}",
                 f"- Censoring strategy: {estimand_block.get('censoring_strategy', '-')}"
                 f"{_censoring_strategy_report_note(estimand_block)}",
+            ])
+            plain = [
+                text
+                for text in (
+                    absolute.get("plain_statement"),
+                    relative.get("plain_statement") if relative.get("available") else None,
+                    nnt.get("plain_statement") if nnt.get("reported") else None,
+                )
+                if text
+            ]
+            if plain:
+                lines.extend(["", "### In plain terms", "", "\n\n".join(plain)])
+            lines.extend([
                 "",
                 "> This is the study's estimated average treatment effect under the assumptions "
                 "listed below -- not a clinical recommendation.",

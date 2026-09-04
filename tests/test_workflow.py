@@ -3888,6 +3888,28 @@ class WorkflowResultsNarrativeTests(_ResultsNarrativeFixture, unittest.TestCase)
         self.assertIn("results_narrative.json", state.artifacts)
         self.assertTrue(any(e["event"] == "results_narrative_generated" for e in state.history))
 
+    def test_prompt_carries_the_pre_rounded_narrative_display_block(self):
+        """The results-narrative prompt must include the deterministic
+        `narrative_display` block (rounded values + plain-language
+        restatements) so the model quotes it instead of rounding the raw
+        floats itself -- which `verify_narrative` would reject."""
+        captured: dict[str, str] = {}
+
+        def capturing_llm(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return json.dumps({
+                "narrative": "See claims.",
+                "claims": [{
+                    "text": "See narrative.", "claim_type": "effect_direction",
+                    "source_fields": ["estimation.narrative_display.absolute_effect.plain_statement"],
+                }],
+            })
+
+        self.manager.run_results_narrative(self.run_id, capturing_llm)
+        self.assertIn("narrative_display", captured["prompt"])
+        self.assertIn("events_per_n_point", captured["prompt"])
+        self.assertIn("number_needed_to_treat", captured["prompt"])
+
     def test_causal_report_includes_the_narrative_once_approved(self):
         self.manager.run_results_narrative(self.run_id, self._faithful_llm())
         self.manager.review_results_narrative(self.run_id, "approved", "Dr. Lee")
@@ -3897,6 +3919,13 @@ class WorkflowResultsNarrativeTests(_ResultsNarrativeFixture, unittest.TestCase)
         self.assertIn("its interval", text)
         self.assertIn("advisory only", text)
         self.assertIn("Approved by Dr. Lee", text)
+
+    def test_causal_report_effect_section_is_rounded_and_has_a_plain_terms_block(self):
+        report_path = self.manager.build_causal_report(self.run_id)
+        text = report_path.read_text(encoding="utf-8")
+        self.assertIn("### In plain terms", text)
+        self.assertIn("events per 1000 patients", text)
+        self.assertIn("rounded for readability", text)
 
     def test_report_omits_narrative_section_when_absent(self):
         report_path = self.manager.build_causal_report(self.run_id)
