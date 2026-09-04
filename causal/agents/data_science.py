@@ -145,8 +145,8 @@ class DataScienceAgent:
     Phenotypes are derived generically from `protocol["concept_sets"]`: each
     entry declares its own `role` and `domain` (see `_phenotype_from_concept_set`)
     instead of the agent hardcoding clinical names. This is what lets the same
-    agent plan a sepsis/albumin study and an unrelated one without touching
-    Python code -- only `concept_sets` changes.
+    agent plan a stress-ulcer-prophylaxis study and an unrelated one without
+    touching Python code -- only `concept_sets` changes.
 
     Covariates are derived the same way, from `hypothesis["candidate_dag"]`
     (the role- and temporal-classified DAG variables the Hypothesis Agent /

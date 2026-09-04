@@ -31,11 +31,11 @@ OUTCOME_DOMAINS = tuple(DOMAIN_TABLES) + ("death",)
 # into an inclusion filter and a binary A. This is a real modeling choice,
 # not a mechanical detail -- getting it wrong silently changes who is in the
 # cohort:
-#   "add_on": `comparator` is a required backbone therapy (e.g. crystalloid
-#     resuscitation) and `treatment` is an adjunct layered on top of it
-#     (e.g. albumin). Cohort = everyone who received the backbone; A=1 marks
-#     those who additionally received the adjunct. Matches designs like
-#     "crystalloids plus albumin vs crystalloids alone".
+#   "add_on": `comparator` is a required backbone therapy (e.g. aspirin) and
+#     `treatment` is an adjunct layered on top of it (e.g. clopidogrel).
+#     Cohort = everyone who received the backbone; A=1 marks those who
+#     additionally received the adjunct. Matches designs like "aspirin plus
+#     clopidogrel vs aspirin alone".
 #   "mutually_exclusive": standard active-comparator new-user design (drug A
 #     vs drug B). Cohort = only persons who received exactly one of
 #     treatment/comparator within the grace period; persons who received

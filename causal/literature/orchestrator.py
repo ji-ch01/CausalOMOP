@@ -37,8 +37,8 @@ baseline-characteristics detail behind them).
 OpenAlex hit, since OpenAlex exposes no comparable taxonomy) deliberately
 does *not* take part in that round-robin: OpenAlex's free-text relevance
 ranking is weaker than PubMed's, so unclassified hits are more likely to be
-tangentially related (e.g. matching on a shared lab value like albumin
-across an unrelated liver-disease paper). They only fill quota left over
+tangentially related (e.g. matching on a shared lab value like creatinine
+across an unrelated kidney-disease paper). They only fill quota left over
 after every graded article has had a chance, so topical noise can never
 bump a real systematic review or RCT out of the selection.
 """

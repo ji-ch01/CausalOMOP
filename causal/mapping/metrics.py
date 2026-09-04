@@ -25,10 +25,10 @@ information-retrieval metrics, not an invented heuristic:
 
 `evaluate_lookup_accuracy` runs both over a list of `LookupCase`s and
 separates cases with no achievable standard-concept mapping today (an
-upstream ETL/vocabulary gap, e.g. `studies/albumin_sepsis_28d/
-concept_audit.md`'s unmapped albumin/crystalloid source values) from real
-search misses, so the search algorithm is never penalized for a mapping
-that cannot exist yet.
+upstream ETL/vocabulary gap -- e.g. a source value that stays at
+`concept_id = 0` in the current conversion, see
+`docs/vocabulary_mapping_coverage.md`) from real search misses, so the
+search algorithm is never penalized for a mapping that cannot exist yet.
 """
 
 from __future__ import annotations

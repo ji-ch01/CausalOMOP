@@ -85,7 +85,7 @@ Rules:
 - eligibility_criteria, assignment_procedure, censoring_strategy, analysis_strategy,
   effect_measure, treatment_value, and comparator_value are all REQUIRED, not optional.
   treatment_value/comparator_value must name the specific exposure values the
-  effect_measure contrasts (e.g. "crystalloids plus albumin" vs. "crystalloids alone"),
+  effect_measure contrasts (e.g. "pantoprazole" vs. "famotidine"),
   not restate the free-text treatment/comparator descriptions verbatim if a more precise
   value exists. If the question is underspecified, choose conservative draft values here
   too and list the assumption in assumptions_requiring_review rather than leaving a field

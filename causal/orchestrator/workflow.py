@@ -291,7 +291,7 @@ def _make_run_id(study_id: str) -> str:
     """Build a chronologically sortable, question-identifiable run id.
 
     Format: {UTC timestamp}_{study_id}-{short random hash}, e.g.
-    20260723-143012_albumin_sepsis_28d_mimic_omop-f00fefd1
+    20260723-143012_ppi_vs_h2ra_sup_mortality-f00fefd1
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"{timestamp}_{study_id}-{uuid.uuid4().hex[:8]}"
@@ -310,9 +310,9 @@ def _atomic_write_json(path: Path, data: Any) -> None:
 
 # treatment/comparator each have exactly one fallback role: `treatment_and_
 # comparator`, a single shared-backbone phenotype used by both arms of an
-# `add_on` design (e.g. "crystalloids" in
-# `studies/albumin_sepsis_28d/protocol.json`, the comparator/backbone
-# `crystalloids` alone, `crystalloids` plus `albumin` the treatment).
+# `add_on` design (e.g. a backbone therapy given to everyone, the treatment
+# arm additionally getting an adjunct layered on top: "backbone" alone the
+# comparator, "backbone" plus "adjunct" the treatment).
 # population/outcome have no fallback role.
 _ROLE_FALLBACK_ROLES: dict[str, tuple[str, ...]] = {
     "treatment": ("treatment_and_comparator",),
@@ -1470,7 +1470,7 @@ class WorkflowManager:
         protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
         concept_sets = protocol.get("concept_sets", {})
         # A `concept_sets` entry's clinical label is its dict key (e.g.
-        # "albumin"), not a separate field.
+        # "proton_pump_inhibitor"), not a separate field.
         target = {
             role: next(
                 (name for name, entry in concept_sets.items()

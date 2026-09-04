@@ -1839,7 +1839,7 @@ _EXPOSURE_CONTRAST_INFO: dict[str, tuple[str, str]] = {
     "add_on": (
         "Add-on (comparator is a required backbone therapy)",
         "Everyone gets the comparator; the treatment arm additionally gets the treatment on top "
-        'of it. E.g. "crystalloids plus albumin vs. crystalloids alone".',
+        'of it. E.g. "metformin plus an SGLT2 inhibitor vs. metformin alone".',
     ),
     "mutually_exclusive": (
         "Active comparator (drug vs. drug)",

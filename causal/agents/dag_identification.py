@@ -285,11 +285,11 @@ def grounding_caveat(evidence: EvidenceSourceSummary) -> str:
 
     Nothing in this pipeline checks a `candidate_dag` against a published or
     expert-drawn reference DAG for the question actually being asked. The
-    one artifact on disk that looks like that,
-    `studies/albumin_sepsis_28d/reference_dag.json`, is a hand-transcribed
-    one-off comparison target for a single study (see
-    `docs/dag_generation_audit.md` §0f) -- not a mechanism this pipeline
-    runs automatically for an arbitrary user question. `identified_by_
+    artifacts that look like that, the `reference_dag.json` files under
+    `studies/`, are hand-built one-off comparison targets for specific
+    validation studies (see `docs/dag_generation_audit.md`) -- not a
+    mechanism this pipeline runs automatically for an arbitrary user
+    question. `identified_by_
     backdoor_adjustment` and `approved_for_dag_gate` mean "no known
     structural or clinical blocking issue was found", never "a domain
     expert or a published causal diagram confirmed this structure" --

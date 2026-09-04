@@ -48,28 +48,28 @@ from causal.orchestrator.workflow import WorkflowManager  # noqa: E402
 _REVIEWER = "demo-staging"
 
 _TARGET_TRIAL = {
-    "population": "adults admitted to the ICU with sepsis",
-    "treatment": "intravenous albumin",
-    "comparator": "crystalloids alone",
-    "time_zero": "ICU admission",
-    "grace_period_hours": 24,
-    "outcome": "28-day all-cause mortality",
-    "follow_up_days": 28,
+    "population": "ventilated adults admitted to the ICU",
+    "treatment": "proton pump inhibitor stress-ulcer prophylaxis",
+    "comparator": "histamine-2 receptor antagonist stress-ulcer prophylaxis",
+    "time_zero": "first stress-ulcer-prophylaxis order",
+    "grace_period_hours": 48,
+    "outcome": "in-hospital all-cause mortality",
+    "follow_up_days": 90,
     "primary_estimand": "ATE",
-    "eligibility_criteria": ["adult", "sepsis diagnosis at admission"],
-    "assignment_procedure": "Emulated baseline assignment at ICU admission",
-    "censoring_strategy": "Administrative censoring at end of 28-day follow-up",
+    "eligibility_criteria": ["adult", "invasive mechanical ventilation within 24h of ICU admission"],
+    "assignment_procedure": "Emulated new-user assignment at the first prophylaxis order",
+    "censoring_strategy": "Administrative censoring at hospital discharge or 90 days",
     "analysis_strategy": "Intention-to-treat analogue",
     "effect_measure": "risk_difference",
-    "treatment_value": "albumin",
-    "comparator_value": "crystalloids",
+    "treatment_value": "proton_pump_inhibitor",
+    "comparator_value": "histamine_2_receptor_antagonist",
 }
 
 _PROTOCOL = {
-    "study_id": "demo_albumin_sepsis",
+    "study_id": "demo_ppi_vs_h2ra_sup",
     "source_question": (
-        "Among ICU adults with sepsis, does intravenous albumin versus crystalloids "
-        "alone change 28-day mortality?"
+        "Among ventilated ICU adults, does proton pump inhibitor versus histamine-2 "
+        "receptor antagonist stress-ulcer prophylaxis change in-hospital mortality?"
     ),
     "target_trial": _TARGET_TRIAL,
     "data_source": "demo.synthetic",
