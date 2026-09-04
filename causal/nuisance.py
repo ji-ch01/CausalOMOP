@@ -15,6 +15,7 @@ both TMLE and CATE, not two.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -25,6 +26,19 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.linear_model import LinearRegression, LogisticRegression, LogisticRegressionCV
 from sklearn.metrics import brier_score_loss, log_loss
 from sklearn.model_selection import StratifiedKFold
+
+# `LogisticRegressionCV`'s defaults are mid-deprecation-cycle in the
+# `scikit-learn>=1.2,<2` range this package pins (`requirements-estimation.
+# txt`): `l1_ratios` (None -> `[0.0]`) and, from ~1.9, `use_legacy_
+# attributes` (True -> False, i.e. a simplified fitted-attribute layout).
+# We only ever call `predict_proba`, never read `C_`/`coef_`, so pin both
+# to the post-1.10 behaviour explicitly -- deterministic across versions
+# and silent (no `FutureWarning` in the test suite). `use_legacy_
+# attributes` is signature-guarded so the pin is a no-op on the older
+# supported scikit-learn versions that predate the parameter.
+_LOGISTIC_REGRESSION_CV_KWARGS: dict[str, Any] = {"l1_ratios": [0.0]}
+if "use_legacy_attributes" in inspect.signature(LogisticRegressionCV).parameters:
+    _LOGISTIC_REGRESSION_CV_KWARGS["use_legacy_attributes"] = False
 
 _CITATION = (
     "van der Laan MJ, Polley EC, Hubbard AE. Super Learner. Stat Appl Genet "
@@ -80,6 +94,7 @@ def _default_library(random_seed: int) -> dict[str, Any]:
         "logistic_regression_unpenalized": LogisticRegression(C=np.inf, max_iter=1000),
         "logistic_regression_l2_cv": LogisticRegressionCV(
             max_iter=1000, cv=3, scoring="neg_log_loss", random_state=random_seed,
+            **_LOGISTIC_REGRESSION_CV_KWARGS,
         ),
         "random_forest": RandomForestClassifier(
             n_estimators=100, max_depth=6, min_samples_leaf=10, random_state=random_seed,
