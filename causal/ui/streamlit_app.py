@@ -346,6 +346,7 @@ _REVIEWER_FIELD_KEY_PREFIXES = (
     "covariate_reject_reviewer_",
     "statistical_estimand_reviewer_",
     "estimand_fix_reviewer_",
+    "timing_fix_reviewer_",
     "add_pop_reviewer_",
     "remove_pop_reviewer_",
     "censoring_definition_reviewer_",
@@ -760,6 +761,11 @@ def _render_target_trial_regenerate(manager: WorkflowManager, state: RunState) -
     gate = state.gates["target_trial"]
     if not source_question or not gate.comment:
         return
+    prior_corrections = [
+        f"{entry.get('summary', '')} — {entry.get('comment', '')}".strip(" —")
+        for entry in protocol.get("correction_log", [])
+        if isinstance(entry, dict) and (entry.get("summary") or entry.get("comment"))
+    ]
     st.space("small")
     if st.button(
         "Regenerate with this feedback",
@@ -780,6 +786,7 @@ def _render_target_trial_regenerate(manager: WorkflowManager, state: RunState) -
                 literature=literature,
                 on_llm_output=lambda output: status.write(f"Received `{output.stage}` from the LLM."),
                 reviewer_feedback=gate.comment,
+                prior_corrections=prior_corrections,
             )
             new_state = manager.start_generated(
                 generated, state.mode, f"{resolved_llm.provider}:{resolved_llm.model}"
@@ -861,6 +868,71 @@ def _render_target_trial_manual_estimand_fix(manager: WorkflowManager, state: Ru
                     st.rerun()
                 except (ValueError, RuntimeError) as exc:
                     st.error(str(exc))
+
+
+def _render_target_trial_timing_fix(manager: WorkflowManager, state: RunState) -> None:
+    """Directly correct `target_trial.time_zero` / `grace_period_hours` /
+    `follow_up_days` on the current (rejected) run, for when the LLM draft got
+    a date or the follow-up window wrong and the reviewer knows the fix (see
+    `WorkflowManager.set_target_trial_timing`).
+
+    Scoped to the timing fields only, same reason as
+    `_render_target_trial_manual_estimand_fix`: population/treatment/
+    comparator/outcome also seed the literature search and first-pass
+    covariates, so those stay a regeneration.
+    """
+    protocol = _read_json(Path(state.protocol_path)) or {}
+    target = protocol.get("target_trial")
+    if not isinstance(target, dict):
+        return
+    run_id = state.run_id
+    with st.expander("Or correct the dates / follow-up window", expanded=False):
+        st.caption(
+            "Overrides target_trial.time_zero / grace_period_hours / follow_up_days on this "
+            "run instead of redrafting. Also re-opens the analysis-plan and statistical-estimand "
+            "gates, since follow_up_days feeds the cohort SQL and the censoring definition."
+        )
+        with st.form(key=f"target_trial_timing_fix_{run_id}"):
+            time_zero = st.text_input(
+                "Time zero", value=str(target.get("time_zero", "")),
+                key=f"timing_fix_time_zero_{run_id}",
+            )
+            grace_col, follow_col = st.columns(2)
+            grace_period_hours = grace_col.number_input(
+                "Grace period (hours)", min_value=0, step=1,
+                value=int(target.get("grace_period_hours", 0) or 0),
+                key=f"timing_fix_grace_{run_id}",
+            )
+            follow_up_days = follow_col.number_input(
+                "Follow-up (days)", min_value=1, step=1,
+                value=int(target.get("follow_up_days", 1) or 1),
+                key=f"timing_fix_follow_up_{run_id}",
+            )
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"timing_fix_reviewer_{run_id}"
+            )
+            comment = st.text_area(
+                "Reason for the correction (required)", key=f"timing_fix_comment_{run_id}"
+            )
+            if st.form_submit_button("Save timing correction"):
+                changed: dict[str, Any] = {}
+                if time_zero.strip() != str(target.get("time_zero", "")).strip():
+                    changed["time_zero"] = time_zero.strip()
+                if int(grace_period_hours) != int(target.get("grace_period_hours", 0) or 0):
+                    changed["grace_period_hours"] = int(grace_period_hours)
+                if int(follow_up_days) != int(target.get("follow_up_days", 1) or 1):
+                    changed["follow_up_days"] = int(follow_up_days)
+                if not changed:
+                    st.warning("No field was changed.")
+                else:
+                    try:
+                        manager.set_target_trial_timing(
+                            run_id, reviewer=reviewer, comment=comment, **changed
+                        )
+                        st.success("Timing corrected -- re-review and approve the gate below.")
+                        st.rerun()
+                    except (ValueError, RuntimeError) as exc:
+                        st.error(str(exc))
 
 
 def _render_gate_readiness_hint(gate_name: str, run_dir: Path) -> None:
@@ -951,6 +1023,7 @@ def _render_gate_card(manager: WorkflowManager, state: RunState, gate_name: str,
             if gate_name == "target_trial":
                 _render_target_trial_regenerate(manager, state)
                 _render_target_trial_manual_estimand_fix(manager, state)
+                _render_target_trial_timing_fix(manager, state)
             else:
                 st.caption(
                     "Rejected -- this blocks advancing until the underlying artifact is "

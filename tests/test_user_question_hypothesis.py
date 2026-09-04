@@ -268,6 +268,20 @@ class UserQuestionHypothesisTests(unittest.TestCase):
         # blank/whitespace-only feedback must not add an empty section
         self.assertEqual(self.service.build_prompt(QUESTION), self.service.build_prompt(QUESTION, ""))
 
+    def test_build_prompt_replays_prior_corrections(self):
+        prompt = self.service.build_prompt(
+            QUESTION,
+            prior_corrections=["follow_up_days -> 90 — anchor RCT endpoint", "   ", ""],
+        )
+        self.assertIn(QUESTION, prompt)
+        self.assertIn("Reviewers previously had to correct", prompt)
+        self.assertIn("follow_up_days -> 90", prompt)
+        # empty / whitespace-only entries add no section
+        self.assertEqual(
+            self.service.build_prompt(QUESTION),
+            self.service.build_prompt(QUESTION, prior_corrections=["", "  "]),
+        )
+
     def test_generate_with_reviewer_feedback_validates_against_original_question_only(self):
         """Regression test: a prior version folded the reviewer's comment into the
         same string the LLM was told to preserve verbatim in `source_question`,

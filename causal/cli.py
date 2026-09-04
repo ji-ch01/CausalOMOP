@@ -159,6 +159,25 @@ def main() -> int:
         "--domain", choices=DAG_VARIABLE_DOMAINS,
         help="optional OMOP domain; enables an OMCP concept lookup for this covariate later",
     )
+    workflow_target_trial_timing = workflow_sub.add_parser(
+        "target-trial-timing",
+        help="correct target_trial.time_zero / grace_period_hours / follow_up_days in place "
+        "(targeted fix instead of regenerating the whole run)",
+    )
+    workflow_target_trial_timing.add_argument("run_id")
+    workflow_target_trial_timing.add_argument(
+        "--time-zero", help="new time_zero description (non-empty)"
+    )
+    workflow_target_trial_timing.add_argument(
+        "--grace-period-hours", type=int, help="new grace_period_hours (integer >= 0)"
+    )
+    workflow_target_trial_timing.add_argument(
+        "--follow-up-days", type=int, help="new follow_up_days (integer >= 1)"
+    )
+    workflow_target_trial_timing.add_argument("--reviewer", required=True)
+    workflow_target_trial_timing.add_argument(
+        "--comment", required=True, help="why this was corrected (recorded in state.history)"
+    )
     workflow_concept_set_map = workflow_sub.add_parser(
         "concept-set-map",
         help="record the OMOP domain + concept(s) for a protocol concept_sets entry",
@@ -545,6 +564,15 @@ def main() -> int:
             state = manager.run_negative_control_estimation(
                 args.run_id, args.control_id, OMCPClient(datasets),
                 n_bootstrap=args.n_bootstrap, random_seed=args.seed,
+            )
+        elif args.workflow_command == "target-trial-timing":
+            state = manager.set_target_trial_timing(
+                args.run_id,
+                time_zero=args.time_zero,
+                grace_period_hours=args.grace_period_hours,
+                follow_up_days=args.follow_up_days,
+                reviewer=args.reviewer,
+                comment=args.comment,
             )
         elif args.workflow_command == "covariate-review":
             state = manager.review_covariate(

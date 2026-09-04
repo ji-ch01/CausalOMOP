@@ -150,6 +150,97 @@ class WorkflowTests(unittest.TestCase):
                 state.run_id, primary_estimand="CATE", reviewer="tester", comment="change of mind"
             )
 
+    def test_set_target_trial_timing_corrects_only_the_given_fields(self):
+        state = self.manager.start(self._full_protocol_path())
+
+        updated = self.manager.set_target_trial_timing(
+            state.run_id,
+            follow_up_days=90,
+            time_zero="first qualifying antibiotic order",
+            reviewer="tester",
+            comment="CAPE COD primary endpoint is 90-day mortality",
+        )
+
+        protocol = json.loads(
+            (Path(self.temp.name) / "runs" / state.run_id / "protocol.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(protocol["target_trial"]["follow_up_days"], 90)
+        self.assertEqual(protocol["target_trial"]["time_zero"], "first qualifying antibiotic order")
+        # untouched field keeps its drafted value
+        self.assertEqual(protocol["target_trial"]["grace_period_hours"], 24)
+        entry = next(e for e in updated.history if e["event"] == "target_trial_timing_corrected")
+        self.assertEqual(entry["changes"]["before"]["follow_up_days"], 28)
+        self.assertEqual(entry["changes"]["after"]["follow_up_days"], 90)
+
+    def test_set_target_trial_timing_invalidates_downstream_gates(self):
+        state = self.manager.start(self._full_protocol_path())
+        # Simulate a run that already got these gates decided in a later phase,
+        # without tripping their approval blockers (analysis_plan.json etc.).
+        state = self.manager.load(state.run_id)
+        state.gates["analysis_plan"].status = "provisional"
+        state.gates["statistical_estimand"].status = "provisional"
+        self.manager.save(state)
+
+        updated = self.manager.set_target_trial_timing(
+            state.run_id, grace_period_hours=48, reviewer="tester", comment="wider grace window"
+        )
+
+        self.assertEqual(updated.gates["analysis_plan"].status, "pending")
+        self.assertEqual(updated.gates["statistical_estimand"].status, "pending")
+        self.assertTrue(
+            any(e["event"] == "gate_invalidated" for e in updated.history)
+        )
+
+    def test_set_target_trial_timing_blocked_once_target_trial_approved(self):
+        state = self.manager.start(self._full_protocol_path())
+        self.manager.decide_gate(state.run_id, "target_trial", "approved", "tester")
+        with self.assertRaises(ValueError):
+            self.manager.set_target_trial_timing(
+                state.run_id, follow_up_days=90, reviewer="tester", comment="too late"
+            )
+
+    def test_set_target_trial_timing_rejects_bad_values(self):
+        state = self.manager.start(self._full_protocol_path())
+        for kwargs in (
+            {"follow_up_days": 0},
+            {"grace_period_hours": -1},
+            {"time_zero": "   "},
+            {},  # nothing to change
+        ):
+            with self.assertRaises(ValueError):
+                self.manager.set_target_trial_timing(
+                    state.run_id, reviewer="tester", comment="x", **kwargs
+                )
+
+    def test_set_target_trial_timing_refreshes_hypothesis_when_present(self):
+        state = self.manager.start(self._full_protocol_path())
+        self.manager.run_hypothesis_agent(state.run_id)
+
+        self.manager.set_target_trial_timing(
+            state.run_id, follow_up_days=90, reviewer="tester", comment="anchor trial horizon"
+        )
+
+        hypothesis = json.loads(
+            (Path(self.temp.name) / "runs" / state.run_id / "hypothesis.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(hypothesis["follow_up_days"], 90)
+
+    def test_set_target_trial_timing_and_estimand_write_a_correction_log(self):
+        state = self.manager.start(self._full_protocol_path())
+        self.manager.decide_gate(state.run_id, "target_trial", "rejected", "tester", "wrong")
+        self.manager.set_target_trial_timing(
+            state.run_id, follow_up_days=90, reviewer="tester", comment="D90 endpoint"
+        )
+        self.manager.set_target_trial_estimand(
+            state.run_id, primary_estimand="CATE", reviewer="tester", comment="prespecified subgroups"
+        )
+        protocol = json.loads(
+            (Path(self.temp.name) / "runs" / state.run_id / "protocol.json").read_text(encoding="utf-8")
+        )
+        kinds = [entry["kind"] for entry in protocol["correction_log"]]
+        self.assertEqual(kinds, ["target_trial_timing", "target_trial_estimand"])
+        self.assertEqual(protocol["correction_log"][0]["comment"], "D90 endpoint")
+
     def _protocol_path_with_approved_concept_sets(self):
         """`_full_protocol_path` plus an approved population/treatment/
         comparator, needed as a base for `add_population_concept_set`

@@ -313,6 +313,42 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     temporary.replace(path)
 
 
+#: Fields of a targeted study-design correction worth replaying to a later
+#: full regeneration (`UserQuestionHypothesisService.generate`'s
+#: `prior_corrections`), so the same class of mistake is discouraged on a
+#: fresh draft. Also an audit trail in `protocol.json`.
+_MAX_CORRECTION_LOG_ENTRIES = 50
+
+
+def _append_correction_log(
+    protocol: dict[str, Any],
+    *,
+    kind: str,
+    reviewer: str,
+    comment: str,
+    summary: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Append one targeted-correction record to `protocol["correction_log"]`
+    (created if absent, capped at `_MAX_CORRECTION_LOG_ENTRIES`, oldest
+    dropped first). Mutates `protocol` in place; the caller persists it.
+    """
+    log = protocol.get("correction_log")
+    if not isinstance(log, list):
+        log = []
+    log.append(
+        {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "kind": kind,
+            "reviewer": reviewer,
+            "comment": comment,
+            "summary": summary,
+            "detail": detail or {},
+        }
+    )
+    protocol["correction_log"] = log[-_MAX_CORRECTION_LOG_ENTRIES:]
+
+
 # treatment/comparator each have exactly one fallback role: `treatment_and_
 # comparator`, a single shared-backbone phenotype used by both arms of an
 # `add_on` design (e.g. a backbone therapy given to everyone, the treatment
@@ -2233,6 +2269,20 @@ class WorkflowManager:
             }
             target["primary_estimand"] = primary_estimand
             target["secondary_estimands"] = list(secondary_estimands)
+            _append_correction_log(
+                protocol,
+                kind="target_trial_estimand",
+                reviewer=reviewer,
+                comment=comment.strip(),
+                summary=f"primary_estimand -> {primary_estimand}",
+                detail={
+                    "before": before,
+                    "after": {
+                        "primary_estimand": primary_estimand,
+                        "secondary_estimands": list(secondary_estimands),
+                    },
+                },
+            )
             _atomic_write_json(protocol_path, protocol)
 
         state.record(
@@ -2244,6 +2294,120 @@ class WorkflowManager:
             },
         )
         self._invalidate_gate(state, "target_trial", f"estimand manually corrected by {reviewer}")
+        self.save(state)
+        return state
+
+    def set_target_trial_timing(
+        self,
+        run_id: str,
+        *,
+        time_zero: str | None = None,
+        grace_period_hours: int | None = None,
+        follow_up_days: int | None = None,
+        reviewer: str,
+        comment: str,
+    ) -> RunState:
+        """Let a reviewer directly correct `target_trial.time_zero` /
+        `grace_period_hours` / `follow_up_days` in place, for when the LLM
+        draft got a date or a follow-up window wrong and the reviewer already
+        knows the fix -- the targeted counterpart of
+        `_render_target_trial_regenerate` (`causal/ui/streamlit_app.py`), which
+        discards the whole run and every review already done on it.
+
+        Scoped to just these three timing fields, on the same rationale
+        `set_target_trial_estimand` documents: `population`/`treatment`/
+        `comparator`/`outcome` free text also seeds `literature_search` terms
+        and `first_pass_covariates`, so hand-editing those here would silently
+        desynchronize already-generated downstream artifacts; the timing
+        fields feed the cohort/censoring machinery but nothing upstream of the
+        DAG derives *from* them.
+
+        Only the fields passed non-`None` change; at least one is required.
+        `grace_period_hours`/`follow_up_days` are checked with the same rule
+        `causal.agents.hypothesis.HypothesisAgent._positive_int` applies later
+        (`grace_period_hours >= 0`, `follow_up_days >= 1`), so a value that
+        would otherwise only be rejected at the `dag_review` gate is rejected
+        here instead.
+
+        Invalidates `target_trial` *and* `analysis_plan` /
+        `statistical_estimand`: `follow_up_days` is read straight into
+        `cohort.sql`, the censoring definition, and the feasibility snapshot
+        (`observation_period_covers_follow_up`, `known_death_within_follow_up`),
+        so a run that already reached those phases must re-review them.
+        `hypothesis.json` is refreshed when it exists so `assess_identification`
+        and every `hypothesis["follow_up_days"]` reader see the corrected value
+        immediately, mirroring `review_covariate`.
+
+        Only allowed while `target_trial` is not yet `approved` (reject it
+        first, or regenerate a new run) -- same guard as
+        `set_target_trial_estimand`.
+        """
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if not comment.strip():
+            raise ValueError("comment is required to record why this was corrected")
+        updates: dict[str, object] = {}
+        if time_zero is not None:
+            if not isinstance(time_zero, str) or not time_zero.strip():
+                raise ValueError("time_zero must be a non-empty string")
+            updates["time_zero"] = time_zero.strip()
+        if grace_period_hours is not None:
+            if (
+                not isinstance(grace_period_hours, int)
+                or isinstance(grace_period_hours, bool)
+                or grace_period_hours < 0
+            ):
+                raise ValueError("grace_period_hours must be an integer >= 0")
+            updates["grace_period_hours"] = grace_period_hours
+        if follow_up_days is not None:
+            if (
+                not isinstance(follow_up_days, int)
+                or isinstance(follow_up_days, bool)
+                or follow_up_days < 1
+            ):
+                raise ValueError("follow_up_days must be an integer >= 1")
+            updates["follow_up_days"] = follow_up_days
+        if not updates:
+            raise ValueError("Pass at least one of time_zero, grace_period_hours, follow_up_days")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+        if state.gates["target_trial"].status == "approved":
+            raise ValueError(
+                "Cannot manually edit target-trial timing after the target_trial gate is "
+                "approved -- reject it first, or regenerate a new run."
+            )
+
+        with _RunLock(run_dir):
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            target = protocol.get("target_trial")
+            if not isinstance(target, dict):
+                raise ValueError(
+                    "Cannot correct target-trial timing: protocol.json has no target_trial object"
+                )
+            before = {field: target.get(field) for field in updates}
+            target.update(updates)
+            summary = ", ".join(f"{field}={value}" for field, value in updates.items())
+            _append_correction_log(
+                protocol,
+                kind="target_trial_timing",
+                reviewer=reviewer,
+                comment=comment.strip(),
+                summary=summary,
+                detail={"before": before, "after": dict(updates)},
+            )
+            _atomic_write_json(protocol_path, protocol)
+            if (run_dir / "hypothesis.json").is_file():
+                self._write_hypothesis(run_id, protocol)
+
+        state.record(
+            "target_trial_timing_corrected",
+            f"{summary} by {reviewer}: {comment.strip()}",
+            changes={"before": before, "after": dict(updates)},
+        )
+        for gate in ("target_trial", "analysis_plan", "statistical_estimand"):
+            self._invalidate_gate(state, gate, f"target-trial timing corrected by {reviewer}")
         self.save(state)
         return state
 

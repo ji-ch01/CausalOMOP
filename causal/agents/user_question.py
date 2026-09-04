@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -293,7 +294,12 @@ class UserQuestionHypothesisService:
         self.dag_prompt_path = Path(dag_prompt_path)
         self.dag_critique_prompt_path = Path(dag_critique_prompt_path)
 
-    def build_prompt(self, question: str, reviewer_feedback: str | None = None) -> str:
+    def build_prompt(
+        self,
+        question: str,
+        reviewer_feedback: str | None = None,
+        prior_corrections: Sequence[str] = (),
+    ) -> str:
         question = question.strip()
         if not question:
             raise ValueError("User question is required")
@@ -301,6 +307,18 @@ class UserQuestionHypothesisService:
         if "{{USER_QUESTION}}" not in template:
             raise ValueError("Hypothesis prompt is missing {{USER_QUESTION}}")
         prompt = template.replace("{{USER_QUESTION}}", question)
+        corrections = [str(item).strip() for item in prior_corrections if str(item).strip()]
+        if corrections:
+            # Targeted corrections a reviewer applied to an earlier draft of
+            # this study (`WorkflowManager`'s `correction_log`). Replayed here
+            # so a fresh draft is less likely to repeat the same class of
+            # mistake -- guidance, not part of the question.
+            joined = "\n".join(f"- {item}" for item in corrections)
+            prompt += (
+                "\n\nReviewers previously had to correct earlier drafts of this study on the "
+                "following points. Get these right in this draft:\n\n"
+                f"{joined}"
+            )
         reviewer_feedback = (reviewer_feedback or "").strip()
         if reviewer_feedback:
             # Appended after the template, not folded into {{USER_QUESTION}}:
@@ -332,12 +350,13 @@ class UserQuestionHypothesisService:
         max_critique_rounds: int = _MAX_CRITIQUE_ROUNDS,
         tournament_size: int = 1,
         reviewer_feedback: str | None = None,
+        prior_corrections: Sequence[str] = (),
     ) -> GeneratedHypothesis:
         if max_critique_rounds < 1:
             raise ValueError("max_critique_rounds must be at least 1")
         if not 1 <= tournament_size <= MAX_TOURNAMENT_SIZE:
             raise ValueError(f"tournament_size must be between 1 and {MAX_TOURNAMENT_SIZE}")
-        raw = llm(self.build_prompt(question, reviewer_feedback))
+        raw = llm(self.build_prompt(question, reviewer_feedback, prior_corrections))
         first_output = LLMRawOutput("target_trial_draft", raw)
         llm_outputs = [first_output]
         if on_llm_output is not None:
