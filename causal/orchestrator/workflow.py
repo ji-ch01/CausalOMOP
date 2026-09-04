@@ -36,6 +36,13 @@ from causal.agents.estimation_procedure_suggestion import (
     deterministic_cate_suggestion,
     parse_estimation_procedure_suggestion_response,
 )
+from causal.agents.dag_point_revision import (
+    DEFAULT_DAG_POINT_REVISION_PROMPT_PATH,
+    apply_dag_point_operations,
+    build_dag_point_revision_prompt,
+    format_current_dag,
+    parse_dag_point_revision_response,
+)
 from causal.agents.hypothesis import (
     DAG_VARIABLE_DOMAINS,
     DAG_VARIABLE_ROLES,
@@ -312,6 +319,12 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
     temporary.replace(path)
 
+
+#: Cap on how many free-text correction points one
+#: `revise_candidate_dag_from_points` call accepts -- keeps the formatter
+#: prompt bounded and matches how a reviewer actually works (a handful of
+#: points, reviewed, then another pass if needed).
+_MAX_DAG_REVISION_POINTS = 20
 
 #: Fields of a targeted study-design correction worth replaying to a later
 #: full regeneration (`UserQuestionHypothesisService.generate`'s
@@ -2408,6 +2421,134 @@ class WorkflowManager:
         )
         for gate in ("target_trial", "analysis_plan", "statistical_estimand"):
             self._invalidate_gate(state, gate, f"target-trial timing corrected by {reviewer}")
+        self.save(state)
+        return state
+
+    def revise_candidate_dag_from_points(
+        self,
+        run_id: str,
+        points: Sequence[str],
+        llm: LLMCallable,
+        reviewer: str,
+        *,
+        comment: str = "",
+        prompt_path: Path = DEFAULT_DAG_POINT_REVISION_PROMPT_PATH,
+    ) -> RunState:
+        """Apply a reviewer's free-text DAG correction points as targeted
+        edits, instead of regenerating the whole run.
+
+        The `llm` here is a *formatter* (see
+        `causal.agents.dag_point_revision`): it maps each point to an
+        `add` / `reclassify` / `remove` operation. The reviewer is the
+        grounding, so added/reclassified variables are expert-asserted
+        (`pmid = ""`), exactly as `review_covariate` records a hand-added
+        covariate -- this path is not the literature-grounded
+        `_critique_and_revise_dag` loop and does not go through its
+        citation allow-list.
+
+        The revised `candidate_dag` is still validated by
+        `HypothesisAgent().run(...)` (role/temporal legality, cycles,
+        duplicate labels, window bounds) *before* anything is written: a
+        revision that would not construct a valid graph raises and leaves
+        `protocol.json` untouched. On success, `hypothesis.json` is
+        refreshed and `dag_review` / `clinical_mapping` / `analysis_plan`
+        are re-opened (a covariate reject/reclassify changes the adjustment
+        set and every downstream artifact derived from it).
+
+        Never blocks on the `dag_review` gate being approved -- unlike the
+        target-trial timing/estimand fixes, a DAG correction after approval
+        is the normal case (the reviewer spotted a missing confounder while
+        mapping concepts); the gate re-opening is the safety mechanism.
+        """
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        cleaned_points = [str(point).strip() for point in points if str(point).strip()]
+        if not cleaned_points:
+            raise ValueError("At least one non-empty correction point is required")
+        if len(cleaned_points) > _MAX_DAG_REVISION_POINTS:
+            raise ValueError(f"At most {_MAX_DAG_REVISION_POINTS} correction points at a time")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+        state = self.load(run_id)
+        if not (run_dir / "hypothesis.json").is_file():
+            raise RuntimeError("Run the Hypothesis Agent before revising the DAG")
+
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        target = protocol.get("target_trial")
+        if not isinstance(target, dict):
+            raise ValueError("Cannot revise the DAG: protocol.json has no target_trial object")
+        current_dag = list(protocol.get("candidate_dag", []) or [])
+        prompt = build_dag_point_revision_prompt(
+            prompt_path,
+            target=target,
+            current_dag_text=format_current_dag(current_dag),
+            points=cleaned_points,
+        )
+        revision = parse_dag_point_revision_response(llm(prompt))
+        now = datetime.now(timezone.utc).isoformat()
+        updated_protocol, apply_notes = apply_dag_point_operations(
+            protocol, revision, reviewer.strip(), now=now
+        )
+
+        # Validate the revised graph before persisting anything.
+        try:
+            HypothesisAgent().run(updated_protocol)
+        except ValueError as exc:
+            raise ValueError(
+                f"The revised DAG does not construct a valid graph: {exc}. "
+                "Rephrase the correction point(s); nothing was changed."
+            ) from exc
+
+        before_labels = sorted(
+            str(entry.get("label", "")).strip() for entry in current_dag if entry.get("label")
+        )
+        after_labels = sorted(
+            str(entry.get("label", "")).strip()
+            for entry in updated_protocol.get("candidate_dag", [])
+            if entry.get("label")
+        )
+        summary = (
+            f"{len(revision.operations)} operation(s) from {len(cleaned_points)} point(s)"
+        )
+        with _RunLock(run_dir):
+            _append_correction_log(
+                updated_protocol,
+                kind="dag_points",
+                reviewer=reviewer.strip(),
+                comment=comment.strip(),
+                summary=summary,
+                detail={
+                    "points": cleaned_points,
+                    "operations": [
+                        {
+                            "op": operation.op,
+                            "label": operation.label,
+                            "role": operation.role,
+                            "temporal_classification": operation.temporal_classification,
+                        }
+                        for operation in revision.operations
+                    ],
+                    "acknowledged_errors": list(revision.acknowledged_errors),
+                    "unaddressed_points": list(revision.unaddressed_points),
+                    "apply_notes": apply_notes,
+                },
+            )
+            _atomic_write_json(protocol_path, updated_protocol)
+            self._write_hypothesis(run_id, updated_protocol)
+
+        detail_bits = [summary]
+        if revision.unaddressed_points:
+            detail_bits.append(f"{len(revision.unaddressed_points)} point(s) not applied")
+        if apply_notes:
+            detail_bits.append("; ".join(apply_notes))
+        state.record(
+            "candidate_dag_revised_from_points",
+            f"{'; '.join(detail_bits)} by {reviewer.strip()}",
+            changes={"before": before_labels, "after": after_labels},
+        )
+        for gate in ("dag_review", "clinical_mapping", "analysis_plan"):
+            self._invalidate_gate(state, gate, f"DAG revised from reviewer points by {reviewer.strip()}")
         self.save(state)
         return state
 

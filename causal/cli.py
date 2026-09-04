@@ -159,6 +159,19 @@ def main() -> int:
         "--domain", choices=DAG_VARIABLE_DOMAINS,
         help="optional OMOP domain; enables an OMCP concept lookup for this covariate later",
     )
+    workflow_revise_dag = workflow_sub.add_parser(
+        "revise-dag",
+        help="apply free-text DAG correction points as targeted add/reclassify/remove edits "
+        "(an LLM formats the points; nothing regenerated)",
+    )
+    workflow_revise_dag.add_argument("run_id")
+    workflow_revise_dag.add_argument(
+        "--point", action="append", dest="points", default=[], required=True,
+        help="one correction point, e.g. \"add baseline creatinine as a confounder\" (repeatable)",
+    )
+    workflow_revise_dag.add_argument("--reviewer", required=True)
+    workflow_revise_dag.add_argument("--comment", default="")
+    workflow_revise_dag.add_argument("--model", default=None)
     workflow_target_trial_timing = workflow_sub.add_parser(
         "target-trial-timing",
         help="correct target_trial.time_zero / grace_period_hours / follow_up_days in place "
@@ -564,6 +577,15 @@ def main() -> int:
             state = manager.run_negative_control_estimation(
                 args.run_id, args.control_id, OMCPClient(datasets),
                 n_bootstrap=args.n_bootstrap, random_seed=args.seed,
+            )
+        elif args.workflow_command == "revise-dag":
+            resolved_llm = build_hypothesis_llm(model=args.model)
+            state = manager.revise_candidate_dag_from_points(
+                args.run_id,
+                args.points,
+                resolved_llm.call,
+                args.reviewer,
+                comment=args.comment,
             )
         elif args.workflow_command == "target-trial-timing":
             state = manager.set_target_trial_timing(

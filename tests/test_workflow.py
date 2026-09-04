@@ -241,6 +241,96 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(kinds, ["target_trial_timing", "target_trial_estimand"])
         self.assertEqual(protocol["correction_log"][0]["comment"], "D90 endpoint")
 
+    def _dag_protocol_path(self):
+        path = self._full_protocol_path()
+        protocol = json.loads(path.read_text(encoding="utf-8"))
+        protocol["first_pass_covariates"] = ["age"]
+        protocol["candidate_dag"] = [
+            {
+                "label": "age", "role": "confounder", "temporal_classification": "pre_treatment",
+                "rationale": "prognostic and affects treatment choice", "pmid": "",
+                "observed": True, "certainty": "established", "evidence_level": "uncited",
+            },
+            {
+                "label": "vasopressor use", "role": "confounder",
+                "temporal_classification": "pre_treatment", "rationale": "severity marker",
+                "pmid": "", "observed": True, "certainty": "established", "evidence_level": "uncited",
+            },
+        ]
+        path.write_text(json.dumps(protocol), encoding="utf-8")
+        return path
+
+    def test_revise_candidate_dag_from_points_applies_operations(self):
+        state = self.manager.start(self._dag_protocol_path())
+        self.manager.run_hypothesis_agent(state.run_id)
+
+        response = json.dumps({
+            "operations": [
+                {
+                    "op": "add", "label": "baseline creatinine", "role": "confounder",
+                    "temporal_classification": "pre_treatment", "observed": True,
+                    "certainty": "established", "rationale": "reviewer: confounds nephrotoxin and AKI",
+                },
+                {
+                    "op": "reclassify", "label": "vasopressor use", "role": "mediator",
+                    "temporal_classification": "post_treatment",
+                    "rationale": "reviewer: on the causal pathway",
+                },
+            ],
+            "acknowledged_errors": ["missed baseline renal function"],
+            "unaddressed_points": [],
+        })
+        updated = self.manager.revise_candidate_dag_from_points(
+            state.run_id,
+            ["add baseline creatinine as a confounder", "vasopressors are a mediator"],
+            _CapturingLLM(response),
+            "tester",
+            comment="clinical pass 1",
+        )
+
+        protocol = json.loads(
+            (Path(self.temp.name) / "runs" / state.run_id / "protocol.json").read_text(encoding="utf-8")
+        )
+        labels = {v["label"]: v["role"] for v in protocol["candidate_dag"]}
+        self.assertEqual(labels["baseline creatinine"], "confounder")
+        self.assertEqual(labels["vasopressor use"], "mediator")
+        self.assertEqual(protocol["correction_log"][-1]["kind"], "dag_points")
+        for gate in ("dag_review", "clinical_mapping", "analysis_plan"):
+            self.assertEqual(updated.gates[gate].status, "pending")
+
+    def test_revise_candidate_dag_from_points_rejects_an_invalid_graph(self):
+        state = self.manager.start(self._dag_protocol_path())
+        self.manager.run_hypothesis_agent(state.run_id)
+        # A confounder cannot be post_treatment -- HypothesisAgent rejects it,
+        # and protocol.json must be left untouched.
+        bad = json.dumps({
+            "operations": [{
+                "op": "reclassify", "label": "age", "role": "confounder",
+                "temporal_classification": "post_treatment", "rationale": "reviewer: nonsense",
+            }],
+            "acknowledged_errors": [], "unaddressed_points": [],
+        })
+        with self.assertRaises(ValueError):
+            self.manager.revise_candidate_dag_from_points(
+                state.run_id, ["make age a post-treatment confounder"], _CapturingLLM(bad), "tester"
+            )
+        protocol = json.loads(
+            (Path(self.temp.name) / "runs" / state.run_id / "protocol.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("correction_log", protocol)
+        self.assertEqual(
+            next(v["temporal_classification"] for v in protocol["candidate_dag"] if v["label"] == "age"),
+            "pre_treatment",
+        )
+
+    def test_revise_candidate_dag_from_points_requires_points(self):
+        state = self.manager.start(self._dag_protocol_path())
+        self.manager.run_hypothesis_agent(state.run_id)
+        with self.assertRaises(ValueError):
+            self.manager.revise_candidate_dag_from_points(
+                state.run_id, ["   "], _CapturingLLM("{}"), "tester"
+            )
+
     def _protocol_path_with_approved_concept_sets(self):
         """`_full_protocol_path` plus an approved population/treatment/
         comparator, needed as a base for `add_population_concept_set`

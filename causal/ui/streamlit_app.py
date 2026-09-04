@@ -347,6 +347,8 @@ _REVIEWER_FIELD_KEY_PREFIXES = (
     "statistical_estimand_reviewer_",
     "estimand_fix_reviewer_",
     "timing_fix_reviewer_",
+    "add_covariate_reviewer_",
+    "dag_points_reviewer_",
     "add_pop_reviewer_",
     "remove_pop_reviewer_",
     "censoring_definition_reviewer_",
@@ -1121,6 +1123,107 @@ def _render_gates_tab(manager: WorkflowManager, state: RunState, run_dir: Path) 
                 _render_gate_card(manager, state, gate_name, run_dir)
 
 
+def _render_add_missing_covariate(manager: WorkflowManager, run_id: str) -> None:
+    """Add a confounder (or other DAG variable) the LLM draft never proposed.
+
+    `WorkflowManager.review_covariate` already accepts an arbitrary new label
+    -- the literature / first-pass covariate lists only seed the review cards
+    above, they do not bound what a reviewer may add. This is the UI path for
+    the common "the reference DAG has 15 confounders, the draft grounded 5"
+    gap (the drafting allow-list rejects a confounder with no dedicated PMID).
+    """
+    with st.expander("Add a covariate the draft missed", icon=":material/add:"):
+        st.caption(
+            "Adds a role-classified variable straight into candidate_dag, exactly as "
+            "accepting a first-pass covariate above does. Use the reference / anchor-trial "
+            "covariate list as the checklist."
+        )
+        with st.form(key=f"add_covariate_{run_id}"):
+            label = st.text_input("Covariate label", key=f"add_covariate_label_{run_id}")
+            role_col, temporal_col, domain_col = st.columns(3)
+            role = role_col.selectbox(
+                "Causal role", DAG_VARIABLE_ROLES, key=f"add_covariate_role_{run_id}",
+                format_func=_humanize,
+            )
+            temporal = temporal_col.selectbox(
+                "Temporal classification", DAG_VARIABLE_TEMPORAL_CLASSES,
+                key=f"add_covariate_temporal_{run_id}", format_func=_humanize,
+                help="Relative to treatment.",
+            )
+            domain = domain_col.selectbox(
+                "OMOP domain (optional)", ("",) + DAG_VARIABLE_DOMAINS,
+                key=f"add_covariate_domain_{run_id}",
+                format_func=lambda value: "Not yet assessed" if value == "" else value,
+                help="Enables a concept lookup for this covariate later.",
+            )
+            unobserved = st.checkbox(
+                "Unobserved / latent (no OMOP data captures it)",
+                key=f"add_covariate_unobserved_{run_id}",
+            )
+            rationale = st.text_area("Rationale (required)", key=f"add_covariate_rationale_{run_id}")
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"add_covariate_reviewer_{run_id}"
+            )
+            if st.form_submit_button("Add covariate"):
+                try:
+                    manager.review_covariate(
+                        run_id, label, "accept", reviewer, rationale,
+                        role=role, temporal_classification=temporal,
+                        observed=not unobserved, domain=domain or None,
+                    )
+                    try:
+                        manager.run_data_science_agent(run_id)
+                    except RuntimeError:
+                        pass
+                    st.success(f"'{label.strip()}' added to the candidate DAG.")
+                    st.rerun()
+                except (ValueError, RuntimeError) as exc:
+                    st.error(str(exc))
+
+
+def _render_dag_point_revision(manager: WorkflowManager, run_id: str) -> None:
+    """Apply several free-text DAG correction points at once
+    (`WorkflowManager.revise_candidate_dag_from_points`): an LLM formats each
+    line into an add / reclassify / remove edit, the graph is re-validated,
+    and `dag_review` + downstream gates re-open. The conversational path in
+    the left panel proposes the same call as a card; this is the direct form.
+    """
+    with st.expander("Revise the DAG from correction points", icon=":material/edit_note:"):
+        st.caption(
+            "One correction per line, e.g. \"add baseline serum creatinine as a confounder\", "
+            "\"vasopressor use is a mediator, not a confounder\", \"remove ICU length of stay, "
+            "it is a collider\". Points the model cannot map are reported back, not guessed at."
+        )
+        with st.form(key=f"dag_point_revision_{run_id}"):
+            points_text = st.text_area(
+                "Correction points (one per line)", key=f"dag_points_text_{run_id}", height=140
+            )
+            comment = st.text_input(
+                "Note for the correction log (optional)", key=f"dag_points_comment_{run_id}"
+            )
+            reviewer = st.text_input(
+                "Reviewer", value=_reviewer_default(), key=f"dag_points_reviewer_{run_id}"
+            )
+            if st.form_submit_button("Apply correction points"):
+                points = [line.strip() for line in points_text.splitlines() if line.strip()]
+                if not points:
+                    st.warning("Enter at least one correction point.")
+                else:
+                    status = st.status("Formatting the correction points…", expanded=True)
+                    try:
+                        resolved_llm = build_hypothesis_llm()
+                        status.write(f"Calling `{resolved_llm.provider}:{resolved_llm.model}`…")
+                        manager.revise_candidate_dag_from_points(
+                            run_id, points, resolved_llm.call, reviewer, comment=comment,
+                        )
+                        status.update(label="DAG revised.", state="complete")
+                        st.success("DAG revised — re-review the graph above and the gate.")
+                        st.rerun()
+                    except (ValueError, RuntimeError) as exc:
+                        status.update(label="Revision failed.", state="error")
+                        st.error(str(exc))
+
+
 def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
     hypothesis = _read_json(run_dir / "hypothesis.json")
     if hypothesis is None:
@@ -1646,6 +1749,9 @@ def _render_hypothesis_tab(manager: WorkflowManager, run_id: str, run_dir: Path)
                     st.error("Some decisions were not saved:\n" + "\n".join(f"- {e}" for e in errors))
                 if succeeded:
                     st.rerun()
+
+    _render_add_missing_covariate(manager, run_id)
+    _render_dag_point_revision(manager, run_id)
 
     if artifact.rejected_covariates:
         with st.expander(f"Reviewed exclusions ({len(artifact.rejected_covariates)})"):
