@@ -885,8 +885,10 @@ def _gather_assumptions(
         )
     else:
         assumptions.append(
-            "Out of scope (docs/causal_roadmap.md milestone #4): CATE/effect-modification "
-            "estimation -- this run's estimator reports the population ATE only."
+            "Treatment-effect heterogeneity was not examined in this run: no prespecified "
+            "effect-modifier subgroup family was estimated (CATE via `causal.agents.cate."
+            "CATEAgent` is available but requires CATE to be declared as the primary estimand "
+            "at the causal-question stage). The estimate above is the population ATE."
         )
     assumptions.append(
         "Censoring-aware (IPCW) adjustment is implemented for single-interval administrative "
@@ -1100,6 +1102,55 @@ class WorkflowManager:
         gate_obj.decided_at = None
         state.record("gate_invalidated", f"{gate} reset from {previous_status} to pending: {reason}")
 
+    def _invalidate_gates_from(self, state: RunState, gate: str, reason: str) -> None:
+        """Invalidate `gate` and every gate downstream of it in the pipeline
+        dependency order (`_ALL_GATE_NAMES`).
+
+        The gates are a strict chain: `identification_estimand` is computed
+        from the reviewed DAG, `analysis_plan` from the approved mapping,
+        `statistical_estimand`'s adjustment set and censoring strategy from
+        the approved analysis plan, and `results` from the estimate. So
+        reopening one gate must reopen the ones that were approved on top of
+        it -- otherwise a covariate window/aggregation edit (which does not
+        rename the materialized column, so `run_estimation`'s adjustment-set
+        equality check never notices) leaves `statistical_estimand:
+        approved` standing against a changed operational definition. Each
+        step is a no-op unless that gate is currently approved/provisional,
+        so no spurious `gate_invalidated` events are recorded. This is the
+        single place the chain is encoded; call sites pass only the most
+        upstream gate their change touches.
+        """
+        if gate not in _ALL_GATE_NAMES:
+            raise ValueError(f"Unknown gate: {gate}")
+        for downstream in _ALL_GATE_NAMES[_ALL_GATE_NAMES.index(gate):]:
+            self._invalidate_gate(state, downstream, reason)
+
+    @staticmethod
+    def _require_statistical_estimand_gate(state: RunState) -> None:
+        """Guard the estimator entry points (`run_estimation`, `run_cate`,
+        `run_negative_control_estimation`) on the `statistical_estimand`
+        gate actually being decided -- not merely on `statistical_estimand.
+        json` existing on disk.
+
+        `_invalidate_gate` resets that gate to `pending` when a reviewer
+        changes the reviewed missing-data/censoring/procedure strategy
+        (`set_statistical_estimand_strategy`, `approve_censoring_
+        definition`), but deliberately leaves the already-written
+        `statistical_estimand.json` in place. A bare `estimand_path.
+        is_file()` check would then let an estimator run against a strategy
+        the reviewer has since retracted, silently ignoring the new intent.
+        `ExecutionAgent`/`execution_readiness.json` does not cover this
+        either: it gates on the `clinical_mapping` and `analysis_plan` gate
+        statuses, never this one.
+        """
+        status = state.gates["statistical_estimand"].status
+        if status not in {"approved", "provisional"}:
+            raise RuntimeError(
+                f"The statistical_estimand gate is not approved (status={status!r}) -- "
+                "re-approve it (decide_gate ... statistical_estimand approved) after the "
+                "reviewed estimand strategy changed before running an estimator"
+            )
+
     def _block_if_analysis_plan_incomplete(self, run_id: str) -> None:
         """The `analysis_plan` gate cannot be approved while the plan itself
         still has unresolved issues or a covariate/phenotype that isn't
@@ -1255,7 +1306,6 @@ class WorkflowManager:
         except (TypeError, ValueError):
             raise ValueError("concept_ids must be a list of integers") from None
 
-        state = self.load(run_id)
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
         if not (run_dir / "hypothesis.json").is_file():
@@ -1285,6 +1335,9 @@ class WorkflowManager:
                 )
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             concept_sets = protocol.get("concept_sets", {})
             entry = concept_sets.get(name)
@@ -1320,19 +1373,18 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
-        detail = f"{name}: domain={domain}, {len(concept_ids)} concept(s), status={status} by {reviewer}"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "concept_set_mapped", detail,
-            changes={
-                "before": before,
-                "after": {"domain": domain, "concept_ids": concept_ids, "status": status},
-            },
-        )
-        self._invalidate_gate(state, "clinical_mapping", f"concept_sets['{name}'] changed")
-        self._invalidate_gate(state, "analysis_plan", f"concept_sets['{name}'] changed")
-        self.save(state)
+            detail = f"{name}: domain={domain}, {len(concept_ids)} concept(s), status={status} by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "concept_set_mapped", detail,
+                changes={
+                    "before": before,
+                    "after": {"domain": domain, "concept_ids": concept_ids, "status": status},
+                },
+            )
+            self._invalidate_gates_from(state, "clinical_mapping", f"concept_sets['{name}'] changed")
+            self.save(state)
         return state
 
     def set_concept_set_lookup_terms(self, run_id: str, terms: dict[str, str]) -> RunState:
@@ -1424,11 +1476,13 @@ class WorkflowManager:
 
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
         if not (run_dir / "hypothesis.json").is_file():
             raise RuntimeError("Run the Hypothesis Agent before adding a population concept set")
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             concept_sets = protocol.get("concept_sets", {})
             if name in concept_sets:
@@ -1449,13 +1503,14 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
-        detail = f"'{name}' ({label.strip()}) added by {reviewer} as a required population concept set"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record("population_concept_set_added", detail)
-        self._invalidate_gate(state, "clinical_mapping", f"additional population concept set '{name}' added")
-        self._invalidate_gate(state, "analysis_plan", f"additional population concept set '{name}' added")
-        self.save(state)
+            detail = f"'{name}' ({label.strip()}) added by {reviewer} as a required population concept set"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record("population_concept_set_added", detail)
+            self._invalidate_gates_from(
+                state, "clinical_mapping", f"additional population concept set '{name}' added"
+            )
+            self.save(state)
         return state
 
     def remove_population_concept_set(
@@ -1483,9 +1538,11 @@ class WorkflowManager:
 
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             existing_additional = tuple(protocol.get("additional_population_concept_sets", ()) or ())
             if name not in existing_additional:
@@ -1499,13 +1556,14 @@ class WorkflowManager:
 
             if (run_dir / "hypothesis.json").is_file():
                 self._write_hypothesis(run_id, protocol)
-        detail = f"'{name}' removed by {reviewer} as a required population concept set"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record("population_concept_set_removed", detail)
-        self._invalidate_gate(state, "clinical_mapping", f"additional population concept set '{name}' removed")
-        self._invalidate_gate(state, "analysis_plan", f"additional population concept set '{name}' removed")
-        self.save(state)
+            detail = f"'{name}' removed by {reviewer} as a required population concept set"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record("population_concept_set_removed", detail)
+            self._invalidate_gates_from(
+                state, "clinical_mapping", f"additional population concept set '{name}' removed"
+            )
+            self.save(state)
         return state
 
     def propose_negative_controls(
@@ -1729,13 +1787,15 @@ class WorkflowManager:
         if not label:
             raise ValueError("label is required")
 
-        state = self.load(run_id)
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
         if not (run_dir / "hypothesis.json").is_file():
             raise RuntimeError("Run the Hypothesis Agent before reviewing covariates")
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
 
             previous_entry = next(
@@ -1792,13 +1852,12 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
-        state.record(
-            "covariate_reviewed", f"{label}={decision} by {reviewer}",
-            changes={"before": previous_entry, "after": new_entry},
-        )
-        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' {decision}ed")
-        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' {decision}ed")
-        self.save(state)
+            state.record(
+                "covariate_reviewed", f"{label}={decision} by {reviewer}",
+                changes={"before": previous_entry, "after": new_entry},
+            )
+            self._invalidate_gates_from(state, "clinical_mapping", f"covariate '{label}' {decision}ed")
+            self.save(state)
         return state
 
     def review_covariate_domain(
@@ -1842,13 +1901,15 @@ class WorkflowManager:
         if domain not in DAG_VARIABLE_DOMAINS:
             raise ValueError(f"domain must be one of {DAG_VARIABLE_DOMAINS}")
 
-        state = self.load(run_id)
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
         if not (run_dir / "hypothesis.json").is_file():
             raise RuntimeError("Run the Hypothesis Agent before reviewing a covariate domain")
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
 
             candidate_dag = protocol.get("candidate_dag", ())
@@ -1869,16 +1930,15 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
-        detail = f"{label}: domain={domain} by {reviewer}"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "covariate_domain_reviewed", detail,
-            changes={"before": {"domain": previous_domain}, "after": {"domain": domain}},
-        )
-        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' domain changed")
-        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' domain changed")
-        self.save(state)
+            detail = f"{label}: domain={domain} by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "covariate_domain_reviewed", detail,
+                changes={"before": {"domain": previous_domain}, "after": {"domain": domain}},
+            )
+            self._invalidate_gates_from(state, "clinical_mapping", f"covariate '{label}' domain changed")
+            self.save(state)
         return state
 
     def map_covariate_concepts(
@@ -1929,7 +1989,6 @@ class WorkflowManager:
         if mapping_status == "approved" and not concept_ids:
             raise ValueError("mapping_status='approved' requires at least one concept_id")
 
-        state = self.load(run_id)
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
         if not (run_dir / "hypothesis.json").is_file():
@@ -1961,6 +2020,9 @@ class WorkflowManager:
                     )
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
 
             candidate_dag = protocol.get("candidate_dag", ())
@@ -2011,22 +2073,23 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
-        detail = f"{label}: {len(concept_ids)} concept(s), status={mapping_status} by {reviewer}"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "covariate_concepts_mapped", detail,
-            changes={
-                "before": {
-                    "concept_ids": entry.get("concept_ids", []),
-                    "mapping_status": entry.get("mapping_status", "unmapped"),
+            detail = f"{label}: {len(concept_ids)} concept(s), status={mapping_status} by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "covariate_concepts_mapped", detail,
+                changes={
+                    "before": {
+                        "concept_ids": entry.get("concept_ids", []),
+                        "mapping_status": entry.get("mapping_status", "unmapped"),
+                    },
+                    "after": {"concept_ids": concept_ids, "mapping_status": mapping_status.strip()},
                 },
-                "after": {"concept_ids": concept_ids, "mapping_status": mapping_status.strip()},
-            },
-        )
-        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' concept mapping changed")
-        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' concept mapping changed")
-        self.save(state)
+            )
+            self._invalidate_gates_from(
+                state, "clinical_mapping", f"covariate '{label}' concept mapping changed"
+            )
+            self.save(state)
         return state
 
     def review_covariate_aggregation(
@@ -2059,13 +2122,15 @@ class WorkflowManager:
             raise ValueError("aggregation is required")
         aggregation = aggregation.strip()
 
-        state = self.load(run_id)
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
         if not (run_dir / "hypothesis.json").is_file():
             raise RuntimeError("Run the Hypothesis Agent before reviewing covariate aggregation")
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
 
             candidate_dag = protocol.get("candidate_dag", ())
@@ -2090,19 +2155,20 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
-        detail = f"{label}: aggregation={aggregation} by {reviewer}"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "covariate_aggregation_reviewed", detail,
-            changes={
-                "before": {"aggregation": entry.get("aggregation", "definition_pending")},
-                "after": {"aggregation": aggregation},
-            },
-        )
-        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' aggregation changed")
-        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' aggregation changed")
-        self.save(state)
+            detail = f"{label}: aggregation={aggregation} by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "covariate_aggregation_reviewed", detail,
+                changes={
+                    "before": {"aggregation": entry.get("aggregation", "definition_pending")},
+                    "after": {"aggregation": aggregation},
+                },
+            )
+            self._invalidate_gates_from(
+                state, "clinical_mapping", f"covariate '{label}' aggregation changed"
+            )
+            self.save(state)
         return state
 
     def review_covariate_window(
@@ -2144,13 +2210,15 @@ class WorkflowManager:
                 "window must satisfy window_start_hours <= window_end_hours <= 0"
             )
 
-        state = self.load(run_id)
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
         if not (run_dir / "hypothesis.json").is_file():
             raise RuntimeError("Run the Hypothesis Agent before reviewing a covariate window")
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
 
             candidate_dag = protocol.get("candidate_dag", ())
@@ -2168,22 +2236,26 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, protocol)
 
             self._write_hypothesis(run_id, protocol)
-        detail = f"{label}: window={window_start_hours}h..{window_end_hours}h by {reviewer}"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "covariate_window_reviewed", detail,
-            changes={
-                "before": {
-                    "window_start_hours": entry.get("window_start_hours"),
-                    "window_end_hours": entry.get("window_end_hours"),
+            detail = f"{label}: window={window_start_hours}h..{window_end_hours}h by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "covariate_window_reviewed", detail,
+                changes={
+                    "before": {
+                        "window_start_hours": entry.get("window_start_hours"),
+                        "window_end_hours": entry.get("window_end_hours"),
+                    },
+                    "after": {
+                        "window_start_hours": window_start_hours,
+                        "window_end_hours": window_end_hours,
+                    },
                 },
-                "after": {"window_start_hours": window_start_hours, "window_end_hours": window_end_hours},
-            },
-        )
-        self._invalidate_gate(state, "clinical_mapping", f"covariate '{label}' window changed")
-        self._invalidate_gate(state, "analysis_plan", f"covariate '{label}' window changed")
-        self.save(state)
+            )
+            self._invalidate_gates_from(
+                state, "clinical_mapping", f"covariate '{label}' window changed"
+            )
+            self.save(state)
         return state
 
     def _block_if_target_trial_incomplete(self, run_id: str) -> None:
@@ -2272,14 +2344,16 @@ class WorkflowManager:
 
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
-        if state.gates["target_trial"].status == "approved":
+        if self.load(run_id).gates["target_trial"].status == "approved":
             raise ValueError(
                 "Cannot manually edit the estimand after the target_trial gate is approved -- "
                 "reject it first, or regenerate a new run."
             )
 
         with _RunLock(run_dir):
+            # Reloaded inside the lock so a concurrent gate decision made
+            # after the pre-check above is not clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             target = protocol.get("target_trial")
             if not isinstance(target, dict):
@@ -2306,16 +2380,16 @@ class WorkflowManager:
             )
             _atomic_write_json(protocol_path, protocol)
 
-        state.record(
-            "target_trial_estimand_corrected",
-            f"primary_estimand set to {primary_estimand} by {reviewer}: {comment.strip()}",
-            changes={
-                "before": before,
-                "after": {"primary_estimand": primary_estimand, "secondary_estimands": list(secondary_estimands)},
-            },
-        )
-        self._invalidate_gate(state, "target_trial", f"estimand manually corrected by {reviewer}")
-        self.save(state)
+            state.record(
+                "target_trial_estimand_corrected",
+                f"primary_estimand set to {primary_estimand} by {reviewer}: {comment.strip()}",
+                changes={
+                    "before": before,
+                    "after": {"primary_estimand": primary_estimand, "secondary_estimands": list(secondary_estimands)},
+                },
+            )
+            self._invalidate_gate(state, "target_trial", f"estimand manually corrected by {reviewer}")
+            self.save(state)
         return state
 
     def set_target_trial_timing(
@@ -2393,14 +2467,17 @@ class WorkflowManager:
 
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
-        if state.gates["target_trial"].status == "approved":
+        if self.load(run_id).gates["target_trial"].status == "approved":
             raise ValueError(
                 "Cannot manually edit target-trial timing after the target_trial gate is "
                 "approved -- reject it first, or regenerate a new run."
             )
 
         with _RunLock(run_dir):
+            # Reloaded inside the lock (not reused from the pre-check above)
+            # so a concurrent `decide_gate`/`advance` that completed in the
+            # meantime is not clobbered by this method's own `save`.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             target = protocol.get("target_trial")
             if not isinstance(target, dict):
@@ -2422,14 +2499,18 @@ class WorkflowManager:
             if (run_dir / "hypothesis.json").is_file():
                 self._write_hypothesis(run_id, protocol)
 
-        state.record(
-            "target_trial_timing_corrected",
-            f"{summary} by {reviewer}: {comment.strip()}",
-            changes={"before": before, "after": dict(updates)},
-        )
-        for gate in ("target_trial", "analysis_plan", "statistical_estimand"):
-            self._invalidate_gate(state, gate, f"target-trial timing corrected by {reviewer}")
-        self.save(state)
+            state.record(
+                "target_trial_timing_corrected",
+                f"{summary} by {reviewer}: {comment.strip()}",
+                changes={"before": before, "after": dict(updates)},
+            )
+            # `target_trial` plus the downstream gates that read a timing
+            # field (not `dag_review` / `identification_estimand` /
+            # `clinical_mapping`, which nothing upstream of the DAG derives
+            # from timing).
+            for gate in ("target_trial", "analysis_plan", "statistical_estimand", "results"):
+                self._invalidate_gate(state, gate, f"target-trial timing corrected by {reviewer}")
+            self.save(state)
         return state
 
     def revise_candidate_dag_from_points(
@@ -2459,9 +2540,11 @@ class WorkflowManager:
         duplicate labels, window bounds) *before* anything is written: a
         revision that would not construct a valid graph raises and leaves
         `protocol.json` untouched. On success, `hypothesis.json` is
-        refreshed and `dag_review` / `clinical_mapping` / `analysis_plan`
-        are re-opened (a covariate reject/reclassify changes the adjustment
-        set and every downstream artifact derived from it).
+        refreshed and `_invalidate_gates_from("dag_review")` re-opens
+        `dag_review` and every gate downstream of it (`identification_
+        estimand` through `results`) -- a covariate reject/reclassify
+        changes the identified adjustment set and every downstream artifact
+        derived from it.
 
         Never blocks on the `dag_review` gate being approved -- unlike the
         target-trial timing/estimand fixes, a DAG correction after approval
@@ -2478,7 +2561,6 @@ class WorkflowManager:
 
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
         if not (run_dir / "hypothesis.json").is_file():
             raise RuntimeError("Run the Hypothesis Agent before revising the DAG")
 
@@ -2519,7 +2601,16 @@ class WorkflowManager:
         summary = (
             f"{len(revision.operations)} operation(s) from {len(cleaned_points)} point(s)"
         )
+        detail_bits = [summary]
+        if revision.unaddressed_points:
+            detail_bits.append(f"{len(revision.unaddressed_points)} point(s) not applied")
+        if apply_notes:
+            detail_bits.append("; ".join(apply_notes))
         with _RunLock(run_dir):
+            # Reloaded inside the lock (the LLM formatter call above ran
+            # unlocked) so a concurrent `decide_gate`/review is not clobbered
+            # by this method's own `save`.
+            state = self.load(run_id)
             _append_correction_log(
                 updated_protocol,
                 kind="dag_points",
@@ -2545,19 +2636,15 @@ class WorkflowManager:
             _atomic_write_json(protocol_path, updated_protocol)
             self._write_hypothesis(run_id, updated_protocol)
 
-        detail_bits = [summary]
-        if revision.unaddressed_points:
-            detail_bits.append(f"{len(revision.unaddressed_points)} point(s) not applied")
-        if apply_notes:
-            detail_bits.append("; ".join(apply_notes))
-        state.record(
-            "candidate_dag_revised_from_points",
-            f"{'; '.join(detail_bits)} by {reviewer.strip()}",
-            changes={"before": before_labels, "after": after_labels},
-        )
-        for gate in ("dag_review", "clinical_mapping", "analysis_plan"):
-            self._invalidate_gate(state, gate, f"DAG revised from reviewer points by {reviewer.strip()}")
-        self.save(state)
+            state.record(
+                "candidate_dag_revised_from_points",
+                f"{'; '.join(detail_bits)} by {reviewer.strip()}",
+                changes={"before": before_labels, "after": after_labels},
+            )
+            self._invalidate_gates_from(
+                state, "dag_review", f"DAG revised from reviewer points by {reviewer.strip()}"
+            )
+            self.save(state)
         return state
 
     def _block_if_major_confounders_unresolved(self, run_id: str) -> None:
@@ -2805,7 +2892,7 @@ class WorkflowManager:
                 "agent_completed",
                 f"data_science_agent->analysis_plan.json; mapping_source={source}",
             )
-            self._invalidate_gate(state, "analysis_plan", "analysis_plan.json regenerated")
+            self._invalidate_gates_from(state, "analysis_plan", "analysis_plan.json regenerated")
             self.save(state)
         return state
 
@@ -3091,6 +3178,7 @@ class WorkflowManager:
         estimand_path = run_dir / "statistical_estimand.json"
         if not estimand_path.is_file():
             raise RuntimeError("Run and approve the statistical_estimand gate first")
+        self._require_statistical_estimand_gate(state)
         self.run_execution_readiness(run_id)
         state = self.load(run_id)
         readiness = json.loads((run_dir / "execution_readiness.json").read_text(encoding="utf-8"))
@@ -3314,6 +3402,7 @@ class WorkflowManager:
         ):
             if not path.is_file():
                 raise RuntimeError(f"Run {label} first")
+        self._require_statistical_estimand_gate(state)
 
         self.run_execution_readiness(run_id)
         state = self.load(run_id)
@@ -3715,9 +3804,7 @@ class WorkflowManager:
                 "This profile validates mechanics and cannot support a causal conclusion.",
             ],
         }
-        (run_dir / "cohort_profile.json").write_text(
-            json.dumps(artifact, indent=2), encoding="utf-8"
-        )
+        _atomic_write_json(run_dir / "cohort_profile.json", artifact)
         if "cohort_profile.json" not in state.artifacts:
             state.artifacts.append("cohort_profile.json")
         state.record("cohort_profile_completed", "aggregate profile via OMCP")
@@ -4260,6 +4347,7 @@ class WorkflowManager:
                 f"- Minimum adjustment set(s): {identification.get('minimum_adjustment_sets', '-')}",
             ])
 
+        estimand_is_cate = statistical_estimand.get("population_summary") == "CATE" if statistical_estimand else False
         if statistical_estimand:
             lines.extend([
                 "", "## Statistical estimand", "",
@@ -4268,12 +4356,21 @@ class WorkflowManager:
                 "`statistical_estimand` gate.",
                 "",
                 f"- Identifying functional: {statistical_estimand.get('identifying_functional', '-')}",
+                f"- Estimation procedure: {statistical_estimand.get('estimation_procedure', '-')}",
                 f"- Outcome model: {statistical_estimand.get('outcome_model', '-')}",
                 f"- Adjustment set: {list(statistical_estimand.get('adjustment_set', ()))}",
                 f"- Missing-data strategy: {statistical_estimand.get('missing_data_strategy', '-')}",
                 f"- Censoring strategy: {statistical_estimand.get('censoring_strategy', '-')}",
                 f"- Censoring rationale: {statistical_estimand.get('censoring_rationale', '-')}",
             ])
+            if estimand_is_cate:
+                lines.append(
+                    "> This run's primary estimand is the CATE (`causal_forest_dml`, "
+                    "SuperLearner nuisances) -- see the CATE section below. The **Causal effect "
+                    "estimate** section that follows is a plug-in g-computation ATE kept only as "
+                    "a cross-check for the forest's overall ATE; its simpler logistic outcome "
+                    "model is expected and is not the reviewed procedure."
+                )
 
         if dataset_manifest:
             lines.extend([
@@ -4302,8 +4399,13 @@ class WorkflowManager:
                 if relative.get("available")
                 else f"not computable ({relative.get('reason', '-')})"
             )
+            estimate_heading = (
+                "## Causal effect estimate (plug-in ATE cross-check)"
+                if estimand_is_cate
+                else "## Causal effect estimate"
+            )
             lines.extend([
-                "", "## Causal effect estimate", "",
+                "", estimate_heading, "",
                 "> Numbers here are rounded for readability; the exact values are in "
                 "`estimation.json` (see Provenance below).",
                 "",
@@ -4345,8 +4447,13 @@ class WorkflowManager:
                 lines.extend(["", "### In plain terms", "", "\n\n".join(plain)])
             lines.extend([
                 "",
-                "> This is the study's estimated average treatment effect under the assumptions "
-                "listed below -- not a clinical recommendation.",
+                (
+                    "> For a CATE run this population ATE is a secondary cross-check only; the "
+                    "reviewed primary estimate is in the CATE section below."
+                    if estimand_is_cate
+                    else "> This is the study's estimated average treatment effect under the "
+                    "assumptions listed below -- not a clinical recommendation."
+                ),
             ])
 
         if diagnostics:
@@ -4589,9 +4696,11 @@ class WorkflowManager:
 
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             settings = protocol.get("query_settings")
             settings = dict(settings) if isinstance(settings, dict) else {}
@@ -4600,15 +4709,15 @@ class WorkflowManager:
             protocol["query_settings"] = settings
             _atomic_write_json(protocol_path, protocol)
 
-        detail = f"exposure_contrast: {before} -> {exposure_contrast} by {reviewer}"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "exposure_contrast_set", detail,
-            changes={"before": before, "after": exposure_contrast},
-        )
-        self._invalidate_gate(state, "analysis_plan", "exposure_contrast changed")
-        self.save(state)
+            detail = f"exposure_contrast: {before} -> {exposure_contrast} by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "exposure_contrast_set", detail,
+                changes={"before": before, "after": exposure_contrast},
+            )
+            self._invalidate_gates_from(state, "analysis_plan", "exposure_contrast changed")
+            self.save(state)
         return state
 
     def approve_censoring_definition(
@@ -4626,9 +4735,10 @@ class WorkflowManager:
         aggregate nominal-completeness numbers this per-row definition
         reuses -- so a reviewer approves this after having actually seen
         them, not blind. Same shape as `set_exposure_contrast`: lock, load
-        `protocol.json`, flip the flag, atomic write, record, invalidate the
-        `analysis_plan` gate (a cohort built before this approval has a
-        different `censored` column than one built after).
+        `protocol.json`, flip the flag, atomic write, record, then
+        `_invalidate_gates_from("analysis_plan")` -- a cohort built before
+        this approval has a different `censored` column than one built
+        after, and `statistical_estimand`/`results` rest on that cohort.
         """
         run_dir = self.runs_dir / run_id
         if not (run_dir / "followup_audit.json").is_file():
@@ -4640,9 +4750,11 @@ class WorkflowManager:
             raise ValueError("reviewer is required")
 
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             settings = protocol.get("query_settings")
             settings = dict(settings) if isinstance(settings, dict) else {}
@@ -4651,16 +4763,15 @@ class WorkflowManager:
             protocol["query_settings"] = settings
             _atomic_write_json(protocol_path, protocol)
 
-        detail = f"censoring_definition_approved: {before} -> True by {reviewer}"
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "censoring_definition_approved", detail,
-            changes={"before": before, "after": True},
-        )
-        self._invalidate_gate(state, "analysis_plan", "censoring_definition_approved changed")
-        self._invalidate_gate(state, "statistical_estimand", "censoring_definition_approved changed")
-        self.save(state)
+            detail = f"censoring_definition_approved: {before} -> True by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "censoring_definition_approved", detail,
+                changes={"before": before, "after": True},
+            )
+            self._invalidate_gates_from(state, "analysis_plan", "censoring_definition_approved changed")
+            self.save(state)
         return state
 
     def set_statistical_estimand_strategy(
@@ -4706,9 +4817,11 @@ class WorkflowManager:
 
         run_dir = self.runs_dir / run_id
         protocol_path = run_dir / "protocol.json"
-        state = self.load(run_id)
 
         with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
             protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
             before = protocol.get("statistical_estimand_settings")
             protocol["statistical_estimand_settings"] = {
@@ -4719,19 +4832,22 @@ class WorkflowManager:
             }
             _atomic_write_json(protocol_path, protocol)
 
-        detail = (
-            f"statistical_estimand_settings set by {reviewer}: "
-            f"missing_data_strategy={missing_data_strategy}, censoring_strategy={censoring_strategy}, "
-            f"estimation_procedure={estimation_procedure}"
-        )
-        if comment and comment.strip():
-            detail += f" ({comment.strip()})"
-        state.record(
-            "statistical_estimand_strategy_set", detail,
-            changes={"before": before, "after": protocol["statistical_estimand_settings"]},
-        )
-        self._invalidate_gate(state, "statistical_estimand", "statistical_estimand_settings changed")
-        self.save(state)
+            detail = (
+                f"statistical_estimand_settings set by {reviewer}: "
+                f"missing_data_strategy={missing_data_strategy}, "
+                f"censoring_strategy={censoring_strategy}, "
+                f"estimation_procedure={estimation_procedure}"
+            )
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "statistical_estimand_strategy_set", detail,
+                changes={"before": before, "after": protocol["statistical_estimand_settings"]},
+            )
+            self._invalidate_gates_from(
+                state, "statistical_estimand", "statistical_estimand_settings changed"
+            )
+            self.save(state)
         return state
 
     def propose_estimation_procedure(
@@ -4869,7 +4985,28 @@ class WorkflowManager:
             reviewer_memory=self.reviewer_memory(reviewer) if reviewer else ReviewerMemory(),
         )
         prompt = build_design_dialogue_prompt(prompt_path, history=history, context=context)
-        return parse_companion_turn(llm(prompt))
+        turn = parse_companion_turn(llm(prompt))
+        if (
+            context.target_trial_gate_approved
+            and turn.proposed_action is not None
+            and turn.proposed_action.action in {
+                "set_target_trial_timing", "set_target_trial_estimand",
+            }
+        ):
+            # `set_target_trial_timing`/`set_target_trial_estimand` both
+            # raise once `target_trial` is approved. The prompt already tells
+            # the companion not to propose them then, but if it does anyway,
+            # drop the card here rather than render a confirm button that
+            # would only `ValueError` on click.
+            turn = CompanionTurn(
+                reply=(
+                    turn.reply
+                    + "\n\n(Not offering that as an action: changing the target-trial timing "
+                    "or estimand now needs the target_trial gate rejected first.)"
+                ),
+                proposed_action=None,
+            )
+        return turn
 
     def run_companion_turn(
         self,
@@ -5112,6 +5249,7 @@ class WorkflowManager:
         estimand_path = run_dir / "statistical_estimand.json"
         if not estimand_path.is_file():
             raise RuntimeError("Run and approve the statistical_estimand gate first")
+        self._require_statistical_estimand_gate(state)
         statistical_estimand = json.loads(estimand_path.read_text(encoding="utf-8"))
         if statistical_estimand.get("population_summary") != "CATE":
             raise RuntimeError(

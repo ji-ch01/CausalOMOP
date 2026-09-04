@@ -3448,9 +3448,16 @@ def _render_estimation_actions(manager: WorkflowManager, state: RunState, run_id
 
     with st.container(border=True):
         st.markdown("**3. Estimate the treatment effect**")
+        # `causal_estimation_allowed` (ExecutionAgent) does not track the
+        # statistical_estimand gate -- a reviewer who re-opened it by
+        # changing the censoring/procedure strategy leaves
+        # statistical_estimand.json on disk, and `run_estimation` now
+        # refuses until it is re-approved, so mirror that here.
+        estimand_gate_ok = state.gates["statistical_estimand"].status in {"approved", "provisional"}
         estimate_ready = (
             state.phase in {"execution", "diagnostics"}
             and dataset_ready and bool(readiness.get("causal_estimation_allowed"))
+            and estimand_gate_ok
         )
         st.badge(
             "Ready" if estimate_ready else "Not ready",
@@ -3483,11 +3490,18 @@ def _render_estimation_actions(manager: WorkflowManager, state: RunState, run_id
                 st.error(str(exc))
         st.caption(estimator_description)
         if not estimate_ready:
-            st.caption(
-                _not_ready_reason("Requires a materialized dataset and an allowed causal estimation.")
-                if dataset_ready
-                else "Waiting on: a materialized analytic dataset (step 1 above)."
-            )
+            if not dataset_ready:
+                reason = "Waiting on: a materialized analytic dataset (step 1 above)."
+            elif not estimand_gate_ok:
+                reason = _not_ready_reason(
+                    "The statistical_estimand gate was re-opened (the estimand strategy changed) "
+                    "-- re-approve it before estimating."
+                )
+            else:
+                reason = _not_ready_reason(
+                    "Requires a materialized dataset and an allowed causal estimation."
+                )
+            st.caption(reason)
 
 
 def _render_advanced_analyses(manager: WorkflowManager, state: RunState, run_dir: Path) -> None:

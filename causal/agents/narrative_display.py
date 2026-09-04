@@ -306,15 +306,17 @@ def _covariate_balance(diagnostics: dict[str, Any]) -> dict[str, Any]:
     }
     if n_flagged:
         block["plain_statement"] = (
-            f"After adjustment, {int(n_flagged)} of {len(balance)} covariates were still "
-            f"imbalanced between the groups (standardized mean difference above {threshold}"
+            f"Between the treatment groups in the analytic cohort (crude, before outcome-model "
+            f"adjustment), {int(n_flagged)} of {len(balance)} covariates were imbalanced "
+            f"(standardized mean difference above {threshold}"
             + (f", largest {largest}" if largest is not None else "")
             + "); residual confounding from those covariates cannot be excluded."
         )
     else:
         block["plain_statement"] = (
-            f"All {len(balance)} adjusted covariates were balanced between the groups after "
-            f"adjustment (standardized mean difference at or below {threshold})."
+            f"All {len(balance)} covariates were balanced between the treatment groups in the "
+            f"analytic cohort (crude, before outcome-model adjustment; standardized mean "
+            f"difference at or below {threshold})."
         )
     return block
 

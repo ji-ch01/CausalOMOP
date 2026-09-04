@@ -18,13 +18,66 @@ from causal.provenance import artifact_metadata
 from causal.orchestrator.workflow import (
     _LOCK_STALE_SECONDS,
     _RunLock,
+    _atomic_write_json,
+    _atomic_write_text,
     _check_mapping_coverage,
     _dispatch_estimator,
+    _gather_assumptions,
     _load_concept_specs,
     _mapping_coverage_roles,
     _mismatched_concept_domains,
 )
 from causal.queries import ConceptSetSpec
+
+
+class AtomicWriteTests(unittest.TestCase):
+    """Every persisted run artifact goes through `_atomic_write_json` /
+    `_atomic_write_text` -- the Streamlit UI reads run files holding no
+    `_RunLock`, so a partial write must never be observable."""
+
+    def test_text_write_is_atomic_and_leaves_no_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "cohort.sql"
+            _atomic_write_text(path, "SELECT 1")
+            self.assertEqual(path.read_text(encoding="utf-8"), "SELECT 1")
+            self.assertEqual(list(Path(temp).glob("*.tmp")), [])
+
+    def test_json_write_round_trips_and_leaves_no_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "estimation.json"
+            _atomic_write_json(path, {"b": 2, "a": [1, 2, 3]})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"b": 2, "a": [1, 2, 3]})
+            self.assertEqual(list(Path(temp).glob("*.tmp")), [])
+
+    def test_sidecar_name_keeps_the_original_suffix(self):
+        # `foo.json` and `foo.sql` written to the same dir must not collide
+        # on one `foo.tmp` sidecar.
+        with tempfile.TemporaryDirectory() as temp:
+            _atomic_write_text(Path(temp) / "foo.sql", "SELECT 1")
+            _atomic_write_json(Path(temp) / "foo.json", {"ok": True})
+            self.assertEqual((Path(temp) / "foo.sql").read_text(encoding="utf-8"), "SELECT 1")
+            self.assertEqual(json.loads((Path(temp) / "foo.json").read_text(encoding="utf-8")), {"ok": True})
+
+
+class GatherAssumptionsTests(unittest.TestCase):
+    def _call(self, cate=None):
+        return _gather_assumptions(
+            study_spec={}, readiness={}, cohort_manifest={}, dataset_manifest={},
+            diagnostics={}, estimand_block={}, cate=cate,
+        )
+
+    def test_no_cate_run_states_heterogeneity_was_not_examined_not_out_of_scope(self):
+        assumptions = self._call(cate=None)
+        joined = " ".join(assumptions)
+        self.assertIn("Treatment-effect heterogeneity was not examined", joined)
+        self.assertNotIn("Out of scope", joined)
+        self.assertNotIn("milestone #4", joined)
+
+    def test_cate_run_reports_the_subgroup_family_caveat(self):
+        assumptions = self._call(cate={"estimand": {"n_prespecified_subgroups_tested": 3}})
+        joined = " ".join(assumptions)
+        self.assertIn("prespecified subgroup family only", joined)
+        self.assertNotIn("Treatment-effect heterogeneity was not examined", joined)
 
 
 def _approve_pre_mapping_gates(manager, run_id, reviewer="tester"):
@@ -360,6 +413,27 @@ class WorkflowTests(unittest.TestCase):
             state = self.manager.advance(state.run_id)
         with self.assertRaises(RuntimeError):
             self.manager.run_design_companion_turn(state.run_id, _CapturingLLM("{}"), [])
+
+    def test_run_design_companion_turn_drops_timing_card_once_target_trial_approved(self):
+        state = self.manager.start(self._dag_protocol_path())
+        self.manager.run_hypothesis_agent(state.run_id)
+        self.manager.decide_gate(state.run_id, "target_trial", "approved", "tester")
+        state = self.manager.advance(state.run_id)
+        self.assertEqual(state.phase, "dag_review")
+        response = json.dumps({
+            "reply": "You want 90-day follow-up.",
+            "proposed_action": {
+                "action": "set_target_trial_timing",
+                "args": {"follow_up_days": 90, "comment": "anchor RCT"},
+            },
+        })
+        turn = self.manager.run_design_companion_turn(
+            state.run_id, _CapturingLLM(response), []
+        )
+        # `set_target_trial_timing` would only raise on confirm once the
+        # gate is approved, so the card is dropped and the reply says why.
+        self.assertIsNone(turn.proposed_action)
+        self.assertIn("target_trial gate rejected first", turn.reply)
 
     def _protocol_path_with_approved_concept_sets(self):
         """`_full_protocol_path` plus an approved population/treatment/
@@ -1904,6 +1978,20 @@ class WorkflowReviewCovariateWindowTests(unittest.TestCase):
         self.assertEqual(event["changes"]["after"]["window_start_hours"], -6)
         self.assertEqual(event["changes"]["after"]["window_end_hours"], 0)
 
+    def test_window_change_reopens_the_statistical_estimand_gate(self):
+        # A window change does not rename the materialized column, so
+        # `run_estimation`'s adjustment-set equality check never notices --
+        # the downstream `statistical_estimand`/`results` gates must reopen.
+        state = self.manager.load(self.state.run_id)
+        for gate in ("clinical_mapping", "analysis_plan", "statistical_estimand", "results"):
+            state.gates[gate].status = "approved"
+        self.manager.save(state)
+        state = self.manager.review_covariate_window(
+            self.state.run_id, "lactate", -6, 0, "Dr. Lee",
+        )
+        for gate in ("clinical_mapping", "analysis_plan", "statistical_estimand", "results"):
+            self.assertEqual(state.gates[gate].status, "pending", gate)
+
 
 class WorkflowSetExposureContrastTests(unittest.TestCase):
     """`set_exposure_contrast` records a reviewer's choice of
@@ -3338,6 +3426,28 @@ class WorkflowRunEstimationTests(WorkflowMaterializeAnalyticDatasetTests):
         with self.assertRaises(RuntimeError):
             self.manager.run_estimation(self.run_id)
 
+    def test_rejects_when_the_statistical_estimand_gate_was_invalidated(self):
+        """A reviewer who changes the censoring/procedure strategy after the
+        gate was approved re-opens it (`_invalidate_gate` -> pending) but
+        `statistical_estimand.json` deliberately stays on disk. `run_
+        estimation` must refuse rather than silently estimate against the
+        retracted strategy. The happy path (re-approve, then estimate) is
+        the standard fixture every other test in this class already runs."""
+        self.manager.set_statistical_estimand_strategy(
+            self.run_id,
+            missing_data_strategy="complete_case_analysis",
+            censoring_strategy="exclude_censored_before_analysis",
+            censoring_rationale="Re-reviewed: drop censored rows instead.",
+            reviewer="Dr. Lee",
+            estimation_procedure=self.ESTIMATION_PROCEDURE,
+        )
+        self.assertTrue((self.run_dir / "statistical_estimand.json").is_file())
+        self.assertEqual(
+            self.manager.load(self.run_id).gates["statistical_estimand"].status, "pending"
+        )
+        with self.assertRaisesRegex(RuntimeError, "statistical_estimand gate is not approved"):
+            self.manager.run_estimation(self.run_id)
+
 class WorkflowRunEstimationTMLETests(WorkflowRunEstimationTests):
     """`run_estimation` must dispatch to `TMLEAgent` -- not `EstimationAgent`
     -- when the reviewed `statistical_estimand.json` names
@@ -3598,6 +3708,19 @@ class WorkflowRunNegativeControlEstimationTests(WorkflowRunEstimationTests):
                 self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
             )
 
+    def test_negative_control_rejects_when_statistical_estimand_gate_invalidated(self):
+        self.manager.set_statistical_estimand_strategy(
+            self.run_id,
+            missing_data_strategy="complete_case_analysis",
+            censoring_strategy="exclude_censored_before_analysis",
+            censoring_rationale="Re-reviewed: drop censored rows instead.",
+            reviewer="Dr. Lee",
+        )
+        with self.assertRaisesRegex(RuntimeError, "statistical_estimand gate is not approved"):
+            self.manager.run_negative_control_estimation(
+                self.run_id, self.control_id, _FakeCohortRowsClient(_synthetic_cohort_csv()),
+            )
+
     def test_remains_callable_after_advancing_to_results_review(self):
         """Regression test: `run_negative_control_estimation` used to be
         pinned to `phase == "execution"` only, unlike its siblings
@@ -3765,6 +3888,16 @@ class WorkflowCausalReportTests(WorkflowRunEstimationTests):
         self.assertIn("causal_report.md", self.manager.load(self.run_id).artifacts)
         self.assertIn("An average treatment effect has been estimated", text)
 
+    def test_statistical_estimand_section_names_the_reviewed_procedure(self):
+        # A plain ATE run: the reviewed procedure and the estimation.json
+        # outcome model agree, and the CATE cross-check note is absent.
+        self.manager.advance(self.run_id)
+        self.manager.advance(self.run_id)
+        text = self.manager.build_causal_report(self.run_id).read_text(encoding="utf-8")
+        self.assertIn("Estimation procedure: plug_in_standardization", text)
+        self.assertNotIn("plug-in ATE cross-check", text)
+        self.assertNotIn("secondary cross-check", text)
+
     def test_results_gate_approves_once_estimation_exists(self):
         self.manager.advance(self.run_id)
         state = self.manager.advance(self.run_id)
@@ -3799,6 +3932,26 @@ class WorkflowCausalReportTests(WorkflowRunEstimationTests):
         text = report_path.read_text(encoding="utf-8")
         self.assertIn("| sensitivity_analysis.json | sensitivity_agent |", text)
         self.assertIn("| cate.json | cate_agent |", text)
+
+    def test_cate_run_labels_the_plug_in_ate_as_a_cross_check(self):
+        # For a CATE study `_dispatch_estimator` falls through to the plug-in
+        # g-computation (logistic outcome model) as a cross-check, while
+        # `statistical_estimand.json` records `super_learner_ensemble` for
+        # the forest -- the report must frame that pair as expected, not as
+        # a contradiction.
+        estimand_path = self.run_dir / "statistical_estimand.json"
+        estimand = json.loads(estimand_path.read_text(encoding="utf-8"))
+        estimand["population_summary"] = "CATE"
+        estimand["estimation_procedure"] = "causal_forest_dml"
+        estimand["outcome_model"] = "super_learner_ensemble"
+        estimand_path.write_text(json.dumps(estimand), encoding="utf-8")
+        self.manager.advance(self.run_id)
+        self.manager.advance(self.run_id)
+        text = self.manager.build_causal_report(self.run_id).read_text(encoding="utf-8")
+        self.assertIn("Estimation procedure: causal_forest_dml", text)
+        self.assertIn("Causal effect estimate (plug-in ATE cross-check)", text)
+        self.assertIn("secondary cross-check", text)
+        self.assertNotIn("This is the study's estimated average treatment effect", text)
 
     def test_report_snapshots_the_decision_memory(self):
         protocol_path = self.run_dir / "protocol.json"

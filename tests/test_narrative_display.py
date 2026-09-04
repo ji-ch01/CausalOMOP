@@ -74,6 +74,23 @@ class RoundingTests(unittest.TestCase):
         self.assertEqual(block["n_covariates_flagged"], 2)
         self.assertEqual(block["n_covariates_checked"], 2)
 
+    def test_balance_statement_is_framed_as_crude_pre_adjustment(self):
+        # `run_diagnostics` computes SMD on the raw analytic cohort, and
+        # g-computation/TMLE adjust through the outcome model rather than by
+        # rebalancing covariates -- so this SMD is a crude, before-adjustment
+        # quantity and the plain statement must not imply otherwise (it is
+        # copied verbatim into the narrative prompt and companion dialogue).
+        flagged = build_narrative_display(_ESTIMATION, _DIAGNOSTICS)["covariate_balance"]
+        self.assertIn("before outcome-model adjustment", flagged["plain_statement"])
+        self.assertNotIn("After adjustment", flagged["plain_statement"])
+        self.assertNotIn("after adjustment", flagged["plain_statement"])
+
+        balanced = build_narrative_display(
+            _ESTIMATION, {**_DIAGNOSTICS, "n_covariates_flagged": 0}
+        )["covariate_balance"]
+        self.assertIn("before outcome-model adjustment", balanced["plain_statement"])
+        self.assertNotIn("after adjustment", balanced["plain_statement"])
+
 
 class DerivedQuantityTests(unittest.TestCase):
     def test_nnt_omitted_when_interval_includes_no_effect(self):
