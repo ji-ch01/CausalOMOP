@@ -151,7 +151,13 @@ amplify bias from unmeasured confounding.
   external inspection, plus the evidence/adjustment-set metrics from §7 on
   stderr; the Streamlit app's "Hypothesis & DAG" tab renders the graph
   (Graphviz), the identification/clinical verdicts, the same metrics, and
-  the accept/reject covariate review flow.
+  the accept/reject covariate review flow. `workflow compare-reference-dag
+  <run_id> --reference <study>` scores this run's generated DAG against a
+  hand-built `studies/*/reference_dag.json` (§9's label alignment +
+  SHD/SID), printing the matched pairs and every unmatched label on each
+  side; `--alias "cand=ref"` forces a pair, `--merge "MERGED=m1|m2"` folds a
+  covariate family into one node, `--json` emits the full
+  `ReferenceDagComparison`.
 
 ## 4. Test coverage
 
@@ -163,6 +169,7 @@ amplify bias from unmeasured confounding.
 | `tests/test_dag_tournament.py` | 221 | SHD, lexicographic ranking, SHD-based dedup, and all four merge-conflict types (`role`/`direction`/`cycle`/`structural`) in isolation |
 | `tests/test_workflow.py` | 357 | gate blocking behavior, covariate review, run lifecycle |
 | `tests/test_cli_dag_export.py` | 90 | `workflow dag-export` end to end through the real `causal.cli.main()` entry point |
+| `tests/test_cli_compare_reference_dag.py` | 210 | `workflow compare-reference-dag` end to end: label alignment, `--json`, `--alias`, `--merge`, error paths |
 
 Line counts drift with the codebase; re-run `python -m pytest tests -q` rather
 than trusting the table above for a current figure.
@@ -213,7 +220,7 @@ than trusting the table above for a current figure.
   by hand, was considered and set aside: most clinical questions have no
   published DAG to find, so it would add an LLM/search cost for a
   rarely-successful lookup.
-- **Reference-DAG comparison artifacts exist, comparison not yet run.**
+- **Reference-DAG comparison: tooling ready, one input still missing.**
   Three question-bank studies carry a `reference_dag.json` in the same
   `candidate_dag`/`covariate_relations` shape the rest of the pipeline uses,
   with per-node provenance: `studies/ppi_vs_h2ra_sup_mortality/`,
@@ -223,10 +230,17 @@ than trusting the table above for a current figure.
   publish no DAG figure) and carries explicitly unobserved confounders, so
   conditioning on the full observed set still leaves an open backdoor path.
   `tests/test_reference_dag_question_bank.py` guards the artifacts against
-  silently breaking. Comparing one of these references against a
-  CausalOMOP-*generated* DAG for the same study — the "how close is automated
-  drafting to expert judgment" number — is not done yet: no `candidate_dag`
-  has been drafted for these studies through the pipeline itself.
+  silently breaking. `causal.agents.dag_metrics.compare_generated_to_reference`
+  (CLI: `workflow compare-reference-dag <run_id> --reference <study>`) now
+  does the scoring end to end: `align_labels` reconciles the two free-text
+  label sets (§9), `relabel_dag` moves the generated DAG into the reference's
+  namespace, and SHD / SID (both directions) are computed over the aligned
+  graphs, with every unmatched label on each side reported for review. The
+  one input still missing is a CausalOMOP-*generated* `candidate_dag` for
+  these studies — no pipeline run has drafted one yet (all six
+  `artifacts/runs/` entries stop at `target_trial_review`), so the "how close
+  is automated drafting to expert judgment" number is one end-to-end run
+  away, not a build task.
 - **`minimum_adjustment_sets` does not scale to a realistically-sized
   reference DAG.** The `corticosteroids_severe_cap_mortality` reference DAG
   has 20 confounders, 17 of them *observed*, and — because 3 are transcribed
@@ -427,7 +441,25 @@ it:
   clinically-identical concept with different free-text labels (e.g. "age"
   vs. "patient age") are treated as genuinely different variables, the same
   class of limitation already flagged for OptimusKG's substring matching in
-  §6. `dedup_candidates`'s `duplicate_threshold` defaults to `0`: the SHD
+  §6. For the *reference-DAG* comparison specifically (an LLM draft vs a
+  hand-built `studies/*/reference_dag.json`, where the label mismatch is
+  systematic rather than occasional), `causal.agents.dag_metrics.align_labels`
+  reconciles the two label sets first — exact normalized match, then a
+  Sørensen–Dice token-overlap match above a threshold, with an optional
+  hand-supplied alias map taking precedence — and reports every unmatched
+  label on each side so the correspondence is a reviewed one, not accidental
+  string equality. It stays deterministic and LLM-free, and one-to-one. When
+  a reference DAG folds a covariate family into a single node while the
+  generated draft lists each member separately (e.g.
+  `vanco_piptazo_vs_cefepime_aki`'s one "Nephrotoxin co-exposure cluster"
+  node vs six or seven per-drug covariates), `align_labels` correctly leaves
+  the members unmatched (many vs one is not a 1:1 correspondence);
+  `merge_dag_nodes` — CLI `--merge "MERGED=m1|m2|..."` — collapses the named
+  members into one node (edge union, role/timing must be homogeneous) before
+  matching, so the reviewer makes that grouping call explicitly rather than
+  the aligner guessing it. The tournament dedup pass below uses neither
+  `align_labels` nor `merge_dag_nodes` — same-run candidates already share a
+  label vocabulary. `dedup_candidates`'s `duplicate_threshold` defaults to `0`: the SHD
   papers cited above define a *distance metric*, not a *near-duplicate
   cutoff*, so only structurally identical candidates are merged away by
   default rather than inventing a non-zero threshold nothing in the reviewed

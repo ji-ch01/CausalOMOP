@@ -2,9 +2,15 @@ import unittest
 
 from causal.agents.dag_critique import build_pre_check
 from causal.agents.dag_metrics import (
+    LabelAlignment,
+    ReferenceDagComparison,
+    align_labels,
+    compare_generated_to_reference,
     max_structural_hamming_distance,
     max_structural_intervention_distance,
+    merge_dag_nodes,
     normalized_agreement,
+    relabel_dag,
     structural_hamming_distance,
     structural_intervention_distance,
 )
@@ -195,6 +201,227 @@ class NormalizedAgreementTests(unittest.TestCase):
         # distance is 0, which would otherwise divide by zero.
         self.assertEqual(normalized_agreement(0, max_structural_hamming_distance(1)), 1.0)
         self.assertEqual(normalized_agreement(0, max_structural_hamming_distance(0)), 1.0)
+
+
+class LabelAlignmentTests(unittest.TestCase):
+    """`align_labels`: the deterministic, LLM-free label reconciliation that
+    lets a pipeline-generated DAG be scored against a hand-built
+    `reference_dag.json` without accidental string equality driving the
+    result (module docstring, docs/dag_generation_audit.md SS9)."""
+
+    def test_exact_match_after_normalization(self):
+        alignment = align_labels(["Chronic Liver Disease."], ["chronic liver disease"])
+        self.assertEqual(len(alignment.matches), 1)
+        match = alignment.matches[0]
+        self.assertEqual(match.method, "exact")
+        self.assertEqual(match.similarity, 1.0)
+        self.assertEqual(match.reference_label, "Chronic Liver Disease.")
+        self.assertEqual(match.candidate_label, "chronic liver disease")
+        self.assertEqual(alignment.unmatched_reference, ())
+        self.assertEqual(alignment.unmatched_candidate, ())
+
+    def test_token_overlap_match_above_threshold(self):
+        alignment = align_labels(["Age at ICU admission"], ["age"])
+        self.assertEqual(len(alignment.matches), 1)
+        self.assertEqual(alignment.matches[0].method, "token_overlap")
+        # {age} vs {age, icu, admission}: 2 * 1 / (1 + 3)
+        self.assertAlmostEqual(alignment.matches[0].similarity, 0.5)
+
+    def test_below_threshold_pair_is_left_unmatched(self):
+        alignment = align_labels(["Serum creatinine"], ["serum sodium"], min_similarity=0.75)
+        self.assertEqual(alignment.matches, ())
+        self.assertEqual(alignment.unmatched_reference, ("Serum creatinine",))
+        self.assertEqual(alignment.unmatched_candidate, ("serum sodium",))
+
+    def test_manual_alias_takes_precedence_and_is_recorded(self):
+        alignment = align_labels(
+            ["Illness severity (SOFA)"],
+            ["baseline organ-dysfunction burden"],
+            manual_aliases={"baseline organ-dysfunction burden": "Illness severity (SOFA)"},
+        )
+        self.assertEqual(len(alignment.matches), 1)
+        self.assertEqual(alignment.matches[0].method, "manual")
+        self.assertEqual(alignment.matches[0].similarity, 1.0)
+
+    def test_stale_manual_alias_raises(self):
+        with self.assertRaises(ValueError):
+            align_labels(["Age"], ["age"], manual_aliases={"not a candidate label": "Age"})
+        with self.assertRaises(ValueError):
+            align_labels(["Age"], ["age"], manual_aliases={"age": "not a reference label"})
+
+    def test_matching_is_one_to_one_and_greedy_by_similarity(self):
+        # Both reference labels share the token "disease" with the single
+        # candidate, but "chronic kidney disease" overlaps more -- it wins the
+        # candidate, and "chronic liver disease" is left unmatched rather than
+        # both mapping to the same candidate.
+        alignment = align_labels(
+            ["Chronic kidney disease", "Chronic liver disease"],
+            ["chronic kidney disease / renal replacement therapy"],
+        )
+        self.assertEqual(len(alignment.matches), 1)
+        self.assertEqual(alignment.matches[0].reference_label, "Chronic kidney disease")
+        self.assertEqual(alignment.unmatched_reference, ("Chronic liver disease",))
+
+    def test_result_is_deterministic_regardless_of_input_order(self):
+        reference = ["Age at admission", "Baseline SOFA score", "Prior GI bleeding"]
+        candidate = ["prior gi bleeding", "age at admission", "baseline sofa score"]
+        first = align_labels(reference, candidate).to_dict()
+        second = align_labels(list(reversed(reference)), list(reversed(candidate))).to_dict()
+        self.assertEqual(first["matches"], second["matches"])
+
+    def test_to_dict_is_json_safe_and_complete(self):
+        alignment = align_labels(["Age at ICU admission", "Frailty"], ["age", "sepsis"])
+        payload = alignment.to_dict()
+        self.assertEqual(payload["matched_count"], 1)
+        self.assertEqual(payload["unmatched_reference"], ["Frailty"])
+        self.assertEqual(payload["unmatched_candidate"], ["sepsis"])
+        self.assertEqual(
+            set(payload["matches"][0]), {"reference_label", "candidate_label", "method", "similarity"}
+        )
+
+
+class RelabelDagTests(unittest.TestCase):
+    def test_relabel_changes_labels_but_preserves_edges(self):
+        original = _dag_from_candidate([_variable("age"), _variable("severity")])
+        relabeled = relabel_dag(original, {"age": "Age at ICU admission"})
+        labels = {node.label for node in relabeled.nodes}
+        self.assertIn("Age at ICU admission", labels)
+        self.assertNotIn("age", labels)
+        # Same structure -- only a label changed -- so SHD/SID to the original
+        # (which still says "age") is driven purely by that one renamed node.
+        self.assertEqual(
+            structural_hamming_distance(original, relabel_dag(original, {})), 0
+        )
+
+    def test_relabel_rejects_a_non_injective_map(self):
+        original = _dag_from_candidate([_variable("age"), _variable("severity")])
+        with self.assertRaises(ValueError):
+            relabel_dag(original, {"age": "shared", "severity": "shared"})
+
+
+class ReferenceDagComparisonTests(unittest.TestCase):
+    """`compare_generated_to_reference`: align first, then score with
+    SHD/SID, treating the reference as the true graph."""
+
+    def test_same_structure_different_labels_scores_zero_after_alignment(self):
+        reference = _dag_from_candidate([_variable("Age at ICU admission")])
+        generated = _dag_from_candidate([_variable("age")])
+        comparison = compare_generated_to_reference(reference, generated)
+        self.assertIsInstance(comparison, ReferenceDagComparison)
+        self.assertEqual(comparison.shd, 0)
+        self.assertEqual(comparison.sid_generated_vs_reference, 0)
+        self.assertEqual(comparison.structural_agreement, 1.0)
+        self.assertEqual(comparison.alignment.unmatched_reference, ())
+
+    def test_alignment_collapses_a_distance_that_bare_labels_inflate(self):
+        reference = _dag_from_candidate([_variable("Age at ICU admission"), _variable("Baseline SOFA score")])
+        generated = _dag_from_candidate([_variable("age"), _variable("baseline SOFA score")])
+        aligned = compare_generated_to_reference(reference, generated).shd
+        bare = structural_hamming_distance(reference, generated)
+        self.assertEqual(aligned, 0)
+        self.assertGreater(bare, aligned)
+
+    def test_missing_confounder_is_a_nonzero_sid_and_is_reported_unmatched(self):
+        reference = _dag_from_candidate([_variable("Age at ICU admission"), _variable("Septic shock")])
+        generated = _dag_from_candidate([_variable("age")])
+        comparison = compare_generated_to_reference(reference, generated)
+        self.assertGreater(comparison.sid_generated_vs_reference, 0)
+        self.assertEqual(comparison.alignment.unmatched_reference, ("Septic shock",))
+        self.assertEqual(comparison.shared_label_count, 3)  # exposure, outcome, age
+        self.assertEqual(comparison.union_label_count, 4)
+
+    def test_manual_aliases_flow_through_to_the_comparison(self):
+        reference = _dag_from_candidate([_variable("Illness severity (SOFA)")])
+        generated = _dag_from_candidate([_variable("organ dysfunction burden")])
+        without = compare_generated_to_reference(reference, generated)
+        self.assertEqual(without.alignment.unmatched_reference, ("Illness severity (SOFA)",))
+        with_alias = compare_generated_to_reference(
+            reference, generated,
+            manual_aliases={"organ dysfunction burden": "Illness severity (SOFA)"},
+        )
+        self.assertEqual(with_alias.shd, 0)
+        self.assertEqual(with_alias.alignment.matches[0].method, "manual")
+
+    def test_to_dict_is_json_safe(self):
+        reference = _dag_from_candidate([_variable("Age at ICU admission")])
+        generated = _dag_from_candidate([_variable("age")])
+        payload = compare_generated_to_reference(reference, generated).to_dict()
+        self.assertEqual(
+            set(payload),
+            {
+                "alignment", "shared_label_count", "union_label_count", "shd",
+                "sid_generated_vs_reference", "sid_reference_vs_generated",
+                "structural_agreement", "causal_agreement",
+            },
+        )
+        self.assertIsInstance(payload["alignment"]["matches"], list)
+
+
+class MergeDagNodesTests(unittest.TestCase):
+    """`merge_dag_nodes`: collapse a covariate family the generated DAG lists
+    separately into the one node a reference DAG represents it as."""
+
+    def test_merge_collapses_members_into_one_node_with_unioned_edges(self):
+        dag = _dag_from_candidate(
+            [_variable("nsaid"), _variable("contrast"), _variable("aminoglycoside"), _variable("age")]
+        )
+        merged = merge_dag_nodes(
+            dag, {"Nephrotoxin cluster": ["nsaid", "contrast", "aminoglycoside"]}
+        )
+        labels = {node.label for node in merged.nodes}
+        self.assertIn("Nephrotoxin cluster", labels)
+        self.assertEqual(labels & {"nsaid", "contrast", "aminoglycoside"}, set())
+        self.assertIn("age", labels)
+        # The three confounders each wired to exposure and outcome; the merged
+        # node keeps exactly one edge to each (deduped), so it scores like a
+        # single confounder.
+        single = _dag_from_candidate([_variable("Nephrotoxin cluster"), _variable("age")])
+        self.assertEqual(structural_hamming_distance(merged, single), 0)
+
+    def test_merge_is_observed_only_if_every_member_is(self):
+        dag = _dag_from_candidate(
+            [_variable("measured", observed=True), _variable("latent", observed=False)]
+        )
+        merged = merge_dag_nodes(dag, {"family": ["measured", "latent"]})
+        family = next(node for node in merged.nodes if node.label == "family")
+        self.assertFalse(family.observed)
+
+    def test_unknown_member_label_raises(self):
+        dag = _dag_from_candidate([_variable("age")])
+        with self.assertRaises(ValueError):
+            merge_dag_nodes(dag, {"family": ["age", "not a node"]})
+
+    def test_group_cannot_include_exposure_or_outcome(self):
+        dag = _dag_from_candidate([_variable("age")])
+        exposure_label = dag.node_map[dag.exposure_id].label
+        with self.assertRaises(ValueError):
+            merge_dag_nodes(dag, {"family": ["age", exposure_label]})
+
+    def test_heterogeneous_group_is_rejected(self):
+        dag = _dag_from_candidate(
+            [_variable("conf", role="confounder"), _variable("mod", role="effect_modifier")]
+        )
+        with self.assertRaises(ValueError):
+            merge_dag_nodes(dag, {"family": ["conf", "mod"]})
+
+    def test_candidate_label_groups_flows_through_the_comparison(self):
+        reference = _dag_from_candidate([_variable("Nephrotoxin co-exposure"), _variable("Age")])
+        generated = _dag_from_candidate(
+            [_variable("NSAID use"), _variable("contrast use"), _variable("age")]
+        )
+        without = compare_generated_to_reference(reference, generated)
+        merged = compare_generated_to_reference(
+            reference, generated,
+            candidate_label_groups={"Nephrotoxin co-exposure": ["NSAID use", "contrast use"]},
+            manual_aliases={"age": "Age"},
+        )
+        self.assertLess(merged.shd, without.shd)
+        self.assertEqual(merged.alignment.unmatched_candidate, ())
+
+
+class LabelAlignmentTypeTests(unittest.TestCase):
+    def test_align_labels_returns_a_label_alignment(self):
+        self.assertIsInstance(align_labels(["a"], ["b"]), LabelAlignment)
 
 
 if __name__ == "__main__":

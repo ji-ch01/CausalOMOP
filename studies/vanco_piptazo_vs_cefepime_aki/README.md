@@ -72,7 +72,13 @@ association a randomized trial (ACORN) does not support - and whether the
 3. Map the nephrotoxin co-exposure covariate cluster (7 drug groups) and the
    neutropenia / intra-abdominal-source covariates.
 4. Generate and clinically review a candidate DAG; compute SHD/SID vs
-   `reference_dag.json`.
+   `reference_dag.json` with
+   `python -m causal.cli workflow compare-reference-dag <run_id> --reference vanco_piptazo_vs_cefepime_aki`.
+   The reference folds the seven nephrotoxin drug groups into a single
+   "Nephrotoxin co-exposure cluster" node, so pass the generated draft's
+   separate nephrotoxin covariates to `--merge "Nephrotoxin co-exposure
+   cluster (...)=<member>|<member>|..."` (see `causal.agents.dag_metrics.
+   merge_dag_nodes`) before reading the score.
 5. Propose and approve negative-control outcomes (e.g. outcomes with no
    plausible link to beta-lactam choice) via `causal/queries/negative_controls.py`,
    and run empirical calibration of the estimate against them.

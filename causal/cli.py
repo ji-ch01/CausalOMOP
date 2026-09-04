@@ -8,11 +8,13 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from causal.bigquery import BigQueryOMOPGateway, make_google_client
 from causal.config import BigQueryDatasets
 from causal.agents import HypothesisAgent
-from causal.agents.dag_identification import build_study_specification, review_dag
+from causal.agents.dag_identification import build_causal_dag, build_study_specification, review_dag
+from causal.agents.dag_metrics import compare_generated_to_reference
 from causal.agents.dag_tournament import MAX_TOURNAMENT_SIZE
 from causal.agents.hypothesis import (
     DAG_VARIABLE_AGGREGATIONS,
@@ -475,6 +477,35 @@ def main() -> int:
         "estimand, DAG) from protocol.json + hypothesis.json",
     )
     workflow_study_spec.add_argument("run_id")
+    workflow_compare_reference = workflow_sub.add_parser(
+        "compare-reference-dag",
+        help="score this run's generated DAG against a hand-built studies/*/reference_dag.json "
+        "(label alignment + SHD/SID); prints the alignment audit trail",
+    )
+    workflow_compare_reference.add_argument("run_id")
+    workflow_compare_reference.add_argument(
+        "--reference", required=True,
+        help="a studies/ name (e.g. 'ppi_vs_h2ra_sup_mortality') or a path to a directory "
+        "holding reference_dag.json + protocol.json",
+    )
+    workflow_compare_reference.add_argument(
+        "--alias", action="append", default=[], metavar="CANDIDATE=REFERENCE",
+        help="force a label pair the automatic matcher would miss (repeatable); "
+        "e.g. --alias \"organ dysfunction burden=Illness severity (SOFA)\"",
+    )
+    workflow_compare_reference.add_argument(
+        "--merge", action="append", default=[], metavar="MERGED='m1|m2|m3'",
+        help="collapse several generated-DAG nodes into one before matching, for a reference "
+        "node that represents a covariate family (repeatable); members are '|'-separated; "
+        "e.g. --merge \"Nephrotoxin cluster=NSAID exposure|contrast exposure|aminoglycoside exposure\"",
+    )
+    workflow_compare_reference.add_argument(
+        "--min-similarity", type=float, default=None,
+        help="token-overlap threshold for automatic matching (default 0.5; raise for stricter)",
+    )
+    workflow_compare_reference.add_argument(
+        "--json", action="store_true", help="print the full comparison as JSON on stdout",
+    )
     args = parser.parse_args()
     datasets = BigQueryDatasets.from_env()
 
@@ -840,6 +871,102 @@ def main() -> int:
                 f"counterfactual_contrast={spec.estimand.counterfactual_contrast!r}",
                 file=sys.stderr,
             )
+            return 0
+        elif args.workflow_command == "compare-reference-dag":
+            reference_arg = Path(args.reference)
+            reference_dir = reference_arg if reference_arg.is_dir() else Path("studies") / args.reference
+            reference_path = reference_dir / "reference_dag.json"
+            if not reference_path.is_file():
+                print(f"No reference_dag.json under {reference_dir}", file=sys.stderr)
+                return 1
+
+            aliases: dict[str, str] = {}
+            for item in args.alias:
+                if "=" not in item:
+                    print(f"--alias must be CANDIDATE=REFERENCE, got {item!r}", file=sys.stderr)
+                    return 1
+                candidate_label, reference_label = (part.strip() for part in item.split("=", 1))
+                aliases[candidate_label] = reference_label
+
+            merge_groups: dict[str, list[str]] = {}
+            for item in args.merge:
+                if "=" not in item:
+                    print(f"--merge must be MERGED='m1|m2', got {item!r}", file=sys.stderr)
+                    return 1
+                merged_label, members = item.split("=", 1)
+                member_labels = [part.strip() for part in members.split("|") if part.strip()]
+                if not member_labels:
+                    print(f"--merge {item!r} lists no members", file=sys.stderr)
+                    return 1
+                merge_groups[merged_label.strip()] = member_labels
+
+            run_protocol = json.loads(
+                (manager.runs_dir / args.run_id / "protocol.json").read_text(encoding="utf-8")
+            )
+            generated_dag = build_causal_dag(HypothesisAgent().run(run_protocol))
+
+            reference_json = json.loads(reference_path.read_text(encoding="utf-8"))
+            study_protocol_path = reference_dir / "protocol.json"
+            study_protocol = (
+                json.loads(study_protocol_path.read_text(encoding="utf-8"))
+                if study_protocol_path.is_file()
+                else run_protocol
+            )
+            reference_dag = build_causal_dag(HypothesisAgent().run({
+                **study_protocol,
+                "candidate_dag": reference_json["variables"],
+                "covariate_relations": reference_json.get("relations", []),
+            }))
+
+            compare_kwargs: dict[str, object] = {}
+            if aliases:
+                compare_kwargs["manual_aliases"] = aliases
+            if merge_groups:
+                compare_kwargs["candidate_label_groups"] = merge_groups
+            if args.min_similarity is not None:
+                compare_kwargs["min_similarity"] = args.min_similarity
+            try:
+                comparison = compare_generated_to_reference(
+                    reference_dag, generated_dag, **compare_kwargs
+                )
+            except ValueError as exc:
+                print(f"comparison failed: {exc}", file=sys.stderr)
+                return 1
+
+            if args.json:
+                print(json.dumps(comparison.to_dict(), indent=2))
+                return 0
+
+            alignment = comparison.alignment
+            print(f"reference : {reference_path}")
+            print(f"generated : {manager.runs_dir / args.run_id / 'protocol.json'}")
+            print()
+            print(f"matched {len(alignment.matches)} label(s):")
+            for match in alignment.matches:
+                print(
+                    f"  {match.candidate_label!r}  ->  {match.reference_label!r}  "
+                    f"[{match.method}, sim={match.similarity:.2f}]"
+                )
+            if alignment.unmatched_reference:
+                print()
+                print(f"reference labels with no generated match ({len(alignment.unmatched_reference)}):")
+                for label in alignment.unmatched_reference:
+                    print(f"  - {label}")
+            if alignment.unmatched_candidate:
+                print()
+                print(f"generated labels with no reference match ({len(alignment.unmatched_candidate)}):")
+                for label in alignment.unmatched_candidate:
+                    print(f"  - {label}")
+            print()
+            print(f"SHD (structural)                    : {comparison.shd}")
+            print(f"SID (generated vs reference-as-true) : {comparison.sid_generated_vs_reference}")
+            print(f"SID (reference vs generated-as-true) : {comparison.sid_reference_vs_generated}")
+            print(
+                f"shared / union labels               : "
+                f"{comparison.shared_label_count} / {comparison.union_label_count}"
+            )
+            print(f"structural agreement                 : {comparison.structural_agreement:.1%}")
+            print(f"causal agreement                     : {comparison.causal_agreement:.1%}")
             return 0
         else:
             state = manager.advance(args.run_id)
