@@ -1,0 +1,221 @@
+{
+  "study_id": "vanco_piptazo_vs_cefepime_aki_mimic_omop",
+  "status": "draft_pending_human_concept_and_dag_review",
+  "status_detail": "All three drugs are common, well-mapped IV prescriptions and the outcome is a creatinine-based lab phenotype, so this study is not blocked by the inputevents ETL gap (see docs/validation_question_bank.md, F1-F7). Remaining work before a run: (1) human approval of the vancomycin, piperacillin-tazobactam and cefepime concept sets and the KDIGO AKI phenotype; (2) generation and clinical review of a candidate DAG against reference_dag.json; (3) confirming creatinine coverage and the baseline-renal-function rule; (4) mapping the nephrotoxin co-exposure covariate cluster. Question bank id: Q5 - the headline diagnostic case.",
+  "source_question": "Among adult ICU patients started on empiric vancomycin plus an antipseudomonal beta-lactam, what is the effect of piperacillin-tazobactam versus cefepime as the beta-lactam partner on the incidence of KDIGO stage 2 or higher acute kidney injury within 7 days?",
+  "reference": {
+    "anchor_trial": {
+      "name": "ACORN",
+      "citation": "Qian ET, Casey JD, Wright A, et al. Cefepime vs Piperacillin-Tazobactam in Adults Hospitalized With Acute Infection: The ACORN Randomized Clinical Trial. JAMA. 2023;330(16):1557-1567.",
+      "doi": "10.1001/jama.2023.20583",
+      "design": "Pragmatic open-label single-centre RCT, Vanderbilt (ED and medical ICU), 2,511 patients (77.2% on vancomycin at enrolment).",
+      "result": "Highest stage of AKI or death by day 14 (5-level ordinal): OR 0.95 (95% CI 0.80-1.13), P=.56 - no AKI excess with piperacillin-tazobactam. Cefepime caused more neurological dysfunction."
+    },
+    "observational_contrast": [
+      {
+        "citation": "Luther MK, Timbrook TT, Caffrey AR, et al. Vancomycin Plus Piperacillin-Tazobactam and Acute Kidney Injury in Adults: A Systematic Review and Meta-Analysis. Crit Care Med. 2018;46(1):12-20.",
+        "doi": "10.1097/CCM.0000000000002769",
+        "result": "AKI odds vs vancomycin + cefepime or carbapenem: OR 2.68 (95% CI 1.83-3.91); vs vancomycin monotherapy OR 3.40 (2.57-4.50)."
+      },
+      {
+        "citation": "Vancomycin combined with piperacillin/tazobactam increases the risk of acute kidney injury compared with vancomycin plus other anti-pseudomonal beta-lactams: a systematic review and network meta-analysis. J Antimicrob Chemother. 2025;80(1):47-58.",
+        "doi": "10.1093/jac/dkae395",
+        "result": "AKI OR 2.55 (95% CI 2.00-3.28) vs vancomycin + cefepime. [verify pages]"
+      },
+      {
+        "citation": "Hammond DA, Smith MN, Li C, et al. Systematic Review and Meta-analysis of Acute Kidney Injury Associated With Concomitant Vancomycin and Piperacillin/Tazobactam. Clin Infect Dis. 2017;64(5):666-674.",
+        "doi": "10.1093/cid/ciw811"
+      }
+    ]
+  },
+  "data_source": "runtime-configured restricted OMOP dataset (MIMIC-IV v2.2 -> OMOP CDM 5.3.1, OHDSI/MIMIC ETL)",
+  "target_trial": {
+    "population": "Adult ICU patients started on empiric vancomycin plus an antipseudomonal beta-lactam",
+    "treatment": "Piperacillin-tazobactam as the antipseudomonal beta-lactam partner, started within 24 hours of the first vancomycin dose",
+    "comparator": "Cefepime as the antipseudomonal beta-lactam partner, started within 24 hours of the first vancomycin dose",
+    "time_zero": "The first calendar day on which both vancomycin and the beta-lactam partner are co-administered",
+    "grace_period_hours": 24,
+    "outcome": "KDIGO stage 2 or higher acute kidney injury within 7 days of time zero (serum-creatinine criteria: at least 2.0x the baseline value, or dialysis initiation)",
+    "follow_up_days": 7,
+    "primary_estimand": "ATE",
+    "secondary_estimands": [
+      "ATE on any KDIGO AKI (stage 1 or higher) within 7 days",
+      "ATE on a major adverse kidney event composite within 30 days (death, new renal replacement therapy, or failure of serum creatinine to return to <= 1.5x baseline)",
+      "ATE on new renal replacement therapy within 14 days"
+    ],
+    "eligibility_criteria": [
+      "Adult (>=18 years) at ICU admission",
+      "First vancomycin course of the hospital stay, started in the ICU",
+      "Piperacillin-tazobactam or cefepime (exactly one, not both) co-administered within 24 hours of the first vancomycin dose",
+      "First ICU stay per patient only",
+      "No pre-existing end-stage kidney disease and not on chronic dialysis; baseline eGFR >= 30 mL/min/1.73m2 (a >= 60 cut-off is a prespecified sensitivity analysis)",
+      "At least one baseline serum creatinine in the 7 days before or on the day of time zero, and at least one follow-up creatinine",
+      "Not already meeting KDIGO stage 2 AKI at time zero"
+    ],
+    "assignment_procedure": "Not randomized; the beta-lactam partner is chosen by the treating team based on the suspected source of infection, local resistance patterns, allergy history, and institutional stewardship guidance. An observational target-trial emulation of the ACORN comparison in a vancomycin-treated ICU population.",
+    "censoring_strategy": "Administrative censoring at the earlier of ICU discharge, death, or 7 days after time zero for the primary outcome (30 and 14 days for the respective secondaries). A patient who stops both antibiotics before day 7 without an AKI event is retained (intention-to-treat analog), with an at-risk-while-exposed sensitivity analysis prespecified.",
+    "analysis_strategy": "Intention-to-treat analog: the beta-lactam partner is fixed at time zero and later changes are not modelled. A per-protocol sensitivity analysis censoring at the first switch of the beta-lactam partner is prespecified.",
+    "effect_measure": "risk_difference",
+    "treatment_value": "Piperacillin-tazobactam as the beta-lactam partner to vancomycin",
+    "comparator_value": "Cefepime as the beta-lactam partner to vancomycin"
+  },
+  "design_constraints": [
+    "Headline diagnostic case for the workshop paper. The pipeline is EXPECTED to reproduce the observational AKI association (odds ratio roughly 2 to 2.7): that association is real in observational data. The randomized truth (ACORN) is approximately null. The test is whether CausalOMOP's E-value, negative controls, and covariate-balance diagnostics correctly present this as an association a randomized trial does not support.",
+    "The KDIGO endpoint is mechanism-contaminated: piperacillin-tazobactam inhibits tubular creatinine secretion, raising measured serum creatinine without a fall in true glomerular filtration rate (pseudotoxicity). This inflates the measured-AKI rate on the piperacillin-tazobactam arm through a path that is NOT confounding and is NOT closed by any adjustment set. State this explicitly - it is part of the lesson. A cystatin-C-based sensitivity analysis is not possible on MIMIC.",
+    "Active-comparator new-user design on the beta-lactam partner, with vancomycin co-exposure as the shared inclusion trigger. This controls confounding by the indication for broad-spectrum cover but not channelling by the specific source of infection.",
+    "The nephrotoxin co-exposure cluster (iodinated contrast within 72 h, NSAIDs, aminoglycosides, amphotericin B, loop diuretics, ACE inhibitors / ARBs, calcineurin inhibitors) is a required covariate group, ascertained strictly before time zero.",
+    "Neutropenia / haematological malignancy channels toward cefepime (febrile-neutropenia guidance) and independently affects AKI risk - a required covariate.",
+    "Suspected intra-abdominal source channels toward piperacillin-tazobactam and also affects AKI risk - a required covariate.",
+    "Calendar year is a confounder: the vancomycin + piperacillin-tazobactam nephrotoxicity literature itself changed ICU prescribing across 2015-2019.",
+    "Do not promote text-matched drug names to executable concept sets without human review."
+  ],
+  "concept_sets": {
+    "vancomycin": {
+      "role": "population_qualifier",
+      "domain": "drug",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        1707687
+      ],
+      "lookup_term": "vancomycin",
+      "note": "Restrict to systemic (intravenous) vancomycin; exclude oral vancomycin (used for Clostridioides difficile, negligible systemic absorption and no nephrotoxicity signal). Vancomycin is the shared inclusion trigger for both arms, not the exposure contrast.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "seed_concepts": {
+          "1707687": "vancomycin + descendants (196,777 drug_exposure rows / 44,542 persons)"
+        },
+        "route_rule": "restrict to intravenous vancomycin; exclude oral vancomycin (C difficile, no nephrotoxicity signal) via route_concept_id or the oral clinical-drug descendants",
+        "name_matched_unmapped_rows": "124 (drug_concept_id=0) - negligible"
+      }
+    },
+    "piperacillin_tazobactam": {
+      "role": "treatment",
+      "domain": "drug",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        1746114
+      ],
+      "lookup_term": "piperacillin tazobactam",
+      "note": "Approve the RxNorm piperacillin/tazobactam combination concept plus descendants. Piperacillin alone (no tazobactam) is rare in this era; decide inclusion explicitly.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "method": "RxNorm Ingredient 'piperacillin' + concept_ancestor usage on data/mimiciv_omop.duckdb",
+        "seed_concepts": {
+          "1746114": "piperacillin + descendants (43,940 drug_exposure rows / 15,613 persons)",
+          "1741122": "tazobactam + descendants (44,057 / 15,624)"
+        },
+        "combination_note": "OMOP/RxNorm keeps piperacillin and tazobactam as two ingredients; no single standard 'piperacillin/tazobactam' concept exists in this build (only branded drugs). The near-identical piperacillin and tazobactam counts confirm essentially all piperacillin in MIMIC is piperacillin-tazobactam. Define the arm as descendants of piperacillin (1746114); piperacillin monotherapy is negligible in 2008-2019. A stricter definition = drug concepts whose name contains both 'piperacillin' and 'tazobactam'."
+      }
+    },
+    "cefepime": {
+      "role": "comparator",
+      "domain": "drug",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        1748975
+      ],
+      "lookup_term": "cefepime",
+      "note": "Approve the RxNorm cefepime ingredient plus descendants. A meropenem comparator arm is a possible extension (the observational meta-analyses also report vancomycin + carbapenem) but is out of scope for the ACORN-anchored primary.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "seed_concepts": {
+          "1748975": "cefepime + descendants (61,104 drug_exposure rows / 17,913 persons)"
+        },
+        "name_matched_unmapped_rows": "10 - negligible"
+      }
+    },
+    "kdigo_acute_kidney_injury": {
+      "role": "outcome",
+      "domain": "measurement",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        3016723
+      ],
+      "lookup_term": "creatinine serum",
+      "note": "Derived phenotype, not a condition code. Baseline creatinine = the lowest value in the 7 days before or on the day of time zero (fall back to the first ICU value, or an MDRD-estimated value for eGFR 75, only in a documented sensitivity analysis). KDIGO stage 2 = creatinine >= 2.0x baseline; stage 3 = >= 3.0x baseline or >= 4.0 mg/dL with an acute rise, or new dialysis. Urine-output KDIGO criteria are added only if outputevents-derived measurements are confirmed present on this build.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "method": "LOINC Measurement match + measurement usage on data/mimiciv_omop.duckdb",
+        "seed_concepts": {
+          "3016723": "Creatinine [Mass/volume] in Serum or Plasma (3,708,634 measurement rows / 239,896 persons) - THE creatinine concept in this build",
+          "3051825": "Creatinine [Mass/volume] in Blood (4,327 rows) - minor, optional union"
+        },
+        "phenotype_rule": "derived, not a code. baseline = lowest serum creatinine in the 7 days before/at time zero; KDIGO stage 2 = >= 2.0x baseline, stage 3 = >= 3.0x baseline or >= 4.0 mg/dL with acute rise or new dialysis. Confirm unit_concept_id (expect mg/dL). Urine-output KDIGO criteria only if outputevents-derived measurements are confirmed present.",
+        "new_dialysis_concepts": "resolve RRT procedure concepts at mapping time for the stage-3 dialysis criterion and the MAKE secondary"
+      }
+    }
+  },
+  "query_settings": {
+    "exposure_contrast": "mutually_exclusive",
+    "care_site_names": [
+      "Medical Intensive Care Unit (MICU)",
+      "Cardiac Vascular Intensive Care Unit (CVICU)",
+      "Medical/Surgical Intensive Care Unit (MICU/SICU)",
+      "Surgical Intensive Care Unit (SICU)",
+      "Trauma SICU (TSICU)",
+      "Coronary Care Unit (CCU)",
+      "Neuro Surgical Intensive Care Unit (Neuro SICU)"
+    ],
+    "min_age_years": 18
+  },
+  "first_pass_covariates": [
+    "age",
+    "sex",
+    "baseline serum creatinine / estimated GFR",
+    "chronic kidney disease",
+    "diabetes mellitus",
+    "congestive heart failure",
+    "chronic liver disease / cirrhosis",
+    "baseline illness-severity score (SOFA components at time zero)",
+    "septic shock / vasopressor exposure at time zero",
+    "hypotension (lowest MAP in the 24 h before time zero)",
+    "iodinated contrast exposure within 72 h before time zero",
+    "concomitant NSAID exposure at baseline",
+    "concomitant aminoglycoside exposure at baseline",
+    "concomitant amphotericin B exposure at baseline",
+    "concomitant loop diuretic exposure at baseline",
+    "concomitant ACE inhibitor or ARB exposure at baseline",
+    "neutropenia or haematological malignancy",
+    "suspected intra-abdominal source of infection",
+    "weight / body mass index",
+    "care_site (ICU unit)",
+    "calendar year of admission"
+  ],
+  "published_benchmarks": {
+    "source": "ACORN, JAMA 2023;330(16):1557-1567, doi:10.1001/jama.2023.20583 (verified Sept 2026); observational meta-analyses Luther CCM 2018 (doi:10.1097/CCM.0000000000002769) and JAC 2025 network MA (doi:10.1093/jac/dkae395, [verify pages]). Read the exact figures from the primary texts before scoring.",
+    "acorn_aki_or_death_day14_odds_ratio": 0.95,
+    "acorn_aki_or_death_day14_or_ci": [
+      0.8,
+      1.13
+    ],
+    "acorn_aki_or_death_day14_p_value": 0.56,
+    "observational_aki_odds_ratio_vs_cefepime_luther": 2.68,
+    "observational_aki_or_ci_luther": [
+      1.83,
+      3.91
+    ],
+    "observational_aki_odds_ratio_vs_cefepime_network_ma": 2.55,
+    "observational_aki_or_ci_network_ma": [
+      2.0,
+      3.28
+    ],
+    "expected_pipeline_result": "The pipeline should reproduce an elevated AKI risk difference on the piperacillin-tazobactam arm (consistent with the observational OR ~2-2.7). Success is not a null estimate; success is the E-value / negative-control / balance diagnostics correctly flagging that estimate as an association a randomized trial (ACORN, OR 0.95) does not support, and the report naming both the residual-confounding and the creatinine-pseudotoxicity mechanisms."
+  },
+  "feasibility_checklist": {
+    "F1_exposure_is_drug_or_coded_procedure": "PASS - vancomycin, piperacillin-tazobactam and cefepime are common, well-mapped IV prescriptions.",
+    "F2_ever_exposed_in_window_is_enough": "PASS - the contrast is which beta-lactam partner is co-started; no dose or rate needed for the primary (vancomycin trough is a partial covariate).",
+    "F3_clean_index_short_window": "PASS - active-comparator new-user; time zero is the first co-administration day.",
+    "F4_outcome_reliably_captured": "PASS with a caveat - serum creatinine is among the best-covered measurement concepts; the KDIGO derivation is standard. The endpoint is mechanism-contaminated by pseudotoxicity (see design_constraints), which is intentional for this case.",
+    "F5_population_phenotype": "PASS - structural (vancomycin + beta-lactam partner + baseline-renal rule).",
+    "F6_adequate_n_and_followup": "PASS - each arm expected in the low thousands; 7-day follow-up is fully in-hospital.",
+    "F7_confounders_measurable": "PASS - baseline creatinine, comorbidity, sepsis severity, hypotension, and the nephrotoxin co-exposure cluster are all in drug_exposure / measurement / condition_occurrence. Institutional antibiogram is not (see reference_dag.json)."
+  },
+  "_feasibility_snapshot_2026_09_03": {
+    "note": "Crude co-exposure among the 44,542 vancomycin persons, BEFORE same-day co-start / new-user / baseline-renal / no-AKI-at-baseline rules. See concept_audit.md.",
+    "vancomycin_persons": 44542,
+    "crude_piptazo_only_ever": 7684,
+    "crude_cefepime_only_ever": 10722,
+    "crude_both_ever": 5877,
+    "expected_analytic_cohort": "roughly 3,000-6,000 per arm after co-start-within-24h + new-user + baseline eGFR>=30 + not-already-KDIGO-2 rules"
+  }
+}

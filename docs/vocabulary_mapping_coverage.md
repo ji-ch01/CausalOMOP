@@ -19,7 +19,10 @@ update, but coverage remained highly uneven across specific drug
 products even after that update, and the second table's gap has not been
 addressed at all. This is reported as a property of the data conversion
 this project draws on, evaluated at two points in time, not resolved by
-this pipeline itself.
+this pipeline itself. A third, distinct limitation -- the source
+`inputevents` table is not staged at all, so intensive-care infusions are
+absent or order-only regardless of vocabulary coverage -- is described
+under "Infusion administrations" below.
 
 ## Background: what "unmapped" means in OMOP CDM
 
@@ -101,6 +104,31 @@ patient-level data leaves the database):
   represent would require the source system's own item dictionary, which
   is outside the converted OMOP dataset. This gap has not been touched by
   the vocabulary update described above and remains fully open.
+
+### Infusion administrations: a table-scope gap, not a mapping gap
+
+Separate from `concept_id = 0` coverage, the OHDSI/MIMIC conversion this
+project reads does not stage the source `inputevents` table at all. Drug
+exposures are derived from prescription **orders** (`drug_type_concept_id =
+32838`): an order carries an order time but no dose, no infusion rate, and no
+administration/infusion-start timestamp. The consequence is that clinical
+events given predominantly or exclusively as intravenous infusions are
+either **absent entirely** or present only as an order with no quantitative
+detail -- among them resuscitation crystalloids and colloids (albumin),
+blood products, titrated vasopressors, sedation infusions, and intravenous
+insulin. Standard vocabulary concepts for these substances exist and are
+loaded; the gap is that the source rows describing the infusions are never
+converted, so no concept set -- however well mapped -- can recover them.
+
+This is a property of the source conversion's table scope, verified by
+direct audit of the converted dataset (zero rows via `concept_ancestor`
+expansion for infusion-only ingredients; `d_items_to_concept.csv` carries
+the infusion itemids only as unmapped stubs). It matters for any
+intensive-care causal question whose exposure, time zero, or a key covariate
+is an infusion: such a question cannot be operationalised on the current ETL
+and needs an `inputevents` extension upstream first. `causal/queries/`
+feasibility checks and the mapping audit surface a zero-patient or
+order-only exposure arm rather than proceeding silently.
 
 ## Implication for causal validity
 

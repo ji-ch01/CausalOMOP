@@ -5,10 +5,11 @@ one transparent, prespecified estimate (population ATE via g-computation or
 TMLE, or a CATE over a prespecified subgroup family via a causal forest --
 reviewer's choice), not as a clinical decision system or a source of
 clinical-grade causal conclusions. This guide uses the
-albumin/sepsis study as its running example because it is the pipeline's
-worked literature-comparison case; make clear to any audience that CausalOMOP
-itself is general-purpose and disease-agnostic, and that the study is a
-validation example, not the tool's scope (see
+PPI-vs-H2RA stress-ulcer-prophylaxis study
+([`studies/ppi_vs_h2ra_sup_mortality`](../studies/ppi_vs_h2ra_sup_mortality/README.md),
+question-bank Q1, anchored to PEPTIC) as its running example; make clear to
+any audience that CausalOMOP itself is general-purpose and disease-agnostic,
+and that the study is a validation example, not the tool's scope (see
 [README.md's References](../README.md#references)).
 
 ## Opening statement
@@ -45,7 +46,7 @@ count from documentation.
 From the versioned study protocol:
 
 ```powershell
-$state = python -m causal.cli workflow start studies\albumin_sepsis_28d\protocol.json |
+$state = python -m causal.cli workflow start studies\ppi_vs_h2ra_sup_mortality\protocol.json |
   ConvertFrom-Json
 $runId = $state.run_id
 python -m causal.cli workflow hypothesis $runId
@@ -54,7 +55,7 @@ python -m causal.cli workflow hypothesis $runId
 Or from a natural-language question:
 
 ```powershell
-python -m causal.cli workflow start-question "Among adult ICU patients with sepsis, what is the effect of albumin plus crystalloids versus crystalloids alone on 28-day mortality?"
+python -m causal.cli workflow start-question "Among ventilated adult ICU patients, what is the effect of proton pump inhibitor versus histamine-2 receptor antagonist stress-ulcer prophylaxis on in-hospital mortality?"
 ```
 
 Explain that the first LLM step classifies the question. Descriptive requests
@@ -274,12 +275,12 @@ without the conversation.
 - The reported ATE estimate has been validated against unmeasured
   confounding, joint positivity, or informative censoring -- it has not;
   see the report's own "Assumptions and limitations" section.
-- The albumin study has been reproduced.
+- A validation study has been reproduced end-to-end.
 - The system is ready for clinical use.
 
-Historical counts in the study's
-[concept audit](../studies/albumin_sepsis_28d/concept_audit.md) are dated
-feasibility snapshots, not portable current results.
+Historical counts in a study's
+[concept audit](../studies/ppi_vs_h2ra_sup_mortality/concept_audit.md) are
+dated feasibility snapshots, not portable current results.
 
 ## Live-demo fallback
 

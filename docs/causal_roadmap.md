@@ -43,10 +43,21 @@ already have a published, literature-grounded analysis with a known expert
 DAG or concept mapping, then running the actual pipeline against each one so
 its output can be compared to that published ground truth -- SHD/SID for DAG
 structure (`causal/agents/dag_metrics.py`), recall@k/MRR for concept mapping.
-The albumin/sepsis case in [studies/albumin_sepsis_28d](../studies/albumin_sepsis_28d/README.md)
-is the first such comparison case, not a description of what the pipeline is
-built to study; see [README.md's References](../README.md#references) for
-the full literature grounding, including a second candidate comparison case.
+Three scaffolded `studies/` packages carry this comparison --
+[ppi_vs_h2ra_sup_mortality](../studies/ppi_vs_h2ra_sup_mortality/README.md)
+(Q1, PEPTIC), [corticosteroids_severe_cap_mortality](../studies/corticosteroids_severe_cap_mortality/README.md)
+(Q8, CAPE COD), and [vanco_piptazo_vs_cefepime_aki](../studies/vanco_piptazo_vs_cefepime_aki/README.md)
+(Q5, ACORN) -- each a draft pending human review, not a description of what
+the pipeline is built to study. The selection criteria, the reference-anchored
+shortlist, and the ten-question operational set are in
+[docs/validation_study_candidates.md](validation_study_candidates.md) and
+[docs/validation_question_bank.md](validation_question_bank.md). A sepsis
+target trial whose exposure and time zero are intensive-care infusions
+(albumin plus crystalloids vs crystalloids, Doutreligne et al. 2025) is
+future work, blocked on an `inputevents` ETL extension (see
+[docs/vocabulary_mapping_coverage.md](vocabulary_mapping_coverage.md)). See
+[README.md's References](../README.md#references) for the full literature
+grounding.
 
 ## Current implementation map
 

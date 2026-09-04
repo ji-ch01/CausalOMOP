@@ -213,34 +213,38 @@ than trusting the table above for a current figure.
   by hand, was considered and set aside: most clinical questions have no
   published DAG to find, so it would add an LLM/search cost for a
   rarely-successful lookup.
-- **Reference-DAG comparison exists for one study, not yet run.**
-  `studies/albumin_sepsis_28d/reference_dag.json` transcribes the published
-  study's own expert DAG (S6 Fig, built by the paper's authors with a
-  clinician via DAGitty) into the same `candidate_dag`/`covariate_relations`
-  shape the rest of the pipeline uses, with per-node provenance and explicit
-  transcription-confidence notes (`source.transcription_notes`) for the
-  handful of edges that could not be read from the figure with full
-  confidence. `tests/test_reference_dag_albumin_sepsis.py` guards the
-  artifact against silently breaking. Comparing this reference against a
+- **Reference-DAG comparison artifacts exist, comparison not yet run.**
+  Three question-bank studies carry a `reference_dag.json` in the same
+  `candidate_dag`/`covariate_relations` shape the rest of the pipeline uses,
+  with per-node provenance: `studies/ppi_vs_h2ra_sup_mortality/`,
+  `studies/corticosteroids_severe_cap_mortality/`, and
+  `studies/vanco_piptazo_vs_cefepime_aki/`. Each is built from the anchor
+  trial's covariates plus clinical reasoning (PEPTIC / CAPE COD / ACORN
+  publish no DAG figure) and carries explicitly unobserved confounders, so
+  conditioning on the full observed set still leaves an open backdoor path.
+  `tests/test_reference_dag_question_bank.py` guards the artifacts against
+  silently breaking. Comparing one of these references against a
   CausalOMOP-*generated* DAG for the same study — the "how close is automated
   drafting to expert judgment" number — is not done yet: no `candidate_dag`
-  has been drafted for this study through the pipeline itself.
+  has been drafted for these studies through the pipeline itself.
 - **`minimum_adjustment_sets` does not scale to a realistically-sized
-  published DAG.** The reference DAG above has 20 *observed* baseline
-  confounders, and — because 3 more confounders are transcribed as unobserved
-  (matching the paper's own gray "not available in the data" nodes) — no
-  valid backdoor adjustment set exists among those 20 at *any* size.
+  reference DAG.** The `corticosteroids_severe_cap_mortality` reference DAG
+  has 20 confounders, 17 of them *observed*, and — because 3 are transcribed
+  as unobserved (radiographic extent of infiltrates, goals-of-care
+  limitation, frailty) — no valid backdoor adjustment set exists among the
+  observed ones at *any* size.
   `causal.agents.dag_critique.build_pre_check` (via `assess_identification`'s
   default `max_candidates=24`) calls `CausalDAG.minimum_adjustment_sets`,
   whose exhaustive `combinations` search cannot short-circuit in this
-  "no valid set exists" case: it must enumerate all `2**20` (~1e6) subsets
-  before concluding failure, which does not finish in practical time.
+  "no valid set exists" case: it must enumerate every subset of the observed
+  confounders before concluding failure, which does not finish in practical
+  time.
   `structural_intervention_distance`/`structural_hamming_distance` never
   needed that search in the first place — they only need the graph structure
-  — so `tests/test_reference_dag_albumin_sepsis.py` builds the `CausalDAG`
+  — so `tests/test_reference_dag_question_bank.py` builds the `CausalDAG`
   via `build_causal_dag` directly (skipping `assess_identification` entirely)
   instead of `build_pre_check`. This is a real, pre-existing scalability gap
-  in `minimum_adjustment_sets` for realistically-sized *published* DAGs
+  in `minimum_adjustment_sets` for realistically-sized reference DAGs
   (15–25 variables, well beyond a typical LLM-drafted candidate's handful),
   not yet fixed.
 - **OptimusKG schema is still unconfirmed against the installed dataset.**

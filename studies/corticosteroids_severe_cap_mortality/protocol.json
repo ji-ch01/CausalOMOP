@@ -1,0 +1,221 @@
+{
+  "study_id": "corticosteroids_severe_cap_mortality_mimic_omop",
+  "status": "draft_pending_human_concept_and_dag_review",
+  "status_detail": "The exposure is a prescription drug and the population is a condition-code phenotype tightened with a concurrent antibiotic course, so this study is not blocked by the inputevents ETL gap (see docs/validation_question_bank.md, F1-F7). Remaining work before a run: (1) human approval of the systemic-corticosteroid concept set and the severe-CAP phenotype (condition + antibiotic + severity marker); (2) generation and clinical review of a candidate DAG against reference_dag.json; (3) a positive-predictive-value check on the pneumonia phenotype; (4) confirming the non-CAP-steroid-indication exclusions. Question bank id: Q8.",
+  "source_question": "Among adults admitted to the ICU with severe community-acquired pneumonia, what is the effect of starting a systemic corticosteroid within 48 hours of admission, versus no systemic corticosteroid in that window, on in-hospital all-cause mortality?",
+  "reference": {
+    "anchor_trial": {
+      "name": "CAPE COD",
+      "citation": "Dequin PF, Meziani F, Quenot JP, et al. Hydrocortisone in Severe Community-Acquired Pneumonia. N Engl J Med. 2023;388(21):1931-1941.",
+      "doi": "10.1056/NEJMoa2215145",
+      "design": "Phase 3 double-blind placebo-controlled RCT, 31 French ICUs, 800 patients with severe CAP."
+    },
+    "supporting_syntheses": [
+      {
+        "citation": "Efficacy and safety of adjunctive corticosteroids in the treatment of severe community-acquired pneumonia: a systematic review and meta-analysis of randomized controlled trials. Crit Care. 2023;27:274.",
+        "doi": "10.1186/s13054-023-04561-z",
+        "note": "7 RCTs, 1,689 patients. Day-30 mortality RR 0.61 (95% CI 0.44-0.85); less mechanical ventilation RR 0.57 (0.45-0.73)."
+      },
+      {
+        "citation": "Torres A, Sibila O, Ferrer M, et al. Effect of corticosteroids on treatment failure among hospitalized patients with severe community-acquired pneumonia and high inflammatory response: a randomized clinical trial. JAMA. 2015;313(7):677-686.",
+        "doi": "10.1001/jama.2015.88"
+      },
+      {
+        "citation": "Blum CA, Nigro N, Briel M, et al. Adjunct prednisone therapy for patients with community-acquired pneumonia: a multicentre, double-blind, randomised, placebo-controlled trial. Lancet. 2015;385(9977):1511-1518.",
+        "doi": "10.1016/S0140-6736(14)62447-8"
+      }
+    ],
+    "counter_weight": [
+      {
+        "citation": "Meduri GU, Shih MC, Bridges L, et al. Low-dose methylprednisolone treatment in critically ill patients with severe community-acquired pneumonia (ESCAPe). Intensive Care Med. 2022;48(8):1009-1023.",
+        "doi": "10.1007/s00134-022-06684-3",
+        "note": "No 60-day mortality benefit in a predominantly older male VA population."
+      }
+    ]
+  },
+  "data_source": "runtime-configured restricted OMOP dataset (MIMIC-IV v2.2 -> OMOP CDM 5.3.1, OHDSI/MIMIC ETL)",
+  "target_trial": {
+    "population": "Adults admitted to the ICU with severe community-acquired pneumonia",
+    "treatment": "A systemic corticosteroid (hydrocortisone, methylprednisolone, prednisone, prednisolone, dexamethasone) ordered within 48 hours of hospital admission",
+    "comparator": "No systemic corticosteroid ordered within 48 hours of hospital admission",
+    "time_zero": "Hospital admission (the first inpatient visit of the qualifying encounter); the exposure-ascertainment window is the first 48 hours after it",
+    "grace_period_hours": 48,
+    "outcome": "In-hospital all-cause mortality",
+    "follow_up_days": 30,
+    "primary_estimand": "ATE",
+    "secondary_estimands": [
+      "ATE on 30-day all-cause mortality",
+      "ATE on new hyperglycaemia within 7 days (glucose >= 180 mg/dL or a new insulin order) - positive control for a real corticosteroid effect",
+      "ATE on the initiation of invasive mechanical ventilation after time zero (among those not ventilated at baseline)",
+      "CATE by baseline shock (vasopressor exposure at time zero) vs no shock"
+    ],
+    "eligibility_criteria": [
+      "Adult (>=18 years) at hospital admission",
+      "Community-acquired pneumonia recorded within 48 hours of admission (condition code), tightened by a concurrent antibiotic course started within 48 hours; hospital-acquired and ventilator-associated pneumonia codes are excluded, as are aspiration-pneumonia-only codes",
+      "Severe: ICU admission within 48 hours of hospital admission, OR vasopressor or invasive mechanical ventilation within 48 hours",
+      "First qualifying pneumonia admission per patient only",
+      "No systemic corticosteroid order in the 30 days before admission (new-user)",
+      "No competing systemic-corticosteroid indication documented at baseline: COPD or asthma exacerbation as the primary reason for admission, active autoimmune or inflammatory disease on maintenance steroids, adrenal insufficiency, recent solid-organ transplant, or a haematological malignancy on a steroid-containing chemotherapy protocol. A sensitivity analysis relaxing the COPD exclusion (adjusting for COPD instead) is prespecified."
+    ],
+    "assignment_procedure": "Not randomized; the decision to give a systemic corticosteroid is the treating team's, driven by perceived severity, the inflammatory picture, and any airway component. An observational target-trial emulation.",
+    "censoring_strategy": "For the in-hospital primary outcome, administrative censoring at hospital discharge. For the 30-day secondary, administrative censoring at the earlier of the end of observation or 30 days after time zero.",
+    "analysis_strategy": "Intention-to-treat analog: exposure status is fixed by a corticosteroid order in the 48-hour window and not updated afterward. A per-protocol sensitivity analysis requiring at least 3 consecutive days of corticosteroid is prespecified.",
+    "effect_measure": "risk_difference",
+    "treatment_value": "Systemic corticosteroid started within 48 hours of hospital admission",
+    "comparator_value": "No systemic corticosteroid within 48 hours of hospital admission"
+  },
+  "design_constraints": [
+    "This is the bank's clearest sensitivity test: the RCTs and a 7-trial meta-analysis agree on a mortality benefit in the severe stratum (risk difference roughly -3 to -6 percentage points). If the pipeline returns a null here it is too conservative.",
+    "Confounding by indication runs toward the null or toward harm (steroids are given to the sicker patient), so a recovered protective effect is a conservative demonstration, not an overstatement.",
+    "COPD is the single most important confounder: COPD patients with pneumonia receive steroids for the airway component and have a different baseline mortality. Exclude COPD-exacerbation-primary admissions; adjust for COPD as a comorbidity in the main model and test the relaxed-exclusion sensitivity analysis.",
+    "Baseline inflammatory markers (C-reactive protein, white cell count) and severity (SOFA, PaO2/FiO2, lactate) must be ascertained strictly before time zero.",
+    "Calendar year is a confounder: corticosteroid practice in CAP shifted across 2008-2019 (notably after the 2015 Blum and Torres trials).",
+    "New hyperglycaemia is a positive control - a real, expected corticosteroid effect. If it does not come out clearly positive, the covariate/outcome plumbing is wrong.",
+    "Do not promote text-matched drug or condition names to executable concept sets without human review."
+  ],
+  "concept_sets": {
+    "systemic_corticosteroid": {
+      "role": "treatment",
+      "domain": "drug",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        975125,
+        1506270,
+        1551099,
+        1550557,
+        1518254
+      ],
+      "lookup_term": "systemic corticosteroid",
+      "candidate_root_ingredients": [
+        "hydrocortisone",
+        "methylprednisolone",
+        "prednisone",
+        "prednisolone",
+        "dexamethasone"
+      ],
+      "note": "Approve RxNorm ingredient seeds plus concept_ancestor descendants. Restrict to systemic routes (oral, intravenous, intramuscular); exclude inhaled, topical, ophthalmic, intra-articular, and rectal formulations. Fludrocortisone is excluded from the primary (mineralocorticoid). Hydrocortisone given purely as stress-dose steroid for refractory shock is in-scope but should be flagged in the per-protocol analysis.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "method": "RxNorm Ingredient match + concept_ancestor usage on data/mimiciv_omop.duckdb (see concept_audit.md)",
+        "seed_concepts": {
+          "1551099": "prednisone (76,032 drug_exposure rows / 15,833 persons)",
+          "1518254": "dexamethasone (42,400 / 9,424) - also antiemetic/cerebral-oedema/COPD use; the non-CAP-indication exclusions matter most here",
+          "1506270": "methylprednisolone (27,745 / 8,283)",
+          "975125": "hydrocortisone (23,526 / 8,550)",
+          "1550557": "prednisolone (4,053 / 1,707)"
+        },
+        "route_rule": "restrict to systemic routes (oral / IV / IM); exclude inhaled, topical, ophthalmic, intra-articular, rectal via route_concept_id or descendant formulation concepts",
+        "name_matched_unmapped_rows": "prednisolone 153, hydrocortisone 221, methylprednisolone 131 (drug_concept_id=0) - small; spot-check advisable, not a coverage blocker",
+        "fludrocortisone": "excluded from the primary (mineralocorticoid)"
+      }
+    },
+    "community_acquired_pneumonia": {
+      "role": "population",
+      "domain": "condition",
+      "status": "candidate_resolved_pending_human_review_with_phenotype_caveat",
+      "concept_ids": [
+        255848
+      ],
+      "lookup_term": "community acquired pneumonia",
+      "candidate_root_concepts": [
+        "Pneumonia",
+        "Bacterial pneumonia",
+        "Lobar pneumonia",
+        "Community acquired pneumonia"
+      ],
+      "note": "PPV is the main risk. Tighten with a concurrent antibiotic course within 48 h. Exclude 'Ventilator associated pneumonia', 'Hospital acquired pneumonia', 'Pneumonitis due to aspiration' (unless co-coded with a bacterial pneumonia). A chest-imaging procedure within 48 h is an optional additional requirement for a high-specificity sensitivity analysis.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "method": "SNOMED Condition match + concept_ancestor usage on data/mimiciv_omop.duckdb",
+        "seed_concepts": {
+          "255848": "Pneumonia + descendants (24,798 condition_occurrence rows / 17,801 persons)",
+          "257315": "Bacterial pneumonia + descendants (4,801 / 3,913) - higher-specificity alternative seed"
+        },
+        "CAP_specific_code_absent": "4293463 'Community acquired pneumonia' has 0 rows in this build; MIMIC ICD coding does not distinguish CAP. Phenotype MUST be Pneumonia (255848) tightened by a concurrent antibiotic course <=48 h of admission, exclusion of ventilator-associated / hospital-acquired / aspiration-only codes, and optionally a chest-imaging procedure <=48 h. PPV check required before committing (F5).",
+        "descendant_exclusions_to_apply": [
+          "ventilator associated pneumonia",
+          "hospital acquired / healthcare associated pneumonia",
+          "aspiration pneumonia unless co-coded bacterial",
+          "non-infective pneumonitis"
+        ]
+      }
+    },
+    "systemic_antibiotic": {
+      "role": "population_qualifier",
+      "domain": "drug",
+      "status": "candidate_pending_human_review",
+      "concept_ids": [],
+      "lookup_term": "systemic antibacterial agent",
+      "note": "Used only to tighten the pneumonia phenotype (a concurrent antibiotic course started within 48 h of admission), not as an exposure or comparator.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "note": "Phenotype qualifier only, not exposure/comparator. Approve the ATC J01 'ANTIBACTERIALS FOR SYSTEMIC USE' subtree or an equivalent ingredient list at mapping time; an 'any systemic antibiotic within 48 h' flag does not need a precise curated set."
+      }
+    }
+  },
+  "query_settings": {
+    "exposure_contrast": "vs_unexposed",
+    "care_site_names": [
+      "Medical Intensive Care Unit (MICU)",
+      "Cardiac Vascular Intensive Care Unit (CVICU)",
+      "Medical/Surgical Intensive Care Unit (MICU/SICU)",
+      "Surgical Intensive Care Unit (SICU)",
+      "Trauma SICU (TSICU)",
+      "Coronary Care Unit (CCU)",
+      "Neuro Surgical Intensive Care Unit (Neuro SICU)"
+    ],
+    "min_age_years": 18
+  },
+  "first_pass_covariates": [
+    "age",
+    "sex",
+    "baseline illness-severity score (SOFA components at ICU admission)",
+    "PaO2/FiO2 ratio or lowest SpO2/FiO2 on day one",
+    "vasopressor exposure at time zero",
+    "invasive mechanical ventilation at time zero",
+    "baseline C-reactive protein and white cell count",
+    "baseline serum lactate",
+    "COPD",
+    "asthma",
+    "diabetes mellitus",
+    "chronic kidney disease",
+    "chronic liver disease",
+    "congestive heart failure",
+    "active cancer or immunosuppression",
+    "bacteraemia or identified pathogen (incl. influenza) within 48 h",
+    "care_site (ICU unit)",
+    "calendar year of admission"
+  ],
+  "published_benchmarks": {
+    "source": "CAPE COD, NEJM 2023;388(21):1931-1941, doi:10.1056/NEJMoa2215145; meta-analysis Crit Care 2023;27:274, doi:10.1186/s13054-023-04561-z. Read the exact figures from the primary texts before scoring.",
+    "cape_cod_28d_mortality_hydrocortisone": 0.062,
+    "cape_cod_28d_mortality_placebo": 0.119,
+    "cape_cod_28d_mortality_absolute_difference": -0.056,
+    "cape_cod_28d_mortality_ci": [
+      -0.096,
+      -0.017
+    ],
+    "meta_analysis_30d_mortality_rr": 0.61,
+    "meta_analysis_30d_mortality_rr_ci": [
+      0.44,
+      0.85
+    ],
+    "meta_analysis_mechanical_ventilation_rr": 0.57,
+    "expected_pipeline_result": "A genuine protective effect: risk difference roughly -3 to -6 percentage points in this severe stratum. New hyperglycaemia should come out clearly positive. Returning a null for mortality would indicate the pipeline is too conservative."
+  },
+  "feasibility_checklist": {
+    "F1_exposure_is_drug_or_coded_procedure": "PASS - all five corticosteroids are well-mapped prescriptions.",
+    "F2_ever_exposed_in_window_is_enough": "PASS - a corticosteroid order in the 48 h window defines the exposure; a per-protocol >=3-day analysis is secondary.",
+    "F3_clean_index_short_window": "PASS - new-user, clean hospital-admission index.",
+    "F4_outcome_reliably_captured": "PASS - in-hospital and 30-day mortality from the death record; hyperglycaemia from measurement.",
+    "F5_population_phenotype": "WARN - CAP is a condition-code phenotype; PPV depends on the concurrent-antibiotic requirement and the exclusion of HAP/VAP/aspiration-only codes. Run a PPV check before committing.",
+    "F6_adequate_n_and_followup": "PASS - severe-CAP ICU cohort roughly 5,000-8,000; corticosteroid-treated fraction roughly 25-40%.",
+    "F7_confounders_measurable": "PASS - severity, inflammatory markers, comorbidity history, pathogen, vasopressor/ventilation status, care_site, calendar year. Radiographic extent is not captured (see reference_dag.json)."
+  },
+  "_feasibility_snapshot_2026_09_03": {
+    "note": "Crude, BEFORE severity / new-user / non-CAP-indication exclusions (which shrink these substantially). See concept_audit.md.",
+    "pneumonia_persons_any": 17801,
+    "pneumonia_persons_with_any_systemic_steroid_ever": 7980,
+    "expected_eligible_after_severe_and_exclusions": "roughly 3,000-6,000 severe-CAP ICU patients, of whom ~1,000-2,500 steroid-treated within 48 h"
+  }
+}

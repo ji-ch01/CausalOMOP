@@ -1,0 +1,49 @@
+{
+  "source": {
+    "description": "Reference adjustment set for the vancomycin + piperacillin-tazobactam vs vancomycin + cefepime AKI question. NOT transcribed from a published DAG figure. ACORN (JAMA 2023;330(16):1557-1567) is a randomized trial and publishes no DAG; the observational meta-analyses report pooled adjusted odds ratios without a shared graph. The confounder list is constructed from (a) the covariates the observational vancomycin + piperacillin-tazobactam AKI studies adjust for (baseline renal function, sepsis severity, nephrotoxin co-exposure, ICU status), and (b) standard reasoning about what jointly drives the choice of beta-lactam partner and measured acute kidney injury. A defensible reference for SHD/SID comparison against a generated candidate DAG, not a gold standard.",
+    "anchor_trial_doi": "10.1001/jama.2023.20583",
+    "observational_contrast_doi": "10.1097/CCM.0000000000002769",
+    "constructed_on": "2026-09-03",
+    "constructed_by": "clinical reasoning + observational-emulation covariate extraction; not an author-drawn DAG",
+    "construction_notes": [
+      "Every observed node is a common cause of the exposure (piperacillin-tazobactam vs cefepime as the vancomycin partner) and the outcome (measured KDIGO stage >= 2 AKI within 7 days), encoded role='confounder', temporal_classification='pre_treatment'.",
+      "MEASUREMENT-BIAS PATH, not represented as a confounder: piperacillin-tazobactam inhibits tubular secretion of creatinine, raising measured serum creatinine without a true fall in glomerular filtration rate (pseudotoxicity). This is a direct exposure -> measured-outcome path that is NOT a backdoor path and is NOT closed by any adjustment set. It is captured here only as this note and in protocol.json design_constraints, deliberately NOT as a mediator node (a mediator is part of a real total effect; this is assay interference). SHD/SID against a generated DAG should not reward or penalise a pseudotoxicity node.",
+      "Baseline serum creatinine / eGFR is the highest-weight confounder: worse baseline renal function makes some clinicians avoid piperacillin-tazobactam and is the strongest predictor of subsequent AKI.",
+      "The nephrotoxin co-exposure cluster (iodinated contrast within 72 h, NSAIDs, aminoglycosides, amphotericin B, loop diuretics, ACE inhibitors / ARBs, calcineurin inhibitors) is collapsed into one node here for readability; protocol.json first_pass_covariates lists them separately for the actual adjustment set.",
+      "Neutropenia / haematological malignancy is a strong channelling confounder: febrile-neutropenia guidance favours cefepime, and these patients have a distinct AKI risk.",
+      "Suspected intra-abdominal source channels toward piperacillin-tazobactam (anaerobic and enterococcal cover) and independently raises AKI risk through sepsis severity and intra-abdominal hypertension.",
+      "'Institutional antibiogram / stewardship guideline' is observed=false: local resistance patterns and the written empiric-therapy pathway drive the partner choice directly and are not in the OMOP data.",
+      "'Vancomycin exposure intensity (AUC / trough)' is partially observed: higher vancomycin exposure raises AKI risk and correlates with the partner choice; trough levels exist in measurement but are sparse. Encoded observed=true with a note that coverage is incomplete.",
+      "Post-time-zero events - fluid balance after day 1, new hypotension, a second nephrotoxin started after time zero - are potential mediators and are excluded from this baseline set.",
+      "Non-fan relations: chronic kidney disease -> baseline serum creatinine / eGFR; septic shock at time zero -> vasopressor exposure at time zero; septic shock at time zero -> baseline illness-severity score."
+    ]
+  },
+  "analysis_feature_reconciliation": {
+    "note": "15 observed confounder nodes (the nephrotoxin cluster is one node here, ~7 covariates in the adjustment set) + 1 unobserved. A generated candidate DAG is expected to recover baseline renal function, CKD, diabetes, sepsis severity, hypotension, and the nephrotoxin cluster at minimum; the neutropenia->cefepime channelling, the intra-abdominal-source channelling, calendar year, and the pseudotoxicity measurement path are the ones an LLM draft most often misses.",
+    "observed_nodes": 15,
+    "unobserved_nodes": 1
+  },
+  "variables": [
+    {"label": "Age at ICU admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Older patients have lower renal reserve (higher AKI risk) and a modestly different empiric-antibiotic risk profile.", "pmid": "", "observed": true},
+    {"label": "Sex", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Baseline demographic common cause; adjusted for in the observational vancomycin + piperacillin-tazobactam AKI studies.", "pmid": "", "observed": true},
+    {"label": "Baseline serum creatinine / estimated GFR", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "The strongest single predictor of subsequent AKI and a driver of the partner choice (some clinicians avoid piperacillin-tazobactam in renal impairment).", "pmid": "", "observed": true},
+    {"label": "Chronic kidney disease", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Structural renal disease raises AKI susceptibility and changes prescribing caution.", "pmid": "", "observed": true},
+    {"label": "Diabetes mellitus", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Diabetic nephropathy and microvascular disease raise AKI risk; associated with comorbidity-driven prescribing patterns.", "pmid": "", "observed": true},
+    {"label": "Congestive heart failure", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Low effective circulating volume and diuretic use raise AKI risk; a common-cause comorbidity.", "pmid": "", "observed": true},
+    {"label": "Chronic liver disease / cirrhosis", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Hepatorenal physiology raises AKI risk; cirrhosis also influences antibiotic selection and dosing.", "pmid": "", "observed": true},
+    {"label": "Baseline illness-severity score", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "SOFA / APACHE at time zero drives how broad the empiric regimen is and strongly predicts AKI.", "pmid": "", "observed": true},
+    {"label": "Septic shock / vasopressor exposure at time zero", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Shock is the dominant cause of septic AKI and prompts the broadest-spectrum empiric cover.", "pmid": "", "observed": true},
+    {"label": "Hypotension before time zero (lowest MAP in prior 24 h)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Pre-antibiotic hypotension is a direct renal insult and marks the severity that drives regimen breadth.", "pmid": "", "observed": true},
+    {"label": "Nephrotoxin co-exposure cluster (contrast, NSAIDs, aminoglycosides, amphotericin B, loop diuretics, ACEi/ARB, calcineurin inhibitors)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Each raises AKI risk and correlates with the clinical context (imaging, transplant, prior therapy) that also shapes the empiric-antibiotic choice.", "pmid": "", "observed": true},
+    {"label": "Neutropenia or haematological malignancy", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Febrile-neutropenia guidance channels toward cefepime; these patients also have a distinct (often higher) AKI risk from chemotherapy and tumour-lysis physiology.", "pmid": "", "observed": true},
+    {"label": "Suspected intra-abdominal source of infection", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Anaerobic and enterococcal cover channels toward piperacillin-tazobactam; intra-abdominal sepsis independently raises AKI risk (intra-abdominal hypertension, source severity).", "pmid": "", "observed": true},
+    {"label": "Vancomycin exposure intensity (AUC or trough)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Higher vancomycin exposure raises AKI risk and co-varies with the partner choice; trough data exist in measurement but coverage is incomplete.", "pmid": "", "observed": true},
+    {"label": "Calendar year of admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "The vancomycin + piperacillin-tazobactam nephrotoxicity literature itself shifted ICU prescribing across 2015-2019; AKI ascertainment practice also changed.", "pmid": "", "observed": true},
+    {"label": "Institutional antibiogram / empiric-therapy pathway", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Local resistance patterns and the written empiric-antibiotic guideline drive the partner choice directly and are not represented in the OMOP data.", "pmid": "", "observed": false}
+  ],
+  "relations": [
+    {"source": "Chronic kidney disease", "target": "Baseline serum creatinine / estimated GFR", "rationale": "CKD is the structural cause of the elevated baseline creatinine; the two are not independent common causes.", "pmid": ""},
+    {"source": "Septic shock / vasopressor exposure at time zero", "target": "Baseline illness-severity score", "rationale": "Shock is a major determinant of the SOFA / APACHE value at time zero.", "pmid": ""},
+    {"source": "Suspected intra-abdominal source of infection", "target": "Baseline illness-severity score", "rationale": "Intra-abdominal sepsis contributes to the severity score through the abdominal and haemodynamic components.", "pmid": ""}
+  ]
+}

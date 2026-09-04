@@ -1,0 +1,243 @@
+{
+  "study_id": "ppi_vs_h2ra_sup_mortality_mimic_omop",
+  "status": "draft_pending_human_concept_and_dag_review",
+  "status_detail": "All exposures and the population phenotype are prescription drugs or a staged procedure, so this study is not blocked by the inputevents ETL gap (see docs/validation_question_bank.md, F1-F7). Remaining work before a run: (1) human approval of the PPI, H2RA and mechanical-ventilation concept sets; (2) generation and clinical review of a candidate DAG against reference_dag.json; (3) confirming the new-user look-back and the single-first-agent rule against the data. Question bank id: Q1 (= candidate B1 in docs/validation_study_candidates.md).",
+  "source_question": "Among adult ICU patients receiving invasive mechanical ventilation, what is the effect of proton pump inhibitor versus histamine-2 receptor antagonist stress-ulcer prophylaxis, started within 48 hours of the initiation of mechanical ventilation, on in-hospital all-cause mortality?",
+  "reference": {
+    "anchor_trial": {
+      "name": "PEPTIC",
+      "citation": "PEPTIC Investigators; Australian and New Zealand Intensive Care Society Clinical Trials Group. Effect of Stress Ulcer Prophylaxis With Proton Pump Inhibitors vs Histamine-2 Receptor Blockers on In-Hospital Mortality Among ICU Patients Receiving Invasive Mechanical Ventilation: The PEPTIC Randomized Clinical Trial. JAMA. 2020;323(7):616-626.",
+      "doi": "10.1001/jama.2019.22190",
+      "design": "Cluster crossover randomized trial, 50 ICUs, 5 countries, 26,982 patients."
+    },
+    "supporting_emulations": [
+      {
+        "citation": "Comparison of proton pump inhibitors and histamine 2 receptor antagonists for stress ulcer prophylaxis in the intensive care unit. Sci Rep. 2021;11:18424.",
+        "doi": "10.1038/s41598-021-98069-7",
+        "note": "Retrospective ICU cohort with an explicit adjustment set. [verify article no.]"
+      }
+    ]
+  },
+  "data_source": "runtime-configured restricted OMOP dataset (MIMIC-IV v2.2 -> OMOP CDM 5.3.1, OHDSI/MIMIC ETL)",
+  "target_trial": {
+    "population": "Adults receiving invasive mechanical ventilation in the ICU",
+    "treatment": "A proton pump inhibitor (pantoprazole, omeprazole, esomeprazole, lansoprazole, rabeprazole) ordered within 48 hours of the initiation of invasive mechanical ventilation, as the first stress-ulcer-prophylaxis agent of the ICU stay",
+    "comparator": "A histamine-2 receptor antagonist (famotidine, ranitidine, cimetidine, nizatidine) ordered within 48 hours of the initiation of invasive mechanical ventilation, as the first stress-ulcer-prophylaxis agent of the ICU stay",
+    "time_zero": "The first qualifying stress-ulcer-prophylaxis order (PPI or H2RA) within 48 hours of the first invasive mechanical ventilation procedure of the first ICU stay",
+    "grace_period_hours": 48,
+    "outcome": "In-hospital all-cause mortality",
+    "follow_up_days": 90,
+    "primary_estimand": "ATE",
+    "secondary_estimands": [
+      "ATE on 90-day all-cause mortality",
+      "ATE on clinically important upper-gastrointestinal bleeding (exploratory; low-PPV condition code paired with a transfusion or upper-endoscopy procedure)",
+      "CATE by admission type (medical vs surgical/trauma)",
+      "CATE by baseline illness-severity tertile"
+    ],
+    "eligibility_criteria": [
+      "Adult (>=18 years) at ICU admission",
+      "Receiving invasive mechanical ventilation initiated within 24 hours of the first ICU admission (PEPTIC's window). A wider 'invasive ventilation at any point during the first ICU stay' definition is a prespecified sensitivity analysis.",
+      "First ICU stay per patient only",
+      "No PPI and no H2RA order in the 90 days before ICU admission (new-user of acid suppression)",
+      "Exactly one prophylaxis class as the first agent within the 48-hour window; patients whose first orders include both classes, or neither class, are excluded from the primary analysis and characterised separately",
+      "No baseline indication for therapeutic (non-prophylactic) acid suppression: active gastrointestinal bleeding, or endoscopically or clinically documented peptic ulcer disease within 30 days before time zero. A sensitivity analysis without this exclusion is prespecified."
+    ],
+    "assignment_procedure": "Not randomized; the prophylaxis class is the treating clinician's or the ICU's choice. PEPTIC randomized at the ICU level (cluster crossover); the analogous unit here is care_site, which is entered as a baseline covariate and in a care_site-stratified sensitivity analysis.",
+    "censoring_strategy": "For the in-hospital primary outcome, administrative censoring at hospital discharge (patients discharged alive before an in-hospital death are outcome-negative). For the 90-day secondary outcome, administrative censoring at the earlier of the end of the observation period or 90 days after time zero.",
+    "analysis_strategy": "Intention-to-treat analog: the first prophylaxis class is fixed at time zero and later switches or discontinuations are not modelled. PEPTIC had substantial crossover; a per-protocol sensitivity analysis censoring at the first switch to the other class is prespecified.",
+    "effect_measure": "risk_difference",
+    "treatment_value": "Proton pump inhibitor as the first stress-ulcer-prophylaxis agent within 48 hours of mechanical-ventilation initiation",
+    "comparator_value": "Histamine-2 receptor antagonist as the first stress-ulcer-prophylaxis agent within 48 hours of mechanical-ventilation initiation"
+  },
+  "design_constraints": [
+    "Active-comparator new-user design: both arms share the same indication (stress-ulcer prophylaxis in a ventilated patient), which controls confounding by indication and generally supports positivity. A large effect in either direction is a design or mapping failure to diagnose, not a finding.",
+    "Use only covariates measured before or at time zero (first-day labs and vitals, comorbidity history, admission type, baseline drug exposure).",
+    "care_site is a clustered confounder (PEPTIC's randomization unit; ICU-level prescribing culture). Adjust for it and run a care_site-stratified sensitivity analysis.",
+    "Calendar year is a confounder: PPI uptake for stress-ulcer prophylaxis increased across MIMIC-IV's 2008-2019 window.",
+    "The upper-gastrointestinal-bleeding secondary has low positive predictive value from a condition code alone; require pairing with a transfusion or an upper-endoscopy procedure and treat it as exploratory, never as a co-primary.",
+    "Ranitidine is retained in the H2RA set: it was in routine use across MIMIC-IV's data window and was withdrawn only in 2020.",
+    "Do not promote text-matched drug or procedure names to executable concept sets without human review."
+  ],
+  "concept_sets": {
+    "proton_pump_inhibitor": {
+      "role": "treatment",
+      "domain": "drug",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        948078,
+        923645,
+        904453,
+        929887,
+        911735,
+        19039926
+      ],
+      "lookup_term": "proton pump inhibitor",
+      "candidate_root_ingredients": [
+        "pantoprazole",
+        "omeprazole",
+        "esomeprazole",
+        "lansoprazole",
+        "rabeprazole",
+        "dexlansoprazole"
+      ],
+      "note": "Approve RxNorm ingredient seeds plus concept_ancestor descendants. Exclude combination products where the PPI is not the acid-suppression agent of interest (e.g. amoxicillin/clarithromycin H. pylori kits) unless a sensitivity analysis keeps them.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "method": "RxNorm Ingredient match against local CONCEPT + concept_ancestor usage on data/mimiciv_omop.duckdb (see concept_audit.md)",
+        "seed_concepts": {
+          "948078": "pantoprazole (163,531 drug_exposure rows / 43,389 persons)",
+          "923645": "omeprazole (87,663 / 36,251)",
+          "904453": "esomeprazole (1,442 / 956)",
+          "929887": "lansoprazole (9,891 / 5,965)",
+          "911735": "rabeprazole (19 / 14)",
+          "19039926": "dexlansoprazole (8 / 6)"
+        },
+        "name_matched_unmapped_rows": "<60 per ingredient (drug_concept_id=0) - coverage is effectively complete",
+        "descendant_rule": "include concept_ancestor descendants of each seed; no exclusions needed (oral/IV formulations all in scope)"
+      }
+    },
+    "histamine_2_receptor_antagonist": {
+      "role": "comparator",
+      "domain": "drug",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        953076,
+        961047,
+        997276,
+        950696
+      ],
+      "lookup_term": "histamine-2 receptor antagonist",
+      "candidate_root_ingredients": [
+        "famotidine",
+        "ranitidine",
+        "cimetidine",
+        "nizatidine"
+      ],
+      "note": "Approve RxNorm ingredient seeds plus descendants. Retain ranitidine for this data window.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "method": "RxNorm Ingredient match + concept_ancestor usage on data/mimiciv_omop.duckdb",
+        "seed_concepts": {
+          "953076": "famotidine (52,084 rows / 27,330 persons)",
+          "961047": "ranitidine (49,818 / 19,759) - in-era for MIMIC-IV, retained",
+          "997276": "cimetidine (191 / 126)",
+          "950696": "nizatidine (0 / 0) - kept for completeness"
+        },
+        "name_matched_unmapped_rows": "<=10 per ingredient - coverage effectively complete"
+      }
+    },
+    "invasive_mechanical_ventilation": {
+      "role": "population",
+      "domain": "procedure",
+      "status": "candidate_resolved_pending_human_review_with_undercount_caveat",
+      "concept_ids": [
+        2008007,
+        2008008,
+        2008009,
+        2788036,
+        2788037,
+        2788038
+      ],
+      "lookup_term": "invasive mechanical ventilation",
+      "candidate_root_concepts": [
+        "Continuous invasive mechanical ventilation (ICD-9-Proc 96.7x)",
+        "Respiratory Ventilation (ICD-10-PCS 5A19x)"
+      ],
+      "note": "procedureevents is staged in this ETL, so ventilation is recoverable as procedure_occurrence. Confirm that non-invasive ventilation concepts are excluded. The ventilation start datetime anchors the 48-hour exposure-ascertainment window.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "method": "procedure_occurrence usage on data/mimiciv_omop.duckdb (see concept_audit.md)",
+        "seed_concepts": {
+          "2008007": "Continuous invasive mechanical ventilation of unspecified duration (4 rows)",
+          "2008008": "Continuous invasive mechanical ventilation for less than 96 consecutive hours (7,036 rows / 6,358 persons)",
+          "2008009": "Continuous invasive mechanical ventilation for 96 consecutive hours or more (4,064 / 3,623)",
+          "2788036": "Respiratory Ventilation, Less than 24 Consecutive Hours (1,533 / 1,482)",
+          "2788037": "Respiratory Ventilation, 24-96 Consecutive Hours (2,863 / 2,581)",
+          "2788038": "Respiratory Ventilation, Greater than 96 Consecutive Hours (2,350 / 2,049)"
+        },
+        "UNDERCOUNT_CAVEAT": "These are billing procedure codes (ICD-9-Proc + ICD-10-PCS). Union = 14,662 distinct persons. The true invasively-ventilated MIMIC-IV population is ~25,000-30,000: the procedureevents 'Invasive Ventilation' itemid and chartevents ventilator-setting rows do not map to a standard ventilation procedure concept in this ETL build. The billing-code cohort is real but skews toward longer / billed courses. This is an ETL-coverage limitation to state in the writeup, analogous to the inputevents gap. A sensitivity analysis using SNOMED 4230167 'Artificial ventilation' + descendants (9,388 persons, but includes non-invasive) is the alternative.",
+        "SNOMED_37158404": "'Invasive mechanical ventilation' has 0 rows in this build - do NOT use it as the seed."
+      }
+    },
+    "upper_gi_bleeding": {
+      "role": "outcome_secondary",
+      "domain": "condition",
+      "status": "candidate_resolved_pending_human_review",
+      "concept_ids": [
+        192671
+      ],
+      "lookup_term": "gastrointestinal hemorrhage",
+      "note": "Exploratory secondary only. Pair the condition code with a red-cell transfusion or an upper-endoscopy procedure within the same window to raise PPV.",
+      "resolution": {
+        "resolved_on": "2026-09-03",
+        "seed_concepts": {
+          "192671": "Gastrointestinal hemorrhage + descendants (11,877 condition_occurrence rows / 8,558 persons)"
+        },
+        "note": "Exploratory secondary. Pair with a red-cell transfusion or upper-endoscopy procedure to raise PPV. Consider adding 4103703 Melena / 26727 Hematemesis as corroborating."
+      }
+    }
+  },
+  "query_settings": {
+    "exposure_contrast": "mutually_exclusive",
+    "care_site_names": [
+      "Medical Intensive Care Unit (MICU)",
+      "Cardiac Vascular Intensive Care Unit (CVICU)",
+      "Medical/Surgical Intensive Care Unit (MICU/SICU)",
+      "Surgical Intensive Care Unit (SICU)",
+      "Trauma SICU (TSICU)",
+      "Coronary Care Unit (CCU)",
+      "Neuro Surgical Intensive Care Unit (Neuro SICU)"
+    ],
+    "min_age_years": 18
+  },
+  "first_pass_covariates": [
+    "age",
+    "sex",
+    "admission type (medical / surgical / trauma)",
+    "baseline illness-severity score (SOFA or SAPS II components at ICU admission)",
+    "coagulopathy (INR, platelet count, first day)",
+    "prior gastrointestinal bleeding or peptic ulcer history",
+    "chronic liver disease",
+    "chronic kidney disease / renal replacement therapy",
+    "sepsis at admission",
+    "shock / vasopressor exposure at baseline",
+    "enteral nutrition started before time zero",
+    "baseline systemic corticosteroid exposure",
+    "baseline anticoagulant or antiplatelet exposure",
+    "care_site (ICU unit)",
+    "calendar year of admission"
+  ],
+  "published_benchmarks": {
+    "source": "PEPTIC, JAMA 2020;323(7):616-626, doi:10.1001/jama.2019.22190. Read the exact figures from the primary text before scoring.",
+    "in_hospital_mortality_ppi": 0.183,
+    "in_hospital_mortality_h2ra": 0.175,
+    "in_hospital_mortality_odds_ratio": 1.05,
+    "in_hospital_mortality_or_ci": [
+      1.0,
+      1.1
+    ],
+    "in_hospital_mortality_p_value": 0.054,
+    "upper_gi_bleeding_ppi": 0.013,
+    "upper_gi_bleeding_h2ra": 0.018,
+    "c_difficile_note": "similar between arms",
+    "expected_pipeline_result": "Risk difference approximately 0 with a confidence interval covering 0, possibly a small PPI-associated harm. Recovering this near-null is a specificity test."
+  },
+  "feasibility_checklist": {
+    "F1_exposure_is_drug_or_coded_procedure": "PASS - PPI and H2RA are oral/IV prescriptions (~96.8% standard-mapped); ventilation is a staged procedure.",
+    "F2_ever_exposed_in_window_is_enough": "PASS - the contrast is which class is ordered first; no dose or rate needed.",
+    "F3_clean_index_short_window": "PASS - active-comparator new-user; time zero is the first qualifying order.",
+    "F4_outcome_reliably_captured": "PASS - in-hospital and 90-day mortality from the death record. UGIB secondary is low-PPV; keep exploratory.",
+    "F5_population_phenotype": "PASS - ventilation + first-ICU-stay, both structural.",
+    "F6_adequate_n_and_followup": "PASS - roughly 15,000-20,000 ventilated adult first ICU stays; the smaller arm is expected to be H2RA in later years.",
+    "F7_confounders_measurable": "PASS - first-day severity, coagulation, comorbidity history, admission type, baseline drug exposure, care_site, calendar year."
+  },
+  "_feasibility_snapshot_2026_09_03": {
+    "note": "Crude co-exposure among the 14,662 billing-identified invasively-ventilated persons, BEFORE windowing / new-user / single-first-agent rules (which will shrink these). See concept_audit.md.",
+    "ventilated_persons_billing_codes": 14662,
+    "crude_ppi_only": 4040,
+    "crude_h2ra_only": 3958,
+    "crude_both_ever": 5743,
+    "crude_neither": 921,
+    "expected_analytic_cohort": "roughly 6,000-9,000 after the new-user + first-agent-within-48h rules, with a fairly even PPI/H2RA split"
+  }
+}

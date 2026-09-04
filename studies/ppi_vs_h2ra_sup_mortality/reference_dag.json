@@ -1,0 +1,46 @@
+{
+  "source": {
+    "description": "Reference adjustment set for the PPI-vs-H2RA stress-ulcer-prophylaxis question. This is NOT transcribed from a published DAG figure: PEPTIC (JAMA 2020;323(7):616-626) reports a cluster-randomized trial and does not publish an expert DAG. The confounder list below is constructed from (a) the covariates PEPTIC and its observational emulations adjust for or stratify on, and (b) standard pharmaco-epidemiology reasoning about what jointly drives the choice of prophylaxis class and in-hospital mortality in a ventilated ICU patient. It is a defensible reference for SHD/SID comparison against a generated candidate DAG, not a gold standard.",
+    "anchor_trial_doi": "10.1001/jama.2019.22190",
+    "supporting_emulation_doi": "10.1038/s41598-021-98069-7",
+    "constructed_on": "2026-09-03",
+    "constructed_by": "clinical reasoning + anchor-trial covariate extraction; not an author-drawn DAG",
+    "construction_notes": [
+      "Every observed node is a common cause of the exposure (which prophylaxis class is ordered first) and the outcome (in-hospital all-cause mortality), encoded role='confounder', temporal_classification='pre_treatment'.",
+      "care_site (ICU unit) is the strongest structural confounder: PEPTIC's randomization unit was the ICU, and prophylaxis class is largely a unit-level habit. It is observed here only partially - the unit label is available, the underlying formulary preference and local protocol are not - so 'ICU prescribing culture beyond care_site' is a separate observed=false node.",
+      "'Goals-of-care limitation at admission' is observed=false: it drives both a less aggressive prophylaxis choice and higher mortality, and is not reliably coded.",
+      "'Frailty / baseline functional status' is observed=false.",
+      "Hospital-acquired pneumonia and Clostridioides difficile infection that arise AFTER time zero are potential mediators of a PPI effect, not confounders, and are deliberately excluded from this baseline confounder set. Only pneumonia present at ICU admission is a confounder node.",
+      "Non-fan relations: chronic liver disease -> coagulopathy; sepsis at admission -> baseline illness-severity score. Transcribed with moderate confidence; a generated DAG that omits these should not be penalised heavily."
+    ]
+  },
+  "analysis_feature_reconciliation": {
+    "note": "15 observed confounder nodes + 3 unobserved. A generated candidate DAG is expected to recover age, sex, admission type, illness severity, coagulopathy, comorbidity (liver/kidney), sepsis/shock, and care_site at minimum; calendar year and baseline drug exposure are the ones LLM drafts most often miss.",
+    "observed_nodes": 15,
+    "unobserved_nodes": 3
+  },
+  "variables": [
+    {"label": "Age at ICU admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Older ventilated patients have higher in-hospital mortality and a different prophylaxis-risk profile; age is associated with unit and clinician prescribing patterns.", "pmid": "", "observed": true},
+    {"label": "Sex", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Baseline demographic common cause; included in the PEPTIC adjusted model and its emulations.", "pmid": "", "observed": true},
+    {"label": "Admission type (medical vs surgical vs trauma)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Surgical and trauma ICUs favour different prophylaxis defaults and have different baseline mortality risk.", "pmid": "", "observed": true},
+    {"label": "Baseline illness-severity score", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "APACHE II / SOFA / SAPS II at ICU admission predicts mortality and influences how aggressively prophylaxis and other supportive care are pursued.", "pmid": "", "observed": true},
+    {"label": "Coagulopathy at baseline (INR, platelet count)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "A recognised stress-ulcer-bleeding risk factor that pushes clinicians toward a PPI, and an independent marker of mortality risk.", "pmid": "", "observed": true},
+    {"label": "Prior gastrointestinal bleeding or peptic ulcer history", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Strongly pushes prophylaxis choice toward a PPI and is prognostic.", "pmid": "", "observed": true},
+    {"label": "Chronic liver disease", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Portal hypertension and coagulopathy raise bleeding risk (PPI preference) and independently raise ICU mortality.", "pmid": "", "observed": true},
+    {"label": "Chronic kidney disease or renal replacement therapy", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Alters drug clearance and prescribing caution, and is prognostic for mortality.", "pmid": "", "observed": true},
+    {"label": "Sepsis at ICU admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Sepsis raises mortality and is associated with more intensive prophylaxis and acid-suppression practice.", "pmid": "", "observed": true},
+    {"label": "Shock or vasopressor exposure at baseline", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Shock is a stress-ulcer risk factor (PPI preference) and a strong mortality predictor.", "pmid": "", "observed": true},
+    {"label": "Enteral nutrition started before time zero", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Early enteral feeding reduces perceived stress-ulcer risk (may shift toward H2RA or no prophylaxis) and is a marker of a less severe course.", "pmid": "", "observed": true},
+    {"label": "Baseline systemic corticosteroid exposure", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Corticosteroids raise gastrointestinal bleeding risk (PPI preference) and mark the underlying disease severity.", "pmid": "", "observed": true},
+    {"label": "Baseline anticoagulant or antiplatelet exposure", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Antithrombotic exposure pushes prophylaxis toward a PPI and independently affects mortality (bleeding and the underlying cardiovascular indication).", "pmid": "", "observed": true},
+    {"label": "Care site (ICU unit)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "PEPTIC's randomization unit. Prophylaxis class is largely a unit-level default; units also differ in case mix and mortality.", "pmid": "", "observed": true},
+    {"label": "Calendar year of admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "PPI use for stress-ulcer prophylaxis rose across 2008-2019; secular trends in ICU mortality run in parallel.", "pmid": "", "observed": true},
+    {"label": "ICU prescribing culture beyond care_site", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Local formulary preference and written stress-ulcer-prophylaxis protocol drive the class choice directly; only partially captured by the care_site label.", "pmid": "", "observed": false},
+    {"label": "Goals-of-care limitation at admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "An early treatment-limitation decision leads to less aggressive prophylaxis and markedly higher mortality; not reliably coded.", "pmid": "", "observed": false},
+    {"label": "Frailty / baseline functional status", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Frailty predicts mortality and correlates with more conservative prescribing; not captured structurally in this ETL.", "pmid": "", "observed": false}
+  ],
+  "relations": [
+    {"source": "Chronic liver disease", "target": "Coagulopathy at baseline (INR, platelet count)", "rationale": "Hepatic synthetic dysfunction produces the coagulopathy; the two are not independent common causes.", "pmid": ""},
+    {"source": "Sepsis at ICU admission", "target": "Baseline illness-severity score", "rationale": "Sepsis is a major determinant of the SOFA / SAPS II value at admission.", "pmid": ""}
+  ]
+}

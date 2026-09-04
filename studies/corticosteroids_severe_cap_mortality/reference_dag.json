@@ -1,0 +1,51 @@
+{
+  "source": {
+    "description": "Reference adjustment set for the corticosteroids-in-severe-CAP question. NOT transcribed from a published DAG figure: CAPE COD (NEJM 2023;388(21):1931-1941) and the other CAP corticosteroid RCTs do not publish an expert DAG. The confounder list is constructed from (a) the covariates the CAP corticosteroid RCTs and their observational emulations adjust for or stratify on (severity score, inflammatory markers, COPD, pathogen), and (b) standard reasoning about what jointly drives the decision to give a systemic corticosteroid and in-hospital mortality in a patient admitted with severe pneumonia. A defensible reference for SHD/SID comparison, not a gold standard.",
+    "anchor_trial_doi": "10.1056/NEJMoa2215145",
+    "supporting_synthesis_doi": "10.1186/s13054-023-04561-z",
+    "constructed_on": "2026-09-03",
+    "constructed_by": "clinical reasoning + anchor-trial covariate extraction; not an author-drawn DAG",
+    "construction_notes": [
+      "Every observed node is a common cause of the exposure (a systemic corticosteroid order within 48 h) and the outcome (in-hospital all-cause mortality), encoded role='confounder', temporal_classification='pre_treatment'.",
+      "COPD and asthma are the highest-weight confounders: an airway component prompts steroids for a reason unrelated to the pneumonia itself, and chronic lung disease independently changes mortality risk. COPD-exacerbation-primary admissions are excluded by the protocol; the residual COPD signal is a covariate.",
+      "Baseline C-reactive protein / inflammatory response is both a treatment driver (CAPE COD and Torres enriched for high CRP) and prognostic - a genuine confounder, ascertained strictly pre-treatment.",
+      "Identified pathogen, especially influenza, is a confounder with a direction-changing effect (corticosteroids are historically harmful in influenza pneumonia, beneficial in bacterial). Where pathogen is unknown at time zero it is partially observed.",
+      "'Radiographic extent of infiltrates / multilobar involvement' is observed=false: it drives the severity assessment and the steroid decision and is not in the OMOP tables.",
+      "'Goals-of-care limitation at admission' and 'frailty / baseline performance status' are observed=false: both push toward less aggressive escalation and higher mortality.",
+      "Post-time-zero events - ARDS onset, secondary infection, hospital-acquired hyperglycaemia - are potential mediators of a corticosteroid effect and are deliberately excluded from this baseline confounder set.",
+      "Non-fan relations: COPD -> baseline airway obstruction / bronchodilator use; septic shock at presentation -> vasopressor exposure at time zero; CAP severity score -> invasive mechanical ventilation at time zero. Transcribed with moderate confidence."
+    ]
+  },
+  "analysis_feature_reconciliation": {
+    "note": "17 observed confounder nodes + 3 unobserved. A generated candidate DAG is expected to recover age, sex, severity score, oxygenation, COPD, diabetes, immunosuppression, inflammatory markers, and pathogen at minimum; calendar year, identified influenza, and the airway-component pathway are the ones LLM drafts most often miss.",
+    "observed_nodes": 17,
+    "unobserved_nodes": 3
+  },
+  "variables": [
+    {"label": "Age at admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Older patients with severe CAP have higher mortality; age also modestly influences the willingness to add a corticosteroid.", "pmid": "", "observed": true},
+    {"label": "Sex", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Baseline demographic common cause; adjusted for in the CAP corticosteroid trials and emulations.", "pmid": "", "observed": true},
+    {"label": "CAP severity score at admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "PSI / CURB-65 / SOFA at admission is the dominant driver of both the decision to escalate care (including steroids) and of mortality.", "pmid": "", "observed": true},
+    {"label": "Oxygenation at baseline (PaO2/FiO2 or SpO2/FiO2)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Worse hypoxaemia prompts corticosteroids and predicts progression to ARDS and death.", "pmid": "", "observed": true},
+    {"label": "Septic shock at presentation", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Refractory shock is an independent reason to give stress-dose hydrocortisone and carries high mortality.", "pmid": "", "observed": true},
+    {"label": "Vasopressor exposure at time zero", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Marks haemodynamic severity; drives both the hydrocortisone decision and mortality.", "pmid": "", "observed": true},
+    {"label": "Invasive mechanical ventilation at time zero", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Baseline ventilation marks respiratory severity, prompts corticosteroids, and predicts death.", "pmid": "", "observed": true},
+    {"label": "Baseline C-reactive protein / inflammatory response", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "A high inflammatory response is an explicit treatment-selection criterion in Torres 2015 and CAPE COD, and is prognostic.", "pmid": "", "observed": true},
+    {"label": "Baseline white cell count", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Marks the inflammatory picture that clinicians weigh when deciding on steroids; extremes are prognostic.", "pmid": "", "observed": true},
+    {"label": "Baseline serum lactate", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Tissue hypoperfusion marker; associated with the steroid-for-shock decision and with mortality.", "pmid": "", "observed": true},
+    {"label": "COPD", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "An airway component prompts corticosteroids for a reason independent of the pneumonia; chronic airflow limitation independently affects mortality.", "pmid": "", "observed": true},
+    {"label": "Asthma", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "As for COPD: a bronchospastic component drives steroid use and changes the outcome risk.", "pmid": "", "observed": true},
+    {"label": "Diabetes mellitus", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Diabetes makes clinicians more cautious about corticosteroids (hyperglycaemia) and independently worsens CAP outcomes.", "pmid": "", "observed": true},
+    {"label": "Immunosuppression / active cancer / transplant", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Immunocompromise both changes the steroid calculus and markedly raises mortality; partly an exclusion, partly a covariate for milder cases.", "pmid": "", "observed": true},
+    {"label": "Chronic comorbidity burden (CKD, chronic liver disease, congestive heart failure)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Organ-reserve comorbidities predict CAP mortality and shift the risk-benefit of adjunctive steroids.", "pmid": "", "observed": true},
+    {"label": "Identified pathogen within 48 h (incl. influenza)", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Corticosteroids are historically harmful in influenza pneumonia and more clearly beneficial in bacterial CAP; the pathogen influences both the decision and the outcome. Often only partially known at time zero.", "pmid": "", "observed": true},
+    {"label": "Calendar year of admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Corticosteroid practice in CAP shifted across 2008-2019, especially after the 2015 Blum and Torres trials; secular mortality trends run alongside.", "pmid": "", "observed": true},
+    {"label": "Radiographic extent of infiltrates / multilobar involvement", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Extent of consolidation drives the severity impression and the steroid decision and predicts death; not represented in the OMOP tables.", "pmid": "", "observed": false},
+    {"label": "Goals-of-care limitation at admission", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "An early treatment-limitation decision leads to fewer adjunctive therapies and much higher mortality; not reliably coded.", "pmid": "", "observed": false},
+    {"label": "Frailty / baseline performance status", "role": "confounder", "temporal_classification": "pre_treatment", "rationale": "Frailty predicts CAP mortality and correlates with more conservative prescribing; not captured structurally.", "pmid": "", "observed": false}
+  ],
+  "relations": [
+    {"source": "Septic shock at presentation", "target": "Vasopressor exposure at time zero", "rationale": "Shock is the clinical state; vasopressor exposure is its treatment marker, not an independent common cause.", "pmid": ""},
+    {"source": "CAP severity score at admission", "target": "Invasive mechanical ventilation at time zero", "rationale": "Higher severity is a major determinant of early intubation.", "pmid": ""},
+    {"source": "COPD", "target": "Baseline white cell count", "rationale": "Chronic steroid or recent exacerbation treatment in COPD perturbs the baseline leucocyte count; weak, transcribed at low confidence.", "pmid": ""}
+  ]
+}

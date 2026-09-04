@@ -1219,9 +1219,8 @@ class LoadConceptSpecsTests(unittest.TestCase):
         self.assertEqual(specs["outcome"], ConceptSetSpec(domain="death", concept_ids=()))
 
     def test_treatment_and_comparator_shared_backbone_resolves_both_roles(self):
-        """Mirrors `studies/albumin_sepsis_28d/protocol.json`'s "crystalloids"
-        entry: one phenotype (role='treatment_and_comparator') serves as
-        both arms of an `add_on` design."""
+        """One phenotype (role='treatment_and_comparator') serves as the
+        shared backbone for both arms of an `add_on` design."""
         specs = _load_concept_specs({"concept_sets": {
             "sepsis": self._approved("population", "condition", [1]),
             "crystalloids": self._approved("treatment_and_comparator", "drug", [2]),

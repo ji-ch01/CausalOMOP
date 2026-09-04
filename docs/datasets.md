@@ -168,17 +168,34 @@ licences.
 
 ## Validation study
 
-Dataset selection is complete. CausalOMOP itself is not scoped to any one
-condition; the active work is running the pipeline end-to-end on one
-literature-comparison case -- the albumin/sepsis target trial -- against the
-converted MIMIC-IV data, so its output can be checked against that published
-study's design and results. The study still requires a reproducible Sepsis-3
-phenotype, approved albumin and crystalloid mappings, validated ICU time zero,
-baseline covariate coverage, censoring and follow-up rules, and positivity
-assessment.
+Dataset selection is complete (MIMIC-IV in OMOP CDM). CausalOMOP itself is
+not scoped to any one condition. The selection criteria and a reference-anchored
+shortlist are in
+[docs/validation_study_candidates.md](validation_study_candidates.md); the
+operational set of ten target-trial-specified questions, each checked against
+the ETL's limits, is in
+[docs/validation_question_bank.md](validation_question_bank.md).
 
-See [studies/albumin_sepsis_28d](../studies/albumin_sepsis_28d/README.md), the
-[causal roadmap](causal_roadmap.md)'s Validation strategy, and
+Three `studies/` packages exist --
+[ppi_vs_h2ra_sup_mortality](../studies/ppi_vs_h2ra_sup_mortality/README.md)
+(Q1, anchored to PEPTIC), [corticosteroids_severe_cap_mortality](../studies/corticosteroids_severe_cap_mortality/README.md)
+(Q8, anchored to CAPE COD), and [vanco_piptazo_vs_cefepime_aki](../studies/vanco_piptazo_vs_cefepime_aki/README.md)
+(Q5, anchored to ACORN). Each is scaffolded with a `protocol.json` and a
+reference DAG, and is a draft pending human concept-set approval, a
+clinically reviewed candidate DAG, and the per-study phenotype, covariate,
+censoring and positivity work.
+
+Questions whose exposure or time zero is an intensive-care infusion -- fluid
+resuscitation (crystalloids, albumin), titrated vasopressors, sedation
+infusions, IV insulin -- are **out of scope on the current ETL** and recorded
+as future work: the OHDSI/MIMIC conversion derives drug exposures from
+prescription orders and does not stage the source `inputevents` table (see
+[vocabulary_mapping_coverage.md](vocabulary_mapping_coverage.md)'s "Infusion
+administrations" note). An albumin-plus-crystalloids versus crystalloids
+sepsis target trial (Doutreligne et al. 2025) was scoped under this heading
+and is contingent on an `inputevents` ETL extension.
+
+See the [causal roadmap](causal_roadmap.md)'s Validation strategy and
 [README.md's References](../README.md#references) for the full set of
 literature this pipeline is grounded in and compared against.
 

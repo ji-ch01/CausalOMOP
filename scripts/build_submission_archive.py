@@ -103,8 +103,7 @@ clean `git archive` of a single revision.
 
 - `causal/` -- the governed causal-study workflow, agents, and companion.
 - `tests/` -- the artifact-integrity suite referenced in the paper.
-- `docs/`, `studies/albumin_sepsis_28d/`, `scripts/`, requirements files,
-  `README.md`.
+- `docs/`, `studies/`, `scripts/`, requirements files, `README.md`.
 
 ## What was removed or changed
 

@@ -163,22 +163,34 @@ running the actual pipeline against each one so its output can be compared
 against that published ground truth (SHD/SID for DAG structure, recall@k/MRR
 for concept mapping -- see [docs/causal_roadmap.md](docs/causal_roadmap.md)).
 These studies are worked examples used to evaluate and demonstrate pipeline
-effectiveness, not a constraint on what questions the pipeline supports:
+effectiveness, not a constraint on what questions the pipeline supports.
+Which question is carried all the way through end-to-end is deliberately
+still open: the selection criteria and a reference-grounded shortlist of
+candidates (each with its RCT anchor and a MIMIC-IV/OMOP feasibility verdict)
+are in
+[docs/validation_study_candidates.md](docs/validation_study_candidates.md),
+which is the working space for that choice rather than this list.
 
-- **Worked validation case** --
-  [studies/albumin_sepsis_28d](studies/albumin_sepsis_28d/README.md)
-  reproduces the albumin-plus-crystalloids-vs-crystalloids, ICU sepsis,
-  28-day-mortality question and its MIMIC-IV OMOP grounding from *Step-by-
-  step causal analysis of EHRs to ground decision-making*,
-  [doi:10.1371/journal.pdig.0000721](https://doi.org/10.1371/journal.pdig.0000721).
-- **Second candidate comparison case** -- Wang, X., Zhang, K., Wu, Y., Zhang,
-  Z., Li, Y., Han, R., & Liang, F. (2026). Target trial emulation of early
-  acetaminophen use and mortality in critically ill stroke patients.
-  *Scientific Reports*.
-  [doi:10.1038/s41598-026-46381-5](https://doi.org/10.1038/s41598-026-46381-5).
-  Also a target-trial emulation on MIMIC-IV/eICU ICU data; identified as a
-  second comparison case for the causal-question and identification process,
-  not yet built into a `studies/` package.
+- **Scaffolded studies** -- three `studies/` packages carry a target-trial
+  `protocol.json` and a reference DAG, each a draft pending human review:
+  [ppi_vs_h2ra_sup_mortality](studies/ppi_vs_h2ra_sup_mortality/README.md)
+  (question-bank Q1, anchored to PEPTIC),
+  [corticosteroids_severe_cap_mortality](studies/corticosteroids_severe_cap_mortality/README.md)
+  (Q8, CAPE COD), and
+  [vanco_piptazo_vs_cefepime_aki](studies/vanco_piptazo_vs_cefepime_aki/README.md)
+  (Q5, ACORN). The selection criteria and the full ten-question operational
+  set are in
+  [docs/validation_study_candidates.md](docs/validation_study_candidates.md)
+  and [docs/validation_question_bank.md](docs/validation_question_bank.md).
+- **Future work** -- questions whose exposure or time zero is an
+  intensive-care infusion (fluid resuscitation, titrated vasopressors, IV
+  insulin) are out of scope on the current OHDSI/MIMIC ETL, which derives
+  drug exposures from prescription orders and does not stage `inputevents`
+  (see [docs/vocabulary_mapping_coverage.md](docs/vocabulary_mapping_coverage.md)).
+  An albumin-plus-crystalloids versus crystalloids ICU sepsis target trial
+  (*Step-by-step causal analysis of EHRs to ground decision-making*,
+  [doi:10.1371/journal.pdig.0000721](https://doi.org/10.1371/journal.pdig.0000721))
+  is recorded here, contingent on an `inputevents` ETL extension.
 
 ## Repository layout
 
@@ -186,7 +198,7 @@ effectiveness, not a constraint on what questions the pipeline supports:
 CausalOMOP/
   causal/                         project-owned causal workflow
   docs/                           maintained documentation and audit notes
-  studies/albumin_sepsis_28d/     first literature-comparison validation example
+  studies/                        literature-comparison validation study drafts
   scripts/bigquery_etl/           BigQuery-to-DuckDB export utility
   scripts/snuh_etl/               SYN-SNUH preparation and validation
   notebooks/                      exploratory analyses only
@@ -278,7 +290,7 @@ Dataset roles are configured through `CAUSALOMOP_BQ_PROJECT` and the four
 From a reviewed protocol:
 
 ```powershell
-$state = python -m causal.cli workflow start studies\albumin_sepsis_28d\protocol.json |
+$state = python -m causal.cli workflow start studies\ppi_vs_h2ra_sup_mortality\protocol.json |
   ConvertFrom-Json
 $runId = $state.run_id
 
@@ -289,7 +301,7 @@ python -m causal.cli workflow status $runId
 From a natural-language causal question:
 
 ```powershell
-python -m causal.cli workflow start-question "Among adult ICU patients with sepsis, what is the effect of albumin plus crystalloids versus crystalloids alone on 28-day mortality?"
+python -m causal.cli workflow start-question "Among ventilated adult ICU patients, what is the effect of proton pump inhibitor versus histamine-2 receptor antagonist stress-ulcer prophylaxis on in-hospital mortality?"
 ```
 
 This path first classifies the question. A descriptive question is answered

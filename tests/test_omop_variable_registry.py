@@ -303,7 +303,7 @@ class ConceptSetConversionTests(unittest.TestCase):
         from pathlib import Path
 
         protocol = json.loads(
-            Path("studies/albumin_sepsis_28d/protocol.json").read_text(encoding="utf-8")
+            Path("studies/ppi_vs_h2ra_sup_mortality/protocol.json").read_text(encoding="utf-8")
         )
         registry = OMOPVariableRegistry.from_protocol(protocol)
         self.assertEqual(len(registry.variables), len(protocol["concept_sets"]))

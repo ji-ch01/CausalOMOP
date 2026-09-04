@@ -5,8 +5,8 @@ maintained specifications from historical notes and generated artifacts.
 
 CausalOMOP is a general-purpose, protocol-driven causal-inference tool, not a
 system built around one disease or drug. Where a document below discusses a
-specific clinical question (albumin/sepsis, a MIMIC-IV table's vocabulary
-coverage, ...), that question is a worked example used to validate and
+specific clinical question (PPI vs H2RA stress-ulcer prophylaxis, a MIMIC-IV
+table's vocabulary coverage, ...), that question is a worked example used to validate and
 compare pipeline output against published literature -- see
 [README.md's References](../README.md#references) -- not a description of
 the tool's scope.
@@ -26,7 +26,11 @@ the tool's scope.
 | [DAG generation reference](dag_generation_audit.md) | pipeline design, evaluation methodology (SHD/SID, causal-learn), and known gaps |
 | [Repository map](repo_map.md) | folder ownership and Git policy |
 | [Responsible demo guide](responsible_demo_guide.md) | current demonstration script |
-| [Albumin/sepsis study](../studies/albumin_sepsis_28d/README.md) | first literature-comparison validation example |
+| [Validation study candidates](validation_study_candidates.md) | reference-grounded shortlist of causal questions runnable end-to-end, with selection criteria and citations |
+| [Validation question bank](validation_question_bank.md) | ten ETL-feasible causal questions, each specified as a target trial with a published reference truth, for the multi-case evaluation |
+| [PPI vs H2RA study](../studies/ppi_vs_h2ra_sup_mortality/README.md) | question-bank Q1: active-comparator emulation anchored to PEPTIC; scaffolded, pending review |
+| [Corticosteroids in severe CAP study](../studies/corticosteroids_severe_cap_mortality/README.md) | question-bank Q8: sensitivity case anchored to CAPE COD; scaffolded, pending review |
+| [Vancomycin + pip-tazo vs cefepime AKI study](../studies/vanco_piptazo_vs_cefepime_aki/README.md) | question-bank Q5: headline diagnostic case anchored to ACORN; scaffolded, pending review |
 
 ## External documentation
 
