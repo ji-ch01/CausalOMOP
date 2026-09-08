@@ -24,6 +24,12 @@ WHAT IT DOES
    appears, printing every offending ``path:line``.
 5. Write ``ANONYMIZATION.md`` (what changed + how to run the tests) at the
    archive root and emit ``dist/causalomop-submission-<ref>.tar.gz``.
+6. With ``--git``, also stage the same verified-clean tree as a fresh,
+   single-commit git repository (neutral author, squashed history) at
+   ``dist/causalomop-submission-<ref>-git/`` -- a tarball has no git history
+   to leak, but pointing anonymous.4open.science at the *real* repo would
+   expose every commit's actual author. This sibling output is what you push
+   to a brand-new, dedicated GitHub repository for that link.
 
 WHAT IT IS NOT
 --------------
@@ -33,16 +39,23 @@ suite does not import it (both wrappers shell out at runtime) -- so the
 archive is a code-read + ``pytest`` artifact, not a clone-and-run-everything
 bundle. Review the emitted file list and ``ANONYMIZATION.md`` before upload.
 
+The ``--git`` output is not pushed anywhere by this script. Push it yourself
+to a new, purpose-built repository, never to a branch of the real project
+repo: anonymous.4open.science's branch selector can otherwise let a reviewer
+switch to a branch that still carries the real history.
+
 USAGE
 -----
     python scripts/build_submission_archive.py
     python scripts/build_submission_archive.py --ref main --out dist/
     python scripts/build_submission_archive.py --keep-staging   # for inspection
+    python scripts/build_submission_archive.py --git            # + pushable repo
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -85,6 +98,16 @@ DIR_RENAMES: list[tuple[str, str]] = [
     ("scripts/snuh_etl", "scripts/onprem_etl"),
 ]
 
+# Dropped from the archive outright, before substitution/scanning. This file
+# necessarily spells out the identifying tokens above as plain string
+# literals (they are its own DENYLIST/SUBSTITUTIONS data); shipping it would
+# either fail the scan on itself or, worse, ship the real tokens verbatim if
+# ever excluded from the scan instead. Reviewers need the anonymized code,
+# not the tool that anonymized it.
+EXCLUDE_PATHS: list[str] = [
+    "scripts/build_submission_archive.py",
+]
+
 # Extensions treated as text for substitution and denylist scanning.
 _TEXT_SUFFIXES = {
     ".py", ".md", ".txt", ".toml", ".ini", ".cfg", ".yml", ".yaml", ".json",
@@ -119,6 +142,19 @@ clean `git archive` of a single revision.
   The test suite does not import it: `causal.mcp_client.OMCPClient` and
   `causal.fastomop_bridge` both invoke those tools as out-of-process
   commands and are covered by stubs.
+- `scripts/build_submission_archive.py` itself is not included: it
+  necessarily spells out the identifying tokens it removes as plain string
+  literals, so it is dropped rather than shipped.
+
+## Using this for an anonymous.4open.science link
+
+This tarball has no git history, so it cannot leak commit authorship, but
+anonymous.4open.science needs a live GitHub repository to point at, not a
+tarball. If a sibling `-git/` directory was produced alongside this archive
+(`--git` flag), it is that tree staged as a single squashed commit under a
+neutral author. Push it to a brand-new, dedicated GitHub repository, never to
+a branch of the real project repo: the tool's branch selector can otherwise
+let a reviewer switch to a branch that still carries the real history.
 
 ## Running the artifact-integrity tests
 
@@ -185,6 +221,13 @@ def _apply_substitutions(root: Path) -> int:
     return changed
 
 
+def _apply_excludes(root: Path) -> None:
+    for rel in EXCLUDE_PATHS:
+        path = root / rel
+        if path.is_file():
+            path.unlink()
+
+
 def _apply_dir_renames(root: Path) -> None:
     for src_rel, dst_rel in DIR_RENAMES:
         src, dst = root / src_rel, root / dst_rel
@@ -213,6 +256,40 @@ def _make_tarball(root: Path, out_path: Path, top_name: str) -> None:
         tf.add(root, arcname=top_name)
 
 
+def _init_anon_git_repo(staging: Path, dest: Path) -> None:
+    """Copy the verified-clean ``staging`` tree to ``dest`` and turn it into
+    a fresh git repo with one commit under a neutral author -- squashed, so
+    no real commit (and no real author identity) is reachable from it.
+    """
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(staging, dest)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Anonymous",
+        "GIT_AUTHOR_EMAIL": "anonymous@anonymous.invalid",
+        "GIT_COMMITTER_NAME": "Anonymous",
+        "GIT_COMMITTER_EMAIL": "anonymous@anonymous.invalid",
+    }
+    run_kwargs = {"cwd": dest, "check": True, "capture_output": True, "text": True, "env": env}
+    subprocess.run(["git", "init", "--quiet"], **run_kwargs)
+    subprocess.run(["git", "add", "-A"], **run_kwargs)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "Anonymized submission snapshot for double-blind review",
+        ],
+        **run_kwargs,
+    )
+    subprocess.run(["git", "branch", "-M", "main"], **run_kwargs)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ref", default="HEAD", help="git ref to export (default HEAD)")
@@ -227,6 +304,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="leave the unpacked staging tree next to the tarball for inspection",
     )
+    parser.add_argument(
+        "--git",
+        action="store_true",
+        help=(
+            "also stage the anonymized tree as a fresh, single-commit git "
+            "repository (neutral author, squashed history) at "
+            "<out>/<top_name>-git/, ready to push to a dedicated repo for "
+            "an anonymous.4open.science link"
+        ),
+    )
     args = parser.parse_args(argv)
 
     short = _run("git", "rev-parse", "--short", args.ref).strip()
@@ -234,20 +321,22 @@ def main(argv: list[str] | None = None) -> int:
     staging_parent = Path(tempfile.mkdtemp(prefix="causalomop-anon-"))
     staging = staging_parent / top_name
 
+    total = 6 if args.git else 5
     try:
-        print(f"[1/5] git archive {args.ref} ({short}) -> staging")
+        print(f"[1/{total}] git archive {args.ref} ({short}) -> staging")
         _export_tree(args.ref, staging)
+        _apply_excludes(staging)
 
-        print("[2/5] renaming institutional directories")
+        print(f"[2/{total}] renaming institutional directories")
         _apply_dir_renames(staging)
 
-        print("[3/5] rewriting identifying tokens")
+        print(f"[3/{total}] rewriting identifying tokens")
         n_changed = _apply_substitutions(staging)
         print(f"      {n_changed} file(s) rewritten")
 
         (staging / "ANONYMIZATION.md").write_text(_ANON_NOTE, encoding="utf-8")
 
-        print("[4/5] scanning for surviving identifiers")
+        print(f"[4/{total}] scanning for surviving identifiers")
         hits = _scan_denylist(staging)
         if hits:
             print(f"\nFAILED: {len(hits)} identifying token(s) survived:\n", file=sys.stderr)
@@ -261,13 +350,28 @@ def main(argv: list[str] | None = None) -> int:
         print("      clean")
 
         out_path = args.out / f"{top_name}.tar.gz"
-        print(f"[5/5] writing {out_path}")
+        print(f"[5/{total}] writing {out_path}")
         _make_tarball(staging, out_path, top_name)
 
         file_count = sum(1 for p in staging.rglob("*") if p.is_file())
         size_mb = out_path.stat().st_size / 1_048_576
         print(f"\nOK  {file_count} files, {size_mb:.2f} MB")
         print(f"    {out_path}")
+
+        if args.git:
+            git_dir = args.out / f"{top_name}-git"
+            print(f"[6/{total}] staging anonymized git repo -> {git_dir}")
+            _init_anon_git_repo(staging, git_dir)
+            print(f"    {git_dir}")
+            print(
+                "\n    Push this to a brand-new, dedicated GitHub repo (never a\n"
+                "    branch of the real project repo), then generate the\n"
+                "    anonymous.4open.science link from that repo:\n"
+                f"      cd {git_dir}\n"
+                "      git remote add origin <new-empty-repo-url>\n"
+                "      git push -u origin main"
+            )
+
         if args.keep_staging:
             kept = args.out / top_name
             if kept.exists():
