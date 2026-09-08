@@ -405,5 +405,64 @@ class AdditionalPopulationPassThroughTests(unittest.TestCase):
         self.assertIn("population_additional_0_concepts", sql)
 
 
+class WashoutDaysPassThroughTests(unittest.TestCase):
+    """`washout_days` is a thin pass-through to `analytic_cohort_sql` on
+    every method here (the new-user look-back logic lives in
+    `causal.queries.feasibility._cohort_ctes`); it is also recorded on the
+    build manifest for provenance."""
+
+    def test_build_forwards_washout_days_and_records_it_on_the_manifest(self):
+        sql, manifest = AnalyticCohortBuilder().build(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=90, execution_allowed=False,
+        )
+        self.assertIn("washout AS (", sql)
+        self.assertIn("a.washout_new_user AND a.washout_lookback_covered", sql)
+        self.assertEqual(manifest.washout_days, 90)
+        self.assertEqual(manifest.to_dict()["washout_days"], 90)
+
+    def test_default_build_leaves_washout_days_zero_and_sql_unchanged(self):
+        sql, manifest = AnalyticCohortBuilder().build(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            execution_allowed=False,
+        )
+        self.assertNotIn("washout", sql)
+        self.assertEqual(manifest.washout_days, 0)
+
+    def test_profile_sql_forwards_washout_days(self):
+        sql = AnalyticCohortBuilder().profile_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=90,
+        )
+        self.assertIn("washout AS (", sql)
+
+    def test_followup_audit_sql_forwards_washout_days(self):
+        sql = AnalyticCohortBuilder().followup_audit_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=90,
+        )
+        self.assertIn("washout AS (", sql)
+
+    def test_positivity_audit_sql_forwards_washout_days(self):
+        sql = AnalyticCohortBuilder().positivity_audit_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=90,
+        )
+        self.assertIn("washout AS (", sql)
+
+    def test_covariate_missingness_sql_forwards_washout_days(self):
+        sql = AnalyticCohortBuilder().covariate_missingness_sql(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=90,
+        )
+        self.assertIn("washout AS (", sql)
+
+
 if __name__ == "__main__":
     unittest.main()

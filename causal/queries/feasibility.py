@@ -309,6 +309,7 @@ def _cohort_ctes(
     care_site_names: tuple[str, ...],
     exposure_contrast: str,
     additional_population: tuple[ConceptSetSpec, ...] = (),
+    washout_days: int = 0,
 ) -> str:
     if population.domain not in DOMAIN_TABLES:
         raise ValueError(f"population domain must be one of {tuple(DOMAIN_TABLES)}")
@@ -334,6 +335,8 @@ def _cohort_ctes(
         raise ValueError("grace_period_hours must be >= 0 and follow_up_days must be positive")
     if min_age_years is not None and min_age_years < 0:
         raise ValueError("min_age_years must be non-negative")
+    if washout_days < 0 or isinstance(washout_days, bool):
+        raise ValueError("washout_days must be an integer >= 0")
 
     if treatment.domain not in DOMAIN_TABLES:
         raise ValueError(f"treatment domain must be one of {tuple(DOMAIN_TABLES)}")
@@ -455,6 +458,64 @@ def _cohort_ctes(
       GROUP BY e.person_id
     )""")
 
+    # New-user / washout eligibility (see `docs/eligibility_refinements_design.md`).
+    # `washout_days == 0` (default) emits nothing here and downstream, so the
+    # generated SQL is byte-identical to before this feature. When positive,
+    # one `washout` CTE carries two person-level booleans that
+    # `analytic_cohort_sql` filters on and `feasibility_sql` reports as
+    # attrition (never filtering -- same convention as the exposure-combination
+    # counts):
+    #   `washout_new_user`         -- no qualifying exposure in the half-open
+    #     look-back `[index - washout_days, index)`. The look-back concept set
+    #     is the treatment class, plus the comparator class only for an
+    #     active-comparator (`mutually_exclusive`) design, where "new user"
+    #     means new to *either* arm's drug (e.g. PEPTIC: no PPI AND no H2RA).
+    #     For `vs_unexposed`/`add_on` the comparator is either not a real drug
+    #     or is the backbone every cohort member is on by design.
+    #   `washout_lookback_covered` -- an `observation_period` actually spans
+    #     `index - washout_days` through `index`, so "no prior exposure" is an
+    #     observed fact rather than an artefact of a short record (the standard
+    #     OHDSI `priorObservation` rule; critical in MIMIC-IV, where
+    #     pre-admission history is thin). Same single-span convention the
+    #     `censored` column already uses.
+    if washout_days > 0:
+        washout_start = _dt_add(datasets, "e.index_datetime", -int(washout_days), "DAY")
+        prior_exposure_checks = [
+            f"""EXISTS (
+        SELECT 1
+        FROM {datasets.table('omop', trt_table)} wtx
+        JOIN treatment_concepts wtc ON wtx.{trt_concept_col} = wtc.concept_id
+        WHERE wtx.person_id = e.person_id
+          AND wtx.{trt_dt_col} >= {washout_start}
+          AND wtx.{trt_dt_col} < e.index_datetime
+      )"""
+        ]
+        if exposure_contrast == "mutually_exclusive":
+            prior_exposure_checks.append(
+                f"""EXISTS (
+        SELECT 1
+        FROM {datasets.table('omop', cmp_table)} wcx
+        JOIN comparator_concepts wcc ON wcx.{cmp_concept_col} = wcc.concept_id
+        WHERE wcx.person_id = e.person_id
+          AND wcx.{cmp_dt_col} >= {washout_start}
+          AND wcx.{cmp_dt_col} < e.index_datetime
+      )"""
+            )
+        ctes.append(f"""washout AS (
+      SELECT
+        e.person_id,
+        NOT ({" OR ".join(prior_exposure_checks)}) AS washout_new_user,
+        EXISTS (
+          SELECT 1
+          FROM {datasets.table('omop', 'observation_period')} wop
+          WHERE wop.person_id = e.person_id
+            AND DATE(e.index_datetime) BETWEEN wop.observation_period_start_date
+              AND wop.observation_period_end_date
+            AND wop.observation_period_start_date <= DATE({washout_start})
+        ) AS washout_lookback_covered
+      FROM eligible e
+    )""")
+
     # Follow-up (outcome ascertainment) starts at the same index_datetime as
     # exposure ascertainment, by design: this is what a grace-period target
     # trial emulation requires to avoid immortal-time bias (see
@@ -465,6 +526,17 @@ def _cohort_ctes(
     # `outcome_event_during_grace_period` is a diagnostic flag surfacing how
     # many events fall in that overlap, exposed separately in
     # `feasibility_sql` -- it never changes cohort membership or `outcome_event`.
+    #
+    # `washout_*` columns are carried through unchanged when the washout is
+    # active (see the `washout` CTE above); the non-death branch's GROUP BY
+    # gets them too (they are functionally dependent on person_id).
+    washout_select = (
+        ",\n        w.washout_new_user,\n        w.washout_lookback_covered" if washout_days > 0 else ""
+    )
+    washout_join = "\n      JOIN washout w USING (person_id)" if washout_days > 0 else ""
+    washout_group_by = (
+        ", w.washout_new_user, w.washout_lookback_covered" if washout_days > 0 else ""
+    )
     if outcome.domain == "death":
         ctes.append(f"""analytic AS (
       SELECT
@@ -484,9 +556,9 @@ def _cohort_ctes(
         d.death_date IS NOT NULL
           AND d.death_date >= DATE(e.index_datetime)
           AND d.death_date < DATE({_dt_add(datasets, 'e.index_datetime', grace_period_hours)})
-          AS outcome_event_during_grace_period
+          AS outcome_event_during_grace_period{washout_select}
       FROM eligible e
-      JOIN exposure x USING (person_id)
+      JOIN exposure x USING (person_id){washout_join}
       LEFT JOIN {datasets.table('omop', 'death')} d USING (person_id)
     )""")
     else:
@@ -506,12 +578,12 @@ def _cohort_ctes(
           oc.concept_id IS NOT NULL
           AND o.{out_dt_col} >= e.index_datetime
           AND o.{out_dt_col} < {_dt_add(datasets, 'e.index_datetime', grace_period_hours)}
-        ) > 0 AS outcome_event_during_grace_period
+        ) > 0 AS outcome_event_during_grace_period{washout_select}
       FROM eligible e
-      JOIN exposure x USING (person_id)
+      JOIN exposure x USING (person_id){washout_join}
       LEFT JOIN {datasets.table('omop', out_table)} o ON o.person_id = e.person_id
       LEFT JOIN outcome_concepts oc ON o.{out_concept_col} = oc.concept_id
-      GROUP BY e.person_id, x.has_treatment, x.has_comparator
+      GROUP BY e.person_id, x.has_treatment, x.has_comparator{washout_group_by}
     )""")
 
     return ",\n    ".join(ctes)
@@ -530,6 +602,7 @@ def feasibility_sql(
     care_site_names: tuple[str, ...] = (),
     exposure_contrast: str = "add_on",
     additional_population: tuple[ConceptSetSpec, ...] = (),
+    washout_days: int = 0,
 ) -> str:
     """Aggregate-only feasibility counts for an arbitrary target-trial question.
 
@@ -543,6 +616,13 @@ def feasibility_sql(
     independently-required population concept sets onto `population` --
     empty by default, unchanged behavior for a study with a single-concept
     population.
+
+    `washout_days` (see `_cohort_ctes` and `docs/eligibility_refinements_design.md`)
+    is likewise reported here as attrition, never filtered: when positive,
+    three extra columns (`washout_excluded_prevalent_users`,
+    `washout_excluded_insufficient_lookback`, `eligible_after_washout`) show
+    how the new-user look-back would reshape the cohort before a reviewer
+    approves it. Zero (default) emits no extra SQL.
     """
     if exposure_contrast not in EXPOSURE_CONTRASTS:
         raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
@@ -558,6 +638,15 @@ def feasibility_sql(
         care_site_names=care_site_names,
         exposure_contrast=exposure_contrast,
         additional_population=additional_population,
+        washout_days=washout_days,
+    )
+    washout_counts = (
+        """,
+      COUNTIF(NOT washout_new_user) AS washout_excluded_prevalent_users,
+      COUNTIF(washout_new_user AND NOT washout_lookback_covered) AS washout_excluded_insufficient_lookback,
+      COUNTIF(washout_new_user AND washout_lookback_covered) AS eligible_after_washout"""
+        if washout_days > 0
+        else ""
     )
     return f"""
     WITH {ctes}
@@ -572,7 +661,7 @@ def feasibility_sql(
       COUNTIF(outcome_event) AS outcome_events,
       COUNTIF(outcome_event AND has_treatment) AS outcome_events_treatment,
       COUNTIF(outcome_event AND has_comparator AND NOT has_treatment) AS outcome_events_comparator_only,
-      COUNTIF(outcome_event_during_grace_period) AS outcome_events_during_grace_period
+      COUNTIF(outcome_event_during_grace_period) AS outcome_events_during_grace_period{washout_counts}
     FROM analytic
     """
 
@@ -592,6 +681,7 @@ def analytic_cohort_sql(
     covariates: tuple[CovariateSpec, ...] = (),
     censoring_definition_approved: bool = False,
     additional_population: tuple[ConceptSetSpec, ...] = (),
+    washout_days: int = 0,
 ) -> str:
     """Person-level analytic cohort (A/Y columns) for the same target trial.
 
@@ -599,6 +689,13 @@ def analytic_cohort_sql(
     independently-required population concept sets onto `population` --
     empty by default, unchanged behavior for a study with a single-concept
     population.
+
+    `washout_days` (see `_cohort_ctes` and
+    `docs/eligibility_refinements_design.md`) restricts the cohort to
+    new users: persons with no qualifying exposure in
+    `[index - washout_days, index)` whose observation record actually covers
+    that look-back. Both conditions are ANDed into the inclusion filter.
+    Zero (default) emits no extra SQL.
 
     `exposure_contrast` (see `EXPOSURE_CONTRASTS`) selects the inclusion
     filter and the meaning of `A`; it does not change how `treatment`/
@@ -638,13 +735,19 @@ def analytic_cohort_sql(
         care_site_names=care_site_names,
         exposure_contrast=exposure_contrast,
         additional_population=additional_population,
+        washout_days=washout_days,
     )
-    where_clause = {
-        "add_on": "WHERE a.has_comparator",
-        "mutually_exclusive": "WHERE a.has_treatment != a.has_comparator",
+    inclusion_filters = {
+        "add_on": ["a.has_comparator"],
+        "mutually_exclusive": ["a.has_treatment != a.has_comparator"],
         # Everyone eligible is kept -- no comparator exposure to filter on.
-        "vs_unexposed": "",
+        "vs_unexposed": [],
     }[exposure_contrast]
+    if washout_days > 0:
+        # New-user restriction: no prior exposure in the look-back AND the
+        # look-back is actually observed (see the `washout` CTE).
+        inclusion_filters = [*inclusion_filters, "a.washout_new_user", "a.washout_lookback_covered"]
+    where_clause = f"WHERE {' AND '.join(inclusion_filters)}" if inclusion_filters else ""
     covariate_ctes, covariate_columns, covariate_joins = _covariate_ctes_columns_and_joins(
         datasets, covariates
     )

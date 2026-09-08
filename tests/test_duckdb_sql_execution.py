@@ -150,6 +150,30 @@ class DuckDBGeneratedSqlExecutesTests(unittest.TestCase):
         )
         self.con.execute(missingness_sql).fetchall()
 
+    def test_washout_sql_executes_for_every_branch(self):
+        # The washout CTE adds NOT EXISTS / EXISTS subqueries plus two extra
+        # GROUP BY terms on the non-death branch -- exactly the kind of
+        # binder mismatch this module exists to catch.
+        no_comparator = ConceptSetSpec(domain="", concept_ids=())
+        measurement_outcome = ConceptSetSpec(domain="measurement", concept_ids=(3016723,))
+        cases = (
+            feasibility_sql(
+                DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                exposure_contrast="mutually_exclusive", washout_days=90,
+            ),
+            analytic_cohort_sql(
+                DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                exposure_contrast="mutually_exclusive", washout_days=90,
+            ),
+            analytic_cohort_sql(
+                DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=no_comparator,
+                outcome=measurement_outcome, exposure_contrast="vs_unexposed", washout_days=30,
+            ),
+        )
+        for sql in cases:
+            with self.subTest(sql=sql[:60]):
+                self.con.execute(sql).fetchall()
+
     def test_all_mapping_audit_generators_execute(self):
         condition_plan = self._plan(_CONDITION_ENTRY)
         measurement_plan = self._plan(_MEASUREMENT_ENTRY)

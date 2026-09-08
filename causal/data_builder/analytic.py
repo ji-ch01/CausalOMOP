@@ -42,6 +42,7 @@ class CohortBuildManifest:
     exposure_contrast: str
     columns: tuple[AnalyticColumn, ...]
     unresolved_issues: tuple[str, ...]
+    washout_days: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,6 +80,7 @@ class AnalyticCohortBuilder:
         covariates: tuple[CovariateSpec, ...] = (),
         censoring_definition_approved: bool = False,
         additional_population: tuple[ConceptSetSpec, ...] = (),
+        washout_days: int = 0,
         execution_allowed: bool,
     ) -> tuple[str, CohortBuildManifest]:
         """`covariates` are reviewed, human-approved baseline covariates (see
@@ -98,6 +100,12 @@ class AnalyticCohortBuilder:
         ANDs one or more further independently-required population concept
         sets onto `population` -- empty by default, unchanged behavior for a
         study with a single-concept population.
+
+        `washout_days` (see `causal.queries.feasibility._cohort_ctes` and
+        `docs/eligibility_refinements_design.md`) restricts the cohort to new
+        users -- no qualifying exposure in `[index - washout_days, index)`,
+        with the look-back actually observed. Zero (default) is unchanged
+        behavior. Recorded on the manifest for provenance.
         """
         if not study_id.strip():
             raise ValueError("study_id is required")
@@ -117,6 +125,7 @@ class AnalyticCohortBuilder:
             covariates=covariates,
             censoring_definition_approved=censoring_definition_approved,
             additional_population=additional_population,
+            washout_days=washout_days,
         )
         covariate_columns = tuple(
             AnalyticColumn(
@@ -141,6 +150,7 @@ class AnalyticCohortBuilder:
             exposure_contrast=exposure_contrast,
             columns=self.COLUMNS + covariate_columns,
             unresolved_issues=tuple(unresolved_issues),
+            washout_days=int(washout_days),
         )
         return sql, manifest
 
@@ -159,6 +169,7 @@ class AnalyticCohortBuilder:
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
         additional_population: tuple[ConceptSetSpec, ...] = (),
+        washout_days: int = 0,
     ) -> str:
         """Return an aggregate-only query safe for MCP feasibility output."""
         cohort_sql, _ = self.build(
@@ -168,6 +179,7 @@ class AnalyticCohortBuilder:
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
             additional_population=additional_population,
+            washout_days=washout_days,
             execution_allowed=False,
         )
         return f"""
@@ -206,6 +218,7 @@ class AnalyticCohortBuilder:
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
         additional_population: tuple[ConceptSetSpec, ...] = (),
+        washout_days: int = 0,
     ) -> str:
         """Audit nominal follow-up observability and return aggregate counts only."""
         cohort_sql, _ = self.build(
@@ -215,6 +228,7 @@ class AnalyticCohortBuilder:
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
             additional_population=additional_population,
+            washout_days=washout_days,
             execution_allowed=False,
         )
         return f"""
@@ -279,6 +293,7 @@ class AnalyticCohortBuilder:
         exposure_contrast: str = "add_on",
         covariates: tuple[CovariateSpec, ...] = (),
         additional_population: tuple[ConceptSetSpec, ...] = (),
+        washout_days: int = 0,
     ) -> str:
         """Univariate treatment-arm overlap, one reviewed baseline covariate at
         a time -- a practical proxy for positivity (Hernan & Robins, *Causal
@@ -306,6 +321,7 @@ class AnalyticCohortBuilder:
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast, covariates=covariates,
             additional_population=additional_population,
+            washout_days=washout_days,
             execution_allowed=False,
         )
         columns = [
@@ -355,6 +371,7 @@ class AnalyticCohortBuilder:
         exposure_contrast: str = "add_on",
         covariates: tuple[CovariateSpec, ...] = (),
         additional_population: tuple[ConceptSetSpec, ...] = (),
+        washout_days: int = 0,
     ) -> str:
         """Per-covariate missingness across the full analytic cohort,
         generalizing `profile_sql`'s hardcoded age/gender/race-only pattern
@@ -373,6 +390,7 @@ class AnalyticCohortBuilder:
             min_age_years=min_age_years, care_site_names=care_site_names,
             exposure_contrast=exposure_contrast, covariates=covariates,
             additional_population=additional_population,
+            washout_days=washout_days,
             execution_allowed=False,
         )
         columns = ["COUNT(*) AS cohort_persons"]

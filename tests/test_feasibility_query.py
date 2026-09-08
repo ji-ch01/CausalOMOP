@@ -1,5 +1,6 @@
 import unittest
 
+from causal.agents.query_validation import QueryValidationAgent
 from causal.config import BigQueryDatasets
 from causal.queries import ConceptSetSpec, analytic_cohort_sql, feasibility_sql
 
@@ -237,6 +238,109 @@ class AdditionalPopulationConceptSetTests(unittest.TestCase):
         )
         self.assertIn("population_additional_0_concepts", sql)
         self.assertIn("EXISTS (", sql)
+
+
+class WashoutWindowTests(unittest.TestCase):
+    """`washout_days > 0` restricts the analytic cohort to new users: no
+    qualifying exposure in `[index - washout_days, index)` whose look-back is
+    actually observed (see `_cohort_ctes` and
+    `docs/eligibility_refinements_design.md`). `washout_days == 0` (default)
+    must emit byte-identical SQL to before the feature existed."""
+
+    def test_defaults_to_unchanged_behavior(self):
+        with_default = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+        )
+        explicit_zero = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=0,
+        )
+        self.assertEqual(with_default, explicit_zero)
+        self.assertNotIn("washout", with_default)
+
+    def test_rejects_a_negative_window(self):
+        with self.assertRaises(ValueError):
+            feasibility_sql(
+                BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                washout_days=-1,
+            )
+
+    def test_adds_a_washout_cte_with_prior_exposure_and_lookback_checks(self):
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            exposure_contrast="vs_unexposed", washout_days=90,
+        )
+        self.assertIn("washout AS (", sql)
+        self.assertIn("NOT (EXISTS (", sql)
+        self.assertIn("wtx.drug_exposure_start_datetime < e.index_datetime", sql)
+        self.assertIn("DATETIME_ADD(e.index_datetime, INTERVAL -90 DAY)", sql)
+        self.assertIn("observation_period_start_date <=", sql)
+        # New-user restriction is ANDed into the inclusion filter.
+        self.assertIn("a.washout_new_user AND a.washout_lookback_covered", sql)
+
+    def test_mutually_exclusive_also_washes_out_the_comparator_class(self):
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            exposure_contrast="mutually_exclusive", washout_days=90,
+        )
+        self.assertIn("JOIN comparator_concepts wcc", sql)
+        self.assertIn("wcx.drug_exposure_start_datetime < e.index_datetime", sql)
+
+    def test_vs_unexposed_does_not_reference_a_comparator_class(self):
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=DEATH, outcome=DEATH,
+            exposure_contrast="vs_unexposed", washout_days=30,
+        )
+        self.assertNotIn("comparator_concepts", sql)
+
+    def test_feasibility_sql_reports_washout_attrition_without_filtering(self):
+        sql = feasibility_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=90,
+        )
+        self.assertIn("COUNTIF(NOT washout_new_user) AS washout_excluded_prevalent_users", sql)
+        self.assertIn(
+            "COUNTIF(washout_new_user AND NOT washout_lookback_covered) "
+            "AS washout_excluded_insufficient_lookback",
+            sql,
+        )
+        self.assertIn(
+            "COUNTIF(washout_new_user AND washout_lookback_covered) AS eligible_after_washout", sql
+        )
+        # feasibility_sql never filters the cohort on the washout.
+        self.assertNotIn("WHERE", sql.split("FROM analytic")[1])
+
+    def test_duckdb_backend_uses_portable_interval_arithmetic(self):
+        sql = feasibility_sql(
+            DUCKDB_DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            washout_days=90,
+        )
+        self.assertNotIn("DATETIME_ADD", sql)
+        self.assertIn("INTERVAL (-90) DAY", sql)
+
+    def test_washout_sql_passes_governance_validation(self):
+        feasibility = feasibility_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            exposure_contrast="mutually_exclusive", washout_days=90,
+        )
+        cohort = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            exposure_contrast="mutually_exclusive", washout_days=90,
+        )
+        self.assertTrue(QueryValidationAgent().run(feasibility, purpose="aggregate_feasibility").passed)
+        self.assertTrue(QueryValidationAgent().run(cohort, purpose="person_level_dataset").passed)
+
+    def test_grouped_non_death_branch_keeps_washout_columns_in_group_by(self):
+        outcome = ConceptSetSpec(domain="measurement", concept_ids=(3016723,))
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=outcome,
+            washout_days=90,
+        )
+        self.assertIn(
+            "GROUP BY e.person_id, x.has_treatment, x.has_comparator, "
+            "w.washout_new_user, w.washout_lookback_covered",
+            sql,
+        )
 
 
 if __name__ == "__main__":
