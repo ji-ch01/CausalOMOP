@@ -204,6 +204,7 @@ class BigQueryOMOPGateway:
         care_site_names: tuple[str, ...] = (),
         exposure_contrast: str = "add_on",
         additional_population: tuple[ConceptSetSpec, ...] = (),
+        washout_days: int = 0,
     ) -> dict[str, Any]:
         """Run provisional cohort counts for one target-trial question.
 
@@ -226,6 +227,7 @@ class BigQueryOMOPGateway:
             care_site_names=care_site_names,
             exposure_contrast=exposure_contrast,
             additional_population=additional_population,
+            washout_days=washout_days,
         )
         validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")
         if not validation.passed:
@@ -239,8 +241,18 @@ class BigQueryOMOPGateway:
             "causal_effect_estimated": False,
             "grace_period_hours": grace_period_hours,
             "follow_up_days": follow_up_days,
+            "washout_days": washout_days,
             "counts": counts,
             "warnings": [
+                *(
+                    [
+                        "washout_days > 0: a large washout_excluded_insufficient_lookback "
+                        "count reflects MIMIC-IV's thin pre-admission history, not a real "
+                        "prevalent-user population -- read it before approving the new-user rule."
+                    ]
+                    if washout_days > 0
+                    else []
+                ),
                 "Concept sets reflect current human-approved mappings only; unmapped "
                 "roles will fail with a clear error rather than silently degrading.",
                 "Counts are for pipeline feasibility and must not be interpreted causally.",

@@ -50,6 +50,7 @@ _DECISION_EVENTS: dict[str, str] = {
     "negative_control_mapped": "mapping",
     "target_trial_estimand_corrected": "estimand",
     "exposure_contrast_set": "scope",
+    "washout_window_set": "scope",
     "censoring_definition_approved": "estimand",
     "statistical_estimand_strategy_set": "estimand",
     "cate_cutpoint_set": "estimand",

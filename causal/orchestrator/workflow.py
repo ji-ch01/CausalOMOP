@@ -544,9 +544,13 @@ def _load_query_settings(protocol: dict) -> dict[str, Any]:
     settings = protocol.get("query_settings")
     if not isinstance(settings, dict):
         settings = {}
+    washout_days = settings.get("washout_days", 0)
+    if isinstance(washout_days, bool) or not isinstance(washout_days, int) or washout_days < 0:
+        raise RuntimeError("query_settings.washout_days must be an integer >= 0")
     return {
         "care_site_names": tuple(str(value) for value in settings.get("care_site_names", ())),
         "min_age_years": settings.get("min_age_years", 18),
+        "washout_days": washout_days,
     }
 
 
@@ -4200,8 +4204,14 @@ class WorkflowManager:
                 f"- No recognized exposure: **{counts.get('neither_exposure', '—')}**",
                 f"- Outcome events, all groups: **{counts.get('outcome_events', '—')}**",
                 f"- Outcome events during grace period: **{counts.get('outcome_events_during_grace_period', '—')}**",
-                "", "### Feasibility warnings", "",
             ])
+            if "eligible_after_washout" in counts:
+                lines.extend([
+                    f"- Excluded as prevalent users (washout): **{counts.get('washout_excluded_prevalent_users', '—')}**",
+                    f"- Excluded for unobserved look-back (washout): **{counts.get('washout_excluded_insufficient_lookback', '—')}**",
+                    f"- Eligible after washout: **{counts.get('eligible_after_washout', '—')}**",
+                ])
+            lines.extend(["", "### Feasibility warnings", ""])
             lines.extend(f"- {warning}" for warning in feasibility.get("warnings", ()))
         if cohort_manifest:
             lines.extend([
@@ -4717,6 +4727,67 @@ class WorkflowManager:
                 changes={"before": before, "after": exposure_contrast},
             )
             self._invalidate_gates_from(state, "analysis_plan", "exposure_contrast changed")
+            self.save(state)
+        return state
+
+    def set_washout_window(
+        self,
+        run_id: str,
+        washout_days: int,
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's choice of new-user look-back window
+        (`protocol["query_settings"]["washout_days"]`; see
+        `causal.queries.feasibility._cohort_ctes` and
+        `docs/eligibility_refinements_design.md`).
+
+        `washout_days > 0` restricts the analytic cohort to new users: no
+        qualifying exposure in `[index - washout_days, index)`, with an
+        `observation_period` actually spanning that look-back. The look-back
+        concept set is derived from the exposure concept sets (treatment
+        class, plus the comparator class for an active-comparator
+        `mutually_exclusive` design). `feasibility_sql` surfaces the
+        attrition (`washout_excluded_prevalent_users`,
+        `washout_excluded_insufficient_lookback`, `eligible_after_washout`)
+        without filtering, so a reviewer sees it before approving.
+
+        Same shape as `set_exposure_contrast`: this is a real design
+        decision, explicitly reviewer-set rather than defaulted; it writes
+        only `query_settings` (never `hypothesis.json`) and invalidates gates
+        from `analysis_plan` -- a cohort built before and after this differs.
+        The reviewer should still state the washout in the target trial's
+        prose `eligibility_criteria`; `dag_identification` does not yet
+        derive a structured "new user" node from this field.
+        """
+        if isinstance(washout_days, bool) or not isinstance(washout_days, int) or washout_days < 0:
+            raise ValueError("washout_days must be an integer >= 0")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+
+        with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            settings = protocol.get("query_settings")
+            settings = dict(settings) if isinstance(settings, dict) else {}
+            before = int(settings.get("washout_days", 0))
+            settings["washout_days"] = washout_days
+            protocol["query_settings"] = settings
+            _atomic_write_json(protocol_path, protocol)
+
+            detail = f"washout_days: {before} -> {washout_days} by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "washout_window_set", detail,
+                changes={"before": before, "after": washout_days},
+            )
+            self._invalidate_gates_from(state, "analysis_plan", "washout_days changed")
             self.save(state)
         return state
 
@@ -5436,6 +5507,7 @@ class WorkflowManager:
             "causal_effect_estimated": False,
             "grace_period_hours": grace_period_hours,
             "follow_up_days": follow_up_days,
+            "washout_days": settings["washout_days"],
             "counts": counts,
             "mcp_metadata": response.metadata,
             "warnings": [
@@ -5446,6 +5518,15 @@ class WorkflowManager:
                 "the exposure-ascertainment window itself, before treatment status was "
                 "determined; a large share of outcome_events falling here warrants review "
                 "before trusting the arm each such person was assigned to.",
+                *(
+                    [
+                        "washout_days > 0: a large washout_excluded_insufficient_lookback "
+                        "count reflects MIMIC-IV's thin pre-admission history, not a real "
+                        "prevalent-user population -- read it before approving the new-user rule."
+                    ]
+                    if settings["washout_days"] > 0
+                    else []
+                ),
             ],
         }
         artifact_path = run_dir / "feasibility.json"
