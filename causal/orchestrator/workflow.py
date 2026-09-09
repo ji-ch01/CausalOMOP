@@ -129,6 +129,7 @@ from causal.queries import (
     COVARIATE_AGGREGATIONS_BY_DOMAIN,
     DOMAIN_TABLES,
     EXPOSURE_CONTRASTS,
+    MORTALITY_ASCERTAINMENT,
     OUTCOME_DOMAINS,
     ConceptSetSpec,
     CovariateSpec,
@@ -547,10 +548,16 @@ def _load_query_settings(protocol: dict) -> dict[str, Any]:
     washout_days = settings.get("washout_days", 0)
     if isinstance(washout_days, bool) or not isinstance(washout_days, int) or washout_days < 0:
         raise RuntimeError("query_settings.washout_days must be an integer >= 0")
+    mortality_ascertainment = settings.get("mortality_ascertainment", "any_location")
+    if mortality_ascertainment not in MORTALITY_ASCERTAINMENT:
+        raise RuntimeError(
+            f"query_settings.mortality_ascertainment must be one of {MORTALITY_ASCERTAINMENT}"
+        )
     return {
         "care_site_names": tuple(str(value) for value in settings.get("care_site_names", ())),
         "min_age_years": settings.get("min_age_years", 18),
         "washout_days": washout_days,
+        "mortality_ascertainment": mortality_ascertainment,
     }
 
 
@@ -4211,6 +4218,11 @@ class WorkflowManager:
                     f"- Excluded for unobserved look-back (washout): **{counts.get('washout_excluded_insufficient_lookback', '—')}**",
                     f"- Eligible after washout: **{counts.get('eligible_after_washout', '—')}**",
                 ])
+            if "deaths_after_discharge_within_horizon" in counts:
+                lines.append(
+                    f"- Deaths after discharge, not counted (in-hospital ascertainment): "
+                    f"**{counts.get('deaths_after_discharge_within_horizon', '—')}**"
+                )
             lines.extend(["", "### Feasibility warnings", ""])
             lines.extend(f"- {warning}" for warning in feasibility.get("warnings", ()))
         if cohort_manifest:
@@ -4788,6 +4800,65 @@ class WorkflowManager:
                 changes={"before": before, "after": washout_days},
             )
             self._invalidate_gates_from(state, "analysis_plan", "washout_days changed")
+            self.save(state)
+        return state
+
+    def set_mortality_ascertainment(
+        self,
+        run_id: str,
+        mortality_ascertainment: str,
+        reviewer: str,
+        comment: str | None = None,
+    ) -> RunState:
+        """Record a human's choice of how a death-domain outcome is
+        ascertained (`protocol["query_settings"]["mortality_ascertainment"]`;
+        see `causal.queries.feasibility.MORTALITY_ASCERTAINMENT` and
+        `docs/eligibility_refinements_design.md` section 3).
+
+        `"in_hospital"` makes `Y` count only deaths during the index
+        hospitalization -- a person discharged alive before the follow-up
+        horizon is `Y=0` even if they later die out of hospital (the
+        competing-risks subdistribution view). It matches endpoints reported
+        as "in-hospital mortality" (PEPTIC / Q1); the default
+        `"any_location"` matches "28-/90-day all-cause mortality" (CAPE COD,
+        ADRENAL). The SQL builders reject `"in_hospital"` with a non-death
+        outcome.
+
+        Same shape as `set_exposure_contrast`: a real estimand decision,
+        explicitly reviewer-set; writes only `query_settings`, never
+        `hypothesis.json`; invalidates gates from `analysis_plan` (`Y`
+        changes, so the analytic dataset and everything downstream must be
+        rebuilt). The reviewer should still state the ascertainment in the
+        target trial's prose `outcome_definition`.
+        """
+        if mortality_ascertainment not in MORTALITY_ASCERTAINMENT:
+            raise ValueError(f"mortality_ascertainment must be one of {MORTALITY_ASCERTAINMENT}")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+
+        run_dir = self.runs_dir / run_id
+        protocol_path = run_dir / "protocol.json"
+
+        with _RunLock(run_dir):
+            # Loaded and saved entirely inside the lock so a concurrent
+            # `decide_gate`/`advance` cannot be clobbered by this save.
+            state = self.load(run_id)
+            protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            settings = protocol.get("query_settings")
+            settings = dict(settings) if isinstance(settings, dict) else {}
+            before = settings.get("mortality_ascertainment", "any_location")
+            settings["mortality_ascertainment"] = mortality_ascertainment
+            protocol["query_settings"] = settings
+            _atomic_write_json(protocol_path, protocol)
+
+            detail = f"mortality_ascertainment: {before} -> {mortality_ascertainment} by {reviewer}"
+            if comment and comment.strip():
+                detail += f" ({comment.strip()})"
+            state.record(
+                "mortality_ascertainment_set", detail,
+                changes={"before": before, "after": mortality_ascertainment},
+            )
+            self._invalidate_gates_from(state, "analysis_plan", "mortality_ascertainment changed")
             self.save(state)
         return state
 
@@ -5508,6 +5579,7 @@ class WorkflowManager:
             "grace_period_hours": grace_period_hours,
             "follow_up_days": follow_up_days,
             "washout_days": settings["washout_days"],
+            "mortality_ascertainment": settings["mortality_ascertainment"],
             "counts": counts,
             "mcp_metadata": response.metadata,
             "warnings": [
@@ -5525,6 +5597,16 @@ class WorkflowManager:
                         "prevalent-user population -- read it before approving the new-user rule."
                     ]
                     if settings["washout_days"] > 0
+                    else []
+                ),
+                *(
+                    [
+                        "mortality_ascertainment='in_hospital': deaths_after_discharge_within_horizon "
+                        "are deaths reclassified as non-events versus the calendar-window definition; "
+                        "a large count means the two estimands differ materially."
+                    ]
+                    if settings["mortality_ascertainment"] == "in_hospital"
+                    and specs["outcome"].domain == "death"
                     else []
                 ),
             ],

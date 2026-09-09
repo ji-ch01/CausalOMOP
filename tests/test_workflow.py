@@ -2109,6 +2109,61 @@ class WorkflowSetWashoutWindowTests(unittest.TestCase):
         self.assertEqual(state.gates["analysis_plan"].status, "pending")
 
 
+class WorkflowSetMortalityAscertainmentTests(unittest.TestCase):
+    """`set_mortality_ascertainment` records how a death outcome is
+    ascertained (`query_settings.mortality_ascertainment`; see
+    `docs/eligibility_refinements_design.md` section 3). Same shape as
+    `set_exposure_contrast`."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.protocol = root / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "study_id": "test_study",
+            "source_question": "Does treatment affect outcome?",
+            "target_trial": {
+                "population": "population", "treatment": "treatment",
+                "comparator": "comparator", "time_zero": "index",
+                "grace_period_hours": 24, "outcome": "outcome",
+                "follow_up_days": 28, "primary_estimand": "ATE"
+            },
+            "concept_sets": {"treatment": {"status": "approved"}},
+        }), encoding="utf-8")
+        self.manager = WorkflowManager(root / "runs")
+        self.state = self.manager.start(self.protocol)
+        self.run_dir = root / "runs" / self.state.run_id
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _protocol(self) -> dict:
+        return json.loads((self.run_dir / "protocol.json").read_text(encoding="utf-8"))
+
+    def test_saves_the_choice_to_protocol_json(self):
+        self.manager.set_mortality_ascertainment(self.state.run_id, "in_hospital", "Dr. Lee")
+        self.assertEqual(self._protocol()["query_settings"]["mortality_ascertainment"], "in_hospital")
+
+    def test_rejects_an_unknown_value(self):
+        with self.assertRaises(ValueError):
+            self.manager.set_mortality_ascertainment(self.state.run_id, "wherever", "Dr. Lee")
+
+    def test_requires_a_reviewer(self):
+        with self.assertRaises(ValueError):
+            self.manager.set_mortality_ascertainment(self.state.run_id, "in_hospital", "  ")
+
+    def test_records_structured_history_event(self):
+        state = self.manager.set_mortality_ascertainment(self.state.run_id, "in_hospital", "Dr. Lee")
+        event = next(e for e in state.history if e["event"] == "mortality_ascertainment_set")
+        self.assertEqual(event["changes"]["before"], "any_location")
+        self.assertEqual(event["changes"]["after"], "in_hospital")
+
+    def test_invalidates_the_analysis_plan_gate(self):
+        self.manager.decide_gate(self.state.run_id, "analysis_plan", "provisional", "Dr. Lee")
+        state = self.manager.set_mortality_ascertainment(self.state.run_id, "in_hospital", "Dr. Lee")
+        self.assertEqual(state.gates["analysis_plan"].status, "pending")
+
+
 class RunLockTests(unittest.TestCase):
     """`_RunLock` is what turns two reviewers editing the same run's
     `protocol.json` at the same time from a silent last-write-wins race into

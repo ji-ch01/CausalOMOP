@@ -51,6 +51,7 @@ _DECISION_EVENTS: dict[str, str] = {
     "target_trial_estimand_corrected": "estimand",
     "exposure_contrast_set": "scope",
     "washout_window_set": "scope",
+    "mortality_ascertainment_set": "estimand",
     "censoring_definition_approved": "estimand",
     "statistical_estimand_strategy_set": "estimand",
     "cate_cutpoint_set": "estimand",
