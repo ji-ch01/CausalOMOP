@@ -72,6 +72,19 @@ review, not executable concept sets.
   procedure.
 - **Site-level prescribing culture** is only partially captured by the
   `care_site` label (`reference_dag.json` marks the rest unobserved).
+- **`care_site`, `calendar_year`, and `admission_type` are not currently
+  extractable as covariates.** A live end-to-end run found the
+  covariate-extraction system only supports `condition`/`drug`/`procedure`/
+  `measurement`/`observation` domains, with no `visit_occurrence`-derived
+  covariate path yet (see
+  [`docs/eligibility_refinements_design.md`](../../docs/eligibility_refinements_design.md)
+  section 4). This is an engineering-coverage gap, not unmeasured data:
+  these three are recorded in the OMOP build but must be dropped from the
+  adjustment set until the covariate system is extended. `care_site` is
+  PEPTIC's own randomization unit and `calendar_year` tracks the PPI-uptake
+  trend across MIMIC-IV's window (see `docs/validation_question_bank.md`'s
+  Q1 entry) -- losing them is a real, not cosmetic, reduction in confounding
+  control and must be stated in any report built from a run missing them.
 
 For the governed command sequence, see
 [`docs/responsible_demo_guide.md`](../../docs/responsible_demo_guide.md) and

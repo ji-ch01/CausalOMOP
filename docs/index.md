@@ -24,7 +24,7 @@ the tool's scope.
 | [FastOMOP integration](fastomop_integration.md) | component ownership, OMCP contract, and submodules |
 | [LLM hypothesis integration](llm_hypothesis_integration.md) | question gate, evidence retrieval, critique, and provider policy |
 | [DAG generation reference](dag_generation_audit.md) | pipeline design, evaluation methodology (SHD/SID, causal-learn), and known gaps |
-| [Eligibility refinements design](eligibility_refinements_design.md) | washout / new-user (implemented), landmark and in-hospital-mortality modes (specified); the methodological corrections each needs |
+| [Eligibility refinements design](eligibility_refinements_design.md) | washout / new-user and in-hospital-mortality modes (implemented), landmark (specified, deferred); the methodological corrections each needs |
 | [Repository map](repo_map.md) | folder ownership and Git policy |
 | [Responsible demo guide](responsible_demo_guide.md) | current demonstration script |
 | [Validation study candidates](validation_study_candidates.md) | reference-grounded shortlist of causal questions runnable end-to-end, with selection criteria and citations |

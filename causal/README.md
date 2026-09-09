@@ -67,11 +67,15 @@ call it.
   positivity screening, and per-covariate missingness audits;
 - person-level analytic cohort SQL generation (`A`, `Y`, `index_datetime`,
   covariates, and an optional reviewer-approved `censored` column) for OMOP
-  CDM, portable across BigQuery and DuckDB; with an optional reviewer-set
-  new-user look-back (`query_settings.washout_days`, off by default) that
-  excludes prevalent users and persons whose look-back is not observed, and
-  reports the attrition in the feasibility counts before the gate
-  (`docs/eligibility_refinements_design.md`);
+  CDM, portable across BigQuery and DuckDB. Two optional reviewer-set
+  refinements, both off by default and both reporting their effect in the
+  feasibility counts before the gate
+  (`docs/eligibility_refinements_design.md`): a new-user look-back
+  (`query_settings.washout_days`) that excludes prevalent users and persons
+  whose look-back is not observed, and an in-hospital-mortality mode
+  (`query_settings.mortality_ascertainment = "in_hospital"`) that scopes a
+  death outcome to the index hospitalization (discharged-alive-before-horizon
+  is a non-event);
 - governed, read-only query execution via OMCP, with SQL-safety validation
   before anything reaches a database;
 - governed materialization of that person-level cohort into a local
