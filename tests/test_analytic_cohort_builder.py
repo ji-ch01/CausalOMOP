@@ -464,5 +464,53 @@ class WashoutDaysPassThroughTests(unittest.TestCase):
         self.assertIn("washout AS (", sql)
 
 
+class MortalityAscertainmentPassThroughTests(unittest.TestCase):
+    """`mortality_ascertainment` is a thin pass-through to
+    `analytic_cohort_sql` on every method here (the in-hospital logic lives
+    in `causal.queries.feasibility._cohort_ctes`); it is also recorded on the
+    build manifest."""
+
+    def test_build_forwards_and_records_it(self):
+        sql, manifest = AnalyticCohortBuilder().build(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            mortality_ascertainment="in_hospital", execution_allowed=False,
+        )
+        self.assertIn("v.visit_end_datetime", sql)
+        self.assertEqual(manifest.mortality_ascertainment, "in_hospital")
+        self.assertEqual(manifest.to_dict()["mortality_ascertainment"], "in_hospital")
+
+    def test_default_is_any_location_and_sql_unchanged(self):
+        sql, manifest = AnalyticCohortBuilder().build(
+            "study", BigQueryDatasets(),
+            population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            execution_allowed=False,
+        )
+        self.assertNotIn("v.visit_end_datetime", sql)
+        self.assertEqual(manifest.mortality_ascertainment, "any_location")
+
+    def test_helpers_forward_mortality_ascertainment(self):
+        builder = AnalyticCohortBuilder()
+        for sql in (
+            builder.profile_sql(
+                "s", BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN,
+                comparator=CRYSTALLOID, outcome=DEATH, mortality_ascertainment="in_hospital",
+            ),
+            builder.followup_audit_sql(
+                "s", BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN,
+                comparator=CRYSTALLOID, outcome=DEATH, mortality_ascertainment="in_hospital",
+            ),
+            builder.positivity_audit_sql(
+                "s", BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN,
+                comparator=CRYSTALLOID, outcome=DEATH, mortality_ascertainment="in_hospital",
+            ),
+            builder.covariate_missingness_sql(
+                "s", BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN,
+                comparator=CRYSTALLOID, outcome=DEATH, mortality_ascertainment="in_hospital",
+            ),
+        ):
+            self.assertIn("v.visit_end_datetime", sql)
+
+
 if __name__ == "__main__":
     unittest.main()

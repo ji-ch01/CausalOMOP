@@ -205,6 +205,7 @@ class BigQueryOMOPGateway:
         exposure_contrast: str = "add_on",
         additional_population: tuple[ConceptSetSpec, ...] = (),
         washout_days: int = 0,
+        mortality_ascertainment: str = "any_location",
     ) -> dict[str, Any]:
         """Run provisional cohort counts for one target-trial question.
 
@@ -228,6 +229,7 @@ class BigQueryOMOPGateway:
             exposure_contrast=exposure_contrast,
             additional_population=additional_population,
             washout_days=washout_days,
+            mortality_ascertainment=mortality_ascertainment,
         )
         validation = QueryValidationAgent().run(sql, purpose="aggregate_feasibility")
         if not validation.passed:
@@ -242,6 +244,7 @@ class BigQueryOMOPGateway:
             "grace_period_hours": grace_period_hours,
             "follow_up_days": follow_up_days,
             "washout_days": washout_days,
+            "mortality_ascertainment": mortality_ascertainment,
             "counts": counts,
             "warnings": [
                 *(
@@ -251,6 +254,15 @@ class BigQueryOMOPGateway:
                         "prevalent-user population -- read it before approving the new-user rule."
                     ]
                     if washout_days > 0
+                    else []
+                ),
+                *(
+                    [
+                        "mortality_ascertainment='in_hospital': deaths_after_discharge_within_horizon "
+                        "are the deaths reclassified as non-events versus the calendar-window "
+                        "definition; a large count means the two estimands differ materially."
+                    ]
+                    if mortality_ascertainment == "in_hospital" and outcome.domain == "death"
                     else []
                 ),
                 "Concept sets reflect current human-approved mappings only; unmapped "
