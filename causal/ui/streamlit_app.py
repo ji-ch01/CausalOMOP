@@ -76,7 +76,12 @@ from causal.llm import build_hypothesis_llm
 from causal.mcp_client import OMCPClient
 from causal.orchestrator.state import NEXT_PHASE, PHASES, RunState
 from causal.orchestrator.workflow import WorkflowManager
-from causal.queries import COVARIATE_AGGREGATIONS_BY_DOMAIN, EXPOSURE_CONTRASTS, OUTCOME_DOMAINS
+from causal.queries import (
+    COVARIATE_AGGREGATIONS_BY_DOMAIN,
+    EXPOSURE_CONTRASTS,
+    MORTALITY_ASCERTAINMENT,
+    OUTCOME_DOMAINS,
+)
 from causal.roadmap import CENSORING_STRATEGIES, ESTIMATION_PROCEDURES, MISSING_DATA_STRATEGIES, CausalDAG
 from causal.ui.conversation import render_conversation_panel, reset_intake
 
@@ -354,6 +359,8 @@ _REVIEWER_FIELD_KEY_PREFIXES = (
     "censoring_definition_reviewer_",
     "narrative_reviewer_",
     "negative_control_reviewer_",
+    "washout_window_reviewer_",
+    "mortality_ascertainment_reviewer_",
 )
 
 
@@ -2078,6 +2085,116 @@ def _render_exposure_contrast_selector(manager: WorkflowManager, run_id: str, pr
     return current
 
 
+# mortality_ascertainment value -> (clinician-facing label, plain-language
+# description). See `causal.queries.feasibility.MORTALITY_ASCERTAINMENT`'s
+# own comment and `docs/eligibility_refinements_design.md` section 3 for the
+# full modeling rationale.
+_MORTALITY_ASCERTAINMENT_INFO: dict[str, tuple[str, str]] = {
+    "any_location": (
+        "Any location (default)",
+        "A death outcome counts a death anywhere within the follow-up horizon, whether the "
+        "person is still admitted or was discharged first. Matches a fixed-day mortality "
+        'endpoint, e.g. "28-day" or "90-day all-cause mortality" (CAPE COD, ADRENAL).',
+    ),
+    "in_hospital": (
+        "In-hospital only",
+        "A death outcome only counts a death before the person leaves the index "
+        "hospitalization; a person discharged alive before the horizon is a non-event even if "
+        'they later die out of hospital. Matches an "in-hospital mortality" endpoint (e.g. '
+        "PEPTIC). Only meaningful for a death-domain outcome -- the query builders reject it "
+        "otherwise.",
+    ),
+}
+
+
+def _render_washout_window_selector(manager: WorkflowManager, run_id: str, protocol: dict) -> int:
+    """Lets a reviewer set the new-user look-back window (see
+    `causal.orchestrator.workflow.WorkflowManager.set_washout_window` and
+    `docs/eligibility_refinements_design.md` section 1) -- a real design
+    decision, not a query-engine detail: `> 0` excludes prevalent users
+    (anyone with a qualifying treatment/comparator exposure in the look-back
+    before index) and anyone whose observation record doesn't actually cover
+    that look-back. Off (0 days) by default, unchanged behavior. Sibling of
+    `_render_exposure_contrast_selector`; same shape.
+
+    Returns the currently-saved value (before any unsubmitted form edit).
+    """
+    settings = protocol.get("query_settings")
+    current = int((settings or {}).get("washout_days", 0))
+    st.markdown("**New-user look-back window**")
+    st.caption(
+        f"Currently **{current} day(s)** (0 = disabled). `> 0` restricts the cohort to new "
+        "users: excludes anyone with a qualifying treatment/comparator exposure in the "
+        "look-back before index, and anyone whose observation record doesn't actually cover "
+        "it. Feasibility reports the attrition before you gate on it. MIMIC caveat: patients "
+        "enter the record at hospital/ED admission, so a long look-back is close to vacuous "
+        "unless look-back coverage is checked too (it is, automatically)."
+    )
+    with st.form(key=f"washout_window_form_{run_id}"):
+        washout_days = st.number_input(
+            "Look-back window (days)",
+            min_value=0,
+            step=1,
+            value=current,
+            key=f"washout_window_choice_{run_id}",
+        )
+        reviewer = st.text_input(
+            "Reviewer", value=_reviewer_default(), key=f"washout_window_reviewer_{run_id}"
+        )
+        submitted = st.form_submit_button("Save look-back window")
+        if submitted:
+            try:
+                manager.set_washout_window(run_id, int(washout_days), reviewer)
+                st.success("Look-back window saved")
+                st.rerun()
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+    return current
+
+
+def _render_mortality_ascertainment_selector(manager: WorkflowManager, run_id: str, protocol: dict) -> str:
+    """Lets a reviewer choose how a death-domain outcome is ascertained (see
+    `causal.queries.feasibility.MORTALITY_ASCERTAINMENT` and
+    `docs/eligibility_refinements_design.md` section 3) -- a real estimand
+    decision (`Y` itself changes, not just the cohort filter), so it
+    invalidates gates from `analysis_plan` the same way the comparator
+    design does. Sibling of `_render_exposure_contrast_selector`; same shape.
+
+    Returns the currently-saved value (before any unsubmitted form edit).
+    """
+    settings = protocol.get("query_settings")
+    current = (settings or {}).get("mortality_ascertainment", "any_location")
+    st.markdown("**Mortality outcome window**")
+    st.caption(
+        "Only relevant when the outcome is a death-domain outcome. Pick the one that matches "
+        "this study's stated outcome definition:"
+    )
+    for value in MORTALITY_ASCERTAINMENT:
+        label, description = _MORTALITY_ASCERTAINMENT_INFO[value]
+        current_marker = " — **current**" if value == current else ""
+        st.caption(f"- **{label}**{current_marker}: {description}")
+    with st.form(key=f"mortality_ascertainment_form_{run_id}"):
+        choice = st.selectbox(
+            "Mortality outcome window",
+            MORTALITY_ASCERTAINMENT,
+            index=MORTALITY_ASCERTAINMENT.index(current) if current in MORTALITY_ASCERTAINMENT else 0,
+            format_func=lambda value: _MORTALITY_ASCERTAINMENT_INFO[value][0],
+            key=f"mortality_ascertainment_choice_{run_id}",
+        )
+        reviewer = st.text_input(
+            "Reviewer", value=_reviewer_default(), key=f"mortality_ascertainment_reviewer_{run_id}"
+        )
+        submitted = st.form_submit_button("Save mortality outcome window")
+        if submitted:
+            try:
+                manager.set_mortality_ascertainment(run_id, choice, reviewer)
+                st.success("Mortality outcome window saved")
+                st.rerun()
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+    return current
+
+
 def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_dir: Path) -> None:
     """Concept mapping (`concept_sets`) lives in `protocol.json`, not
     `analysis_plan.json` -- so it's shown even before the Data Science Agent
@@ -2107,6 +2224,8 @@ def _render_concept_mapping_section(manager: WorkflowManager, run_id: str, run_d
     )
 
     exposure_contrast = _render_exposure_contrast_selector(manager, run_id, protocol or {})
+    _render_washout_window_selector(manager, run_id, protocol or {})
+    _render_mortality_ascertainment_selector(manager, run_id, protocol or {})
 
     st.caption(
         "OMOP concept(s) are shown as numeric codes here because their matched clinical names "
@@ -3213,6 +3332,8 @@ _EVENT_LABELS: dict[str, str] = {
     "mapping_audit_completed": "Concept mapping audit completed",
     "report_generated": "Quick summary generated",
     "exposure_contrast_set": "Comparator design saved",
+    "washout_window_set": "New-user look-back window saved",
+    "mortality_ascertainment_set": "Mortality outcome window saved",
     "feasibility_completed": "Feasibility check completed",
 }
 

@@ -36,7 +36,7 @@ from causal.llm import build_hypothesis_llm
 from causal.roadmap import CENSORING_STRATEGIES, ESTIMATION_PROCEDURES, MISSING_DATA_STRATEGIES
 from causal.mcp_client import OMCPClient
 from causal.orchestrator import WorkflowManager
-from causal.queries import DOMAIN_TABLES
+from causal.queries import DOMAIN_TABLES, MORTALITY_ASCERTAINMENT
 from causal.roadmap import to_dagitty
 
 
@@ -193,6 +193,29 @@ def main() -> int:
     workflow_target_trial_timing.add_argument(
         "--comment", required=True, help="why this was corrected (recorded in state.history)"
     )
+    workflow_washout_window = workflow_sub.add_parser(
+        "washout-window",
+        help="set the new-user look-back window (query_settings.washout_days) -- "
+        "excludes prevalent users and persons whose look-back is not observed",
+    )
+    workflow_washout_window.add_argument("run_id")
+    workflow_washout_window.add_argument(
+        "washout_days", type=int, help="look-back window in days before index_datetime (>= 0; 0 disables it)"
+    )
+    workflow_washout_window.add_argument("--reviewer", required=True)
+    workflow_washout_window.add_argument("--comment")
+    workflow_mortality_ascertainment = workflow_sub.add_parser(
+        "mortality-ascertainment",
+        help="set how a death-domain outcome is ascertained (query_settings.mortality_ascertainment)",
+    )
+    workflow_mortality_ascertainment.add_argument("run_id")
+    workflow_mortality_ascertainment.add_argument(
+        "mortality_ascertainment", choices=MORTALITY_ASCERTAINMENT,
+        help="'in_hospital' scopes a death outcome to the index hospitalization; "
+        "'any_location' (default) counts a death anywhere within the follow-up horizon",
+    )
+    workflow_mortality_ascertainment.add_argument("--reviewer", required=True)
+    workflow_mortality_ascertainment.add_argument("--comment")
     workflow_concept_set_map = workflow_sub.add_parser(
         "concept-set-map",
         help="record the OMOP domain + concept(s) for a protocol concept_sets entry",
@@ -625,6 +648,20 @@ def main() -> int:
                 grace_period_hours=args.grace_period_hours,
                 follow_up_days=args.follow_up_days,
                 reviewer=args.reviewer,
+                comment=args.comment,
+            )
+        elif args.workflow_command == "washout-window":
+            state = manager.set_washout_window(
+                args.run_id,
+                args.washout_days,
+                args.reviewer,
+                comment=args.comment,
+            )
+        elif args.workflow_command == "mortality-ascertainment":
+            state = manager.set_mortality_ascertainment(
+                args.run_id,
+                args.mortality_ascertainment,
+                args.reviewer,
                 comment=args.comment,
             )
         elif args.workflow_command == "covariate-review":
