@@ -25,7 +25,8 @@ _TABLE_REFERENCE = re.compile(r"`[^`]+\.([a-zA-Z0-9_]+)`")
 _FINAL_SELECT_MARKER = "\n    SELECT"
 
 ALLOWED_TABLES = {table for table, _, _ in DOMAIN_TABLES.values()} | {
-    "person", "death", "concept_ancestor", "visit_detail", "care_site", "observation_period",
+    "person", "death", "concept_ancestor", "visit_occurrence", "visit_detail",
+    "care_site", "observation_period",
 }
 
 # purpose -> columns the final projection must not expose. Row-level

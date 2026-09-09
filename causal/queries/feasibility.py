@@ -47,6 +47,24 @@ OUTCOME_DOMAINS = tuple(DOMAIN_TABLES) + ("death",)
 #     `treatment`, A=0 everyone else.
 EXPOSURE_CONTRASTS = ("add_on", "mutually_exclusive", "vs_unexposed")
 
+# How a death-domain outcome is ascertained. A real estimand choice, not a
+# query detail -- it silently changes what "the outcome" counts (see
+# `docs/eligibility_refinements_design.md` section 3):
+#   "any_location": death from any cause within `[index, index +
+#     follow_up_days]`, wherever it occurs. The default, unchanged behavior.
+#     Matches endpoints reported as "28-day / 90-day all-cause mortality"
+#     (CAPE COD, ADRENAL); MIMIC-IV can ascertain these because it carries
+#     out-of-hospital death within ~1 year of the last discharge.
+#   "in_hospital": death occurring during the index hospitalization
+#     (`eligible.visit_occurrence_id`), capped at the same horizon. A person
+#     discharged alive before the horizon is a non-event -- the competing-
+#     risks subdistribution view: surviving to discharge is surviving the
+#     at-risk period -- even if they later die out of hospital. Matches
+#     endpoints reported as "in-hospital mortality" (PEPTIC). `follow_up_days`
+#     is still measured from `index_datetime`; shifting the clock to a
+#     landmark is a separate, deferred concern (design note section 2).
+MORTALITY_ASCERTAINMENT = ("any_location", "in_hospital")
+
 # Which aggregation rules make sense for a covariate's OMOP domain. Event
 # domains (condition/drug/procedure) carry no numeric value -- only
 # presence/count are meaningful. Value domains (measurement/observation)
@@ -310,11 +328,19 @@ def _cohort_ctes(
     exposure_contrast: str,
     additional_population: tuple[ConceptSetSpec, ...] = (),
     washout_days: int = 0,
+    mortality_ascertainment: str = "any_location",
 ) -> str:
     if population.domain not in DOMAIN_TABLES:
         raise ValueError(f"population domain must be one of {tuple(DOMAIN_TABLES)}")
     if outcome.domain not in OUTCOME_DOMAINS:
         raise ValueError(f"outcome domain must be one of {OUTCOME_DOMAINS}")
+    if mortality_ascertainment not in MORTALITY_ASCERTAINMENT:
+        raise ValueError(f"mortality_ascertainment must be one of {MORTALITY_ASCERTAINMENT}")
+    if mortality_ascertainment == "in_hospital" and outcome.domain != "death":
+        raise ValueError(
+            "mortality_ascertainment='in_hospital' only applies to a death-domain outcome; "
+            f"this outcome is domain '{outcome.domain}'"
+        )
     # grace_period_hours == 0 passes this check -- roadmap.py's
     # `TargetTrialProtocol.__post_init__`, `hypothesis.py`'s
     # `_positive_int(..., allow_zero=True)`, and the drafting prompt's own
@@ -539,6 +565,32 @@ def _cohort_ctes(
         ", w.washout_new_user, w.washout_lookback_covered" if washout_days > 0 else ""
     )
     if outcome.domain == "death":
+        horizon_date = f"DATE_ADD(DATE(e.index_datetime), INTERVAL {int(follow_up_days)} DAY)"
+        # "in_hospital": a death only counts while the person is still
+        # admitted for the index hospitalization. `visit_end_datetime` NULL
+        # (an unclosed visit in the source) is read as "still admitted", so
+        # COALESCE to the horizon -- which the outer bound already caps at.
+        # A person discharged alive before the horizon is a non-event even if
+        # they later die out of hospital (competing-risks subdistribution
+        # view). `death_after_discharge_within_horizon` surfaces how many
+        # deaths the "any_location" -> "in_hospital" choice reclassifies,
+        # exposed by `feasibility_sql` -- it never changes `outcome_event`.
+        if mortality_ascertainment == "in_hospital":
+            discharge_cap = f"COALESCE(DATE(v.visit_end_datetime), {horizon_date})"
+            in_hospital_and = f"\n          AND d.death_date <= {discharge_cap}"
+            in_hospital_join = (
+                f"\n      LEFT JOIN {datasets.table('omop', 'visit_occurrence')} v "
+                "ON v.visit_occurrence_id = e.visit_occurrence_id"
+            )
+            post_discharge_diag = f""",
+        d.death_date IS NOT NULL
+          AND d.death_date >= DATE(e.index_datetime)
+          AND d.death_date <= {horizon_date}
+          AND d.death_date > {discharge_cap} AS death_after_discharge_within_horizon"""
+        else:
+            in_hospital_and = ""
+            in_hospital_join = ""
+            post_discharge_diag = ""
         ctes.append(f"""analytic AS (
       SELECT
         e.person_id,
@@ -546,7 +598,7 @@ def _cohort_ctes(
         x.has_comparator,
         d.death_date IS NOT NULL
           AND d.death_date >= DATE(e.index_datetime)
-          AND d.death_date <= DATE_ADD(DATE(e.index_datetime), INTERVAL {int(follow_up_days)} DAY) AS outcome_event,
+          AND d.death_date <= {horizon_date}{in_hospital_and} AS outcome_event,
         -- death_date is DATE-only in the OMOP CDM (no time-of-day), unlike
         -- every other domain's datetime column below, so this can only
         -- approximate the same [index, index + grace_period) window to
@@ -557,10 +609,10 @@ def _cohort_ctes(
         d.death_date IS NOT NULL
           AND d.death_date >= DATE(e.index_datetime)
           AND d.death_date < DATE({_dt_add(datasets, 'e.index_datetime', grace_period_hours)})
-          AS outcome_event_during_grace_period{washout_select}
+          AS outcome_event_during_grace_period{post_discharge_diag}{washout_select}
       FROM eligible e
       JOIN exposure x USING (person_id){washout_join}
-      LEFT JOIN {datasets.table('omop', 'death')} d USING (person_id)
+      LEFT JOIN {datasets.table('omop', 'death')} d USING (person_id){in_hospital_join}
     )""")
     else:
         out_table, out_concept_col, out_dt_col = DOMAIN_TABLES[outcome.domain]
@@ -604,6 +656,7 @@ def feasibility_sql(
     exposure_contrast: str = "add_on",
     additional_population: tuple[ConceptSetSpec, ...] = (),
     washout_days: int = 0,
+    mortality_ascertainment: str = "any_location",
 ) -> str:
     """Aggregate-only feasibility counts for an arbitrary target-trial question.
 
@@ -624,6 +677,13 @@ def feasibility_sql(
     `washout_excluded_insufficient_lookback`, `eligible_after_washout`) show
     how the new-user look-back would reshape the cohort before a reviewer
     approves it. Zero (default) emits no extra SQL.
+
+    `mortality_ascertainment` (see `MORTALITY_ASCERTAINMENT`): with
+    `"in_hospital"` and a death outcome, `outcome_events` already counts only
+    in-hospital deaths, and one extra column
+    (`deaths_after_discharge_within_horizon`) reports how many deaths the
+    `"any_location"` -> `"in_hospital"` choice reclassifies as non-events.
+    `"any_location"` (default) emits no extra SQL.
     """
     if exposure_contrast not in EXPOSURE_CONTRASTS:
         raise ValueError(f"exposure_contrast must be one of {EXPOSURE_CONTRASTS}")
@@ -640,6 +700,7 @@ def feasibility_sql(
         exposure_contrast=exposure_contrast,
         additional_population=additional_population,
         washout_days=washout_days,
+        mortality_ascertainment=mortality_ascertainment,
     )
     washout_counts = (
         """,
@@ -647,6 +708,11 @@ def feasibility_sql(
       COUNTIF(washout_new_user AND NOT washout_lookback_covered) AS washout_excluded_insufficient_lookback,
       COUNTIF(washout_new_user AND washout_lookback_covered) AS eligible_after_washout"""
         if washout_days > 0
+        else ""
+    )
+    mortality_counts = (
+        ",\n      COUNTIF(death_after_discharge_within_horizon) AS deaths_after_discharge_within_horizon"
+        if mortality_ascertainment == "in_hospital" and outcome.domain == "death"
         else ""
     )
     return f"""
@@ -662,7 +728,7 @@ def feasibility_sql(
       COUNTIF(outcome_event) AS outcome_events,
       COUNTIF(outcome_event AND has_treatment) AS outcome_events_treatment,
       COUNTIF(outcome_event AND has_comparator AND NOT has_treatment) AS outcome_events_comparator_only,
-      COUNTIF(outcome_event_during_grace_period) AS outcome_events_during_grace_period{washout_counts}
+      COUNTIF(outcome_event_during_grace_period) AS outcome_events_during_grace_period{washout_counts}{mortality_counts}
     FROM analytic
     """
 
@@ -683,6 +749,7 @@ def analytic_cohort_sql(
     censoring_definition_approved: bool = False,
     additional_population: tuple[ConceptSetSpec, ...] = (),
     washout_days: int = 0,
+    mortality_ascertainment: str = "any_location",
 ) -> str:
     """Person-level analytic cohort (A/Y columns) for the same target trial.
 
@@ -697,6 +764,12 @@ def analytic_cohort_sql(
     `[index - washout_days, index)` whose observation record actually covers
     that look-back. Both conditions are ANDed into the inclusion filter.
     Zero (default) emits no extra SQL.
+
+    `mortality_ascertainment` (see `MORTALITY_ASCERTAINMENT`): `"in_hospital"`
+    makes `Y` count only deaths during the index hospitalization (a person
+    discharged alive before the horizon is `Y=0`); requires a death outcome.
+    `"any_location"` (default) is unchanged behavior. Does not change who is
+    in the cohort, only how `Y` is defined.
 
     `exposure_contrast` (see `EXPOSURE_CONTRASTS`) selects the inclusion
     filter and the meaning of `A`; it does not change how `treatment`/
@@ -737,6 +810,7 @@ def analytic_cohort_sql(
         exposure_contrast=exposure_contrast,
         additional_population=additional_population,
         washout_days=washout_days,
+        mortality_ascertainment=mortality_ascertainment,
     )
     inclusion_filters = {
         "add_on": ["a.has_comparator"],

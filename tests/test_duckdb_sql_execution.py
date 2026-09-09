@@ -58,6 +58,8 @@ _SCHEMA_DDL = (
     "standard_concept VARCHAR, invalid_reason VARCHAR)",
     "CREATE TABLE observation_period (person_id BIGINT, observation_period_start_date DATE, "
     "observation_period_end_date DATE)",
+    "CREATE TABLE visit_occurrence (person_id BIGINT, visit_occurrence_id BIGINT, "
+    "visit_concept_id BIGINT, visit_start_datetime TIMESTAMP, visit_end_datetime TIMESTAMP)",
     "CREATE TABLE measurement (person_id BIGINT, visit_occurrence_id BIGINT, "
     "measurement_concept_id BIGINT, measurement_datetime TIMESTAMP, value_as_number DOUBLE, "
     "unit_concept_id BIGINT)",
@@ -168,6 +170,25 @@ class DuckDBGeneratedSqlExecutesTests(unittest.TestCase):
             analytic_cohort_sql(
                 DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=no_comparator,
                 outcome=measurement_outcome, exposure_contrast="vs_unexposed", washout_days=30,
+            ),
+        )
+        for sql in cases:
+            with self.subTest(sql=sql[:60]):
+                self.con.execute(sql).fetchall()
+
+    def test_in_hospital_mortality_sql_executes(self):
+        # "in_hospital" adds a visit_occurrence join and a COALESCE(DATE(...))
+        # discharge cap; combine with the washout CTE to catch any binder
+        # clash between the two feature paths.
+        cases = (
+            feasibility_sql(
+                DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                exposure_contrast="mutually_exclusive", mortality_ascertainment="in_hospital",
+            ),
+            analytic_cohort_sql(
+                DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                exposure_contrast="mutually_exclusive", mortality_ascertainment="in_hospital",
+                washout_days=90,
             ),
         )
         for sql in cases:

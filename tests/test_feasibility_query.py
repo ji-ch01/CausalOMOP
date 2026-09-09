@@ -347,5 +347,86 @@ class WashoutWindowTests(unittest.TestCase):
         )
 
 
+class MortalityAscertainmentTests(unittest.TestCase):
+    """`mortality_ascertainment="in_hospital"` makes a death outcome count
+    only deaths during the index hospitalization; a person discharged alive
+    before the horizon is Y=0 (see `_cohort_ctes` and
+    `docs/eligibility_refinements_design.md` section 3). `"any_location"`
+    (default) must emit byte-identical SQL to before the feature existed."""
+
+    def test_defaults_to_unchanged_behavior(self):
+        with_default = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+        )
+        explicit_any = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            mortality_ascertainment="any_location",
+        )
+        self.assertEqual(with_default, explicit_any)
+        self.assertNotIn("visit_occurrence` v ON", with_default)
+        self.assertNotIn("death_after_discharge", with_default)
+
+    def test_rejects_an_unknown_value(self):
+        with self.assertRaises(ValueError):
+            feasibility_sql(
+                BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+                mortality_ascertainment="wherever",
+            )
+
+    def test_rejects_in_hospital_with_a_non_death_outcome(self):
+        outcome = ConceptSetSpec(domain="measurement", concept_ids=(3016723,))
+        with self.assertRaises(ValueError):
+            analytic_cohort_sql(
+                BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=outcome,
+                mortality_ascertainment="in_hospital",
+            )
+
+    def test_in_hospital_joins_the_index_visit_and_caps_at_discharge(self):
+        sql = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            mortality_ascertainment="in_hospital",
+        )
+        self.assertIn("visit_occurrence` v ON v.visit_occurrence_id = e.visit_occurrence_id", sql)
+        self.assertIn("AND d.death_date <= COALESCE(DATE(v.visit_end_datetime)", sql)
+
+    def test_feasibility_sql_reports_reclassified_deaths(self):
+        sql = feasibility_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            mortality_ascertainment="in_hospital",
+        )
+        self.assertIn(
+            "COUNTIF(death_after_discharge_within_horizon) AS deaths_after_discharge_within_horizon", sql
+        )
+
+    def test_non_death_outcome_ignores_any_location_default(self):
+        # A non-death outcome with the default is fine and unchanged; only
+        # "in_hospital" + non-death is a misconfiguration.
+        outcome = ConceptSetSpec(domain="measurement", concept_ids=(3016723,))
+        sql = feasibility_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=outcome,
+        )
+        self.assertNotIn("death_after_discharge", sql)
+
+    def test_passes_governance_validation(self):
+        feasibility = feasibility_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            mortality_ascertainment="in_hospital",
+        )
+        cohort = analytic_cohort_sql(
+            BigQueryDatasets(), population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            mortality_ascertainment="in_hospital", washout_days=90,
+        )
+        self.assertTrue(QueryValidationAgent().run(feasibility, purpose="aggregate_feasibility").passed)
+        self.assertTrue(QueryValidationAgent().run(cohort, purpose="person_level_dataset").passed)
+
+    def test_duckdb_backend_stays_portable(self):
+        sql = feasibility_sql(
+            DUCKDB_DATASETS, population=SEPSIS, treatment=ALBUMIN, comparator=CRYSTALLOID, outcome=DEATH,
+            mortality_ascertainment="in_hospital",
+        )
+        self.assertNotIn("DATETIME_ADD", sql)
+        self.assertNotIn("`", sql)
+
+
 if __name__ == "__main__":
     unittest.main()
