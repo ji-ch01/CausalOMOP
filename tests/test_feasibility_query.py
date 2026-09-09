@@ -271,7 +271,11 @@ class WashoutWindowTests(unittest.TestCase):
             exposure_contrast="vs_unexposed", washout_days=90,
         )
         self.assertIn("washout AS (", sql)
-        self.assertIn("NOT (EXISTS (", sql)
+        # LEFT JOIN + COUNTIF, not a correlated EXISTS subquery: BigQuery
+        # cannot de-correlate an EXISTS whose WHERE clause mixes person_id
+        # equality with per-row date-range predicates (see feasibility.py's
+        # comment on this washout CTE).
+        self.assertIn("NOT (COUNTIF(wtc.concept_id IS NOT NULL) > 0)", sql)
         self.assertIn("wtx.drug_exposure_start_datetime < e.index_datetime", sql)
         self.assertIn("DATETIME_ADD(e.index_datetime, INTERVAL -90 DAY)", sql)
         self.assertIn("observation_period_start_date <=", sql)

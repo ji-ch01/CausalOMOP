@@ -479,41 +479,42 @@ def _cohort_ctes(
     #     pre-admission history is thin). Same single-span convention the
     #     `censored` column already uses.
     if washout_days > 0:
+        # LEFT JOIN + GROUP BY + COUNTIF, not correlated EXISTS subqueries --
+        # mirrors the `exposure` CTE just above. BigQuery's optimizer cannot
+        # de-correlate an EXISTS whose WHERE clause mixes an equi-join on
+        # person_id with per-row date-range predicates against multiple
+        # tables ("Correlated subqueries that reference other tables are not
+        # supported unless they can be de-correlated..."); DuckDB tolerates
+        # the same SQL, which is why this only surfaced when a run actually
+        # executed against the BigQuery backend.
         washout_start = _dt_add(datasets, "e.index_datetime", -int(washout_days), "DAY")
-        prior_exposure_checks = [
-            f"""EXISTS (
-        SELECT 1
-        FROM {datasets.table('omop', trt_table)} wtx
-        JOIN treatment_concepts wtc ON wtx.{trt_concept_col} = wtc.concept_id
-        WHERE wtx.person_id = e.person_id
-          AND wtx.{trt_dt_col} >= {washout_start}
-          AND wtx.{trt_dt_col} < e.index_datetime
-      )"""
-        ]
+        prior_exposure_checks = ["COUNTIF(wtc.concept_id IS NOT NULL) > 0"]
+        comparator_washout_join = ""
         if exposure_contrast == "mutually_exclusive":
-            prior_exposure_checks.append(
-                f"""EXISTS (
-        SELECT 1
-        FROM {datasets.table('omop', cmp_table)} wcx
-        JOIN comparator_concepts wcc ON wcx.{cmp_concept_col} = wcc.concept_id
-        WHERE wcx.person_id = e.person_id
-          AND wcx.{cmp_dt_col} >= {washout_start}
-          AND wcx.{cmp_dt_col} < e.index_datetime
-      )"""
-            )
+            prior_exposure_checks.append("COUNTIF(wcc.concept_id IS NOT NULL) > 0")
+            comparator_washout_join = f"""
+      LEFT JOIN {datasets.table('omop', cmp_table)} wcx
+        ON wcx.person_id = e.person_id
+       AND wcx.{cmp_dt_col} >= {washout_start}
+       AND wcx.{cmp_dt_col} < e.index_datetime
+      LEFT JOIN comparator_concepts wcc ON wcx.{cmp_concept_col} = wcc.concept_id"""
         ctes.append(f"""washout AS (
       SELECT
         e.person_id,
         NOT ({" OR ".join(prior_exposure_checks)}) AS washout_new_user,
-        EXISTS (
-          SELECT 1
-          FROM {datasets.table('omop', 'observation_period')} wop
-          WHERE wop.person_id = e.person_id
-            AND DATE(e.index_datetime) BETWEEN wop.observation_period_start_date
-              AND wop.observation_period_end_date
-            AND wop.observation_period_start_date <= DATE({washout_start})
-        ) AS washout_lookback_covered
+        COUNTIF(wop.person_id IS NOT NULL) > 0 AS washout_lookback_covered
       FROM eligible e
+      LEFT JOIN {datasets.table('omop', trt_table)} wtx
+        ON wtx.person_id = e.person_id
+       AND wtx.{trt_dt_col} >= {washout_start}
+       AND wtx.{trt_dt_col} < e.index_datetime
+      LEFT JOIN treatment_concepts wtc ON wtx.{trt_concept_col} = wtc.concept_id{comparator_washout_join}
+      LEFT JOIN {datasets.table('omop', 'observation_period')} wop
+        ON wop.person_id = e.person_id
+       AND DATE(e.index_datetime) BETWEEN wop.observation_period_start_date
+         AND wop.observation_period_end_date
+       AND wop.observation_period_start_date <= DATE({washout_start})
+      GROUP BY e.person_id
     )""")
 
     # Follow-up (outcome ascertainment) starts at the same index_datetime as
